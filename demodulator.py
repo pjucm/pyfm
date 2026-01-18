@@ -193,12 +193,11 @@ class FMStereoDecoder:
         self.lr_diff_lpf_state = signal.lfilter_zi(self.lr_diff_lpf, 1.0)
 
         # De-emphasis filter (at output audio rate)
-        fc = 1.0 / (2 * np.pi * deemphasis)
+        # Use matched-pole first-order IIR for accurate 75µs time constant
         fs = audio_sample_rate
-        w0 = 2 * np.pi * fc
-        alpha = w0 / (2 * fs)
-        self.deem_b = np.array([alpha / (1 + alpha), alpha / (1 + alpha)])
-        self.deem_a = np.array([1.0, (alpha - 1) / (1 + alpha)])
+        a = np.exp(-1.0 / (deemphasis * fs))
+        self.deem_b = np.array([1.0 - a])
+        self.deem_a = np.array([1.0, -a])
         self.deem_state_l = signal.lfilter_zi(self.deem_b, self.deem_a)
         self.deem_state_r = signal.lfilter_zi(self.deem_b, self.deem_a)
 
