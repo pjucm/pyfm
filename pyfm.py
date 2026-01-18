@@ -1323,7 +1323,6 @@ def run_rich_ui(radio):
     import termios
     import select
     import os
-    import fcntl
 
     console = Console()
 
@@ -1333,13 +1332,11 @@ def run_rich_ui(radio):
         console.print(f"[red bold]Error starting radio:[/] {e}")
         return
 
-    # Set up non-blocking input
+    # Set up terminal for character-at-a-time input
     old_settings = termios.tcgetattr(sys.stdin)
-    old_flags = fcntl.fcntl(sys.stdin, fcntl.F_GETFL)
 
     try:
         tty.setcbreak(sys.stdin.fileno())
-        fcntl.fcntl(sys.stdin, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
 
         with Live(build_display(radio, console.width), console=console, refresh_per_second=10, screen=True) as live:
             input_buffer = ''
@@ -1348,13 +1345,16 @@ def run_rich_ui(radio):
                 # Update display (get current terminal width for responsive spectrum)
                 live.update(build_display(radio, console.width))
 
-                # Read any available input into buffer
-                try:
-                    chunk = sys.stdin.read(32)
-                    if chunk:
-                        input_buffer += chunk
-                except (BlockingIOError, IOError):
-                    pass
+                # Check if input is available using select (avoids non-blocking mode issues)
+                readable, _, _ = select.select([sys.stdin], [], [], 0)
+                if readable:
+                    try:
+                        # Use os.read() to get available bytes without blocking
+                        chunk = os.read(sys.stdin.fileno(), 32)
+                        if chunk:
+                            input_buffer += chunk.decode('utf-8', errors='ignore')
+                    except (BlockingIOError, IOError):
+                        pass
 
                 # Process the input buffer
                 while input_buffer:
@@ -1445,7 +1445,6 @@ def run_rich_ui(radio):
     except StopIteration:
         pass
     finally:
-        fcntl.fcntl(sys.stdin, fcntl.F_SETFL, old_flags)
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         radio.stop()
 
