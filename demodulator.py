@@ -46,9 +46,6 @@ class PilotPLL:
         self.phase = 0.0
         self.freq_offset = 0.0
         self.integrator = 0.0
-        self.amp_est = 1.0
-        self.freq_offset_avg = 0.0
-        self.lock_score = 0.0
         self.locked = False
 
         # Precompute constants
@@ -82,11 +79,6 @@ class PilotPLL:
         Ki = self.Ki
 
         for i in range(n):
-            # Simple pilot amplitude tracking to normalize loop gain
-            # (avoids lock behavior depending on pilot amplitude)
-            self.amp_est = 0.99 * self.amp_est + 0.01 * abs(pilot_signal[i])
-            pilot_norm = pilot_signal[i] / (self.amp_est + 1e-12)
-
             # NCO outputs
             cos_phase = np.cos(phase)
             sin_phase = np.sin(phase)
@@ -95,7 +87,7 @@ class PilotPLL:
 
             # Phase detector: multiply input by quadrature
             # For cos input, sin output gives phase error
-            phase_error = pilot_norm * sin_phase
+            phase_error = pilot_signal[i] * sin_phase
 
             # Loop filter (PI controller)
             integrator += phase_error * Ki * dt
@@ -116,12 +108,8 @@ class PilotPLL:
         self.freq_offset = freq_offset
 
         # Lock detection: frequency offset should be small when locked
-        # Within 50 Hz of center = locked (use smoothed offset for stability)
-        self.freq_offset_avg = 0.9 * self.freq_offset_avg + 0.1 * freq_offset
-        locked_now = abs(self.freq_offset_avg) < 2 * np.pi * 50
-        # Hysteresis via a simple IIR "confidence" to prevent flicker
-        self.lock_score = 0.8 * self.lock_score + 0.2 * (1.0 if locked_now else 0.0)
-        self.locked = self.lock_score > 0.7
+        # Within 50 Hz of center = locked
+        self.locked = abs(freq_offset) < 2 * np.pi * 50
 
         return carrier_19k, carrier_38k, self.locked
 
@@ -130,9 +118,6 @@ class PilotPLL:
         self.phase = 0.0
         self.freq_offset = 0.0
         self.integrator = 0.0
-        self.amp_est = 1.0
-        self.freq_offset_avg = 0.0
-        self.lock_score = 0.0
         self.locked = False
 
 
@@ -208,11 +193,12 @@ class FMStereoDecoder:
         self.lr_diff_lpf_state = signal.lfilter_zi(self.lr_diff_lpf, 1.0)
 
         # De-emphasis filter (at output audio rate)
-        # Use a matched-pole first-order IIR to align with analog 75 us time constant.
+        fc = 1.0 / (2 * np.pi * deemphasis)
         fs = audio_sample_rate
-        a = np.exp(-1.0 / (deemphasis * fs))
-        self.deem_b = np.array([1.0 - a])
-        self.deem_a = np.array([1.0, -a])
+        w0 = 2 * np.pi * fc
+        alpha = w0 / (2 * fs)
+        self.deem_b = np.array([alpha / (1 + alpha), alpha / (1 + alpha)])
+        self.deem_a = np.array([1.0, (alpha - 1) / (1 + alpha)])
         self.deem_state_l = signal.lfilter_zi(self.deem_b, self.deem_a)
         self.deem_state_r = signal.lfilter_zi(self.deem_b, self.deem_a)
 

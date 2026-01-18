@@ -654,11 +654,6 @@ class FMRadio:
                 # Check squelch
                 squelched = self.squelch_enabled and dbm < self.squelch_threshold
 
-                # Demodulate FM using stereo decoder (handles mono signals gracefully)
-                t_demod_start = time.perf_counter()
-                audio = self.stereo_decoder.demodulate(iq)
-                t_demod_end = time.perf_counter()
-
                 # Auto mode: RDS is enabled when pilot is present
                 # (pilot = station has stereo/RDS capability)
                 # Don't enable RDS on noise - require signal above squelch threshold
@@ -671,6 +666,11 @@ class FMRadio:
                             self.rds_decoder.reset()
                     elif not pilot_present and self.rds_enabled:
                         self.rds_enabled = False
+
+                # Demodulate FM using stereo decoder (handles mono signals gracefully)
+                t_demod_start = time.perf_counter()
+                audio = self.stereo_decoder.demodulate(iq)
+                t_demod_end = time.perf_counter()
 
                 # Process RDS inline (no queue) for sample continuity
                 if self.rds_enabled and self.rds_decoder and self.stereo_decoder.last_baseband is not None:
