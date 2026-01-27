@@ -289,10 +289,52 @@ class BB60D:
         check_status(status, "bbGetIQUnpacked")
 
         if sample_loss.value > 0:
-            self.total_sample_loss += sample_loss.value
-            self.recent_sample_loss = sample_loss.value
+            grace = getattr(self, '_flush_grace', 0)
+            if grace > 0:
+                self._flush_grace = grace - 1
+            else:
+                self.total_sample_loss += sample_loss.value
+                self.recent_sample_loss = sample_loss.value
 
         return iq_data
+
+    def flush_iq(self):
+        """Flush stale IQ data from the BB60D internal buffer.
+
+        Call after a long init delay to discard samples that accumulated
+        while the host was busy. Also resets the sample loss counters so
+        startup losses aren't reported.
+        """
+        if self.streaming_mode != "iq":
+            return
+
+        n = 8192
+        iq_data = np.zeros(n, dtype=np.complex64)
+        data_remaining = c_int(0)
+        sample_loss = c_int(0)
+        sec = c_int(0)
+        nano = c_int(0)
+
+        # Purge call discards buffered data
+        bbGetIQUnpacked(
+            self.handle,
+            iq_data,
+            n,
+            None,
+            0,
+            BB_TRUE,  # purge — discard buffered data
+            byref(data_remaining),
+            byref(sample_loss),
+            byref(sec),
+            byref(nano)
+        )
+
+        # Reset loss counters so init-time losses aren't visible.
+        # The BB60D may continue reporting sample loss for one or more
+        # fetches after a purge; _flush_grace absorbs those reports.
+        self.total_sample_loss = 0
+        self.recent_sample_loss = 0
+        self._flush_grace = 3  # ignore sample_loss on next N fetches
 
     def set_frequency(self, freq):
         """

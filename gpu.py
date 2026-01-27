@@ -339,6 +339,236 @@ class GPUResampler:
         self._backend = 'cpu'
 
 
+class GPUFIRFilter:
+    """
+    GPU-accelerated FIR filter using FFT overlap-save convolution.
+
+    Maintains overlap state between blocks for continuous filtering.
+    Falls back to CPU scipy.signal.fftconvolve on ROCm errors.
+    """
+
+    def __init__(self, coeffs, block_size):
+        self._coeffs = np.asarray(coeffs, dtype=np.float32)
+        self._block_size = block_size
+        self._M = len(self._coeffs)
+        self._overlap_len = self._M - 1
+
+        # FFT size: next power of 2 >= block_size + M - 1
+        fft_size = 1
+        while fft_size < block_size + self._overlap_len:
+            fft_size <<= 1
+        self._fft_size = fft_size
+
+        # Overlap buffer
+        self._overlap = np.zeros(self._overlap_len, dtype=np.float32)
+
+        # GPU state
+        self._torch = None
+        self._device = None
+        self._H = None
+        self._backend = 'cpu'
+
+        self._init_rocm()
+
+    def _init_rocm(self):
+        try:
+            import torch
+            self._torch = torch
+            if torch.cuda.is_available():
+                self._device = torch.device('cuda')
+                # Pre-compute frequency-domain filter response
+                h_padded = np.zeros(self._fft_size, dtype=np.float32)
+                h_padded[:self._M] = self._coeffs
+                self._H = torch.fft.rfft(
+                    torch.from_numpy(h_padded).to(self._device)
+                )
+                self._backend = 'rocm'
+        except (ImportError, RuntimeError) as e:
+            print(f"GPUFIRFilter: ROCm init failed ({e}), using CPU")
+
+    def process(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        if self._backend == 'rocm':
+            return self._process_rocm(x)
+        return self._process_cpu(x)
+
+    def _process_rocm(self, x):
+        torch = self._torch
+        try:
+            # Prepend overlap to input
+            extended = np.empty(self._fft_size, dtype=np.float32)
+            extended[:self._overlap_len] = self._overlap
+            extended[self._overlap_len:self._overlap_len + len(x)] = x
+            # Zero-pad remainder if block < expected
+            if self._overlap_len + len(x) < self._fft_size:
+                extended[self._overlap_len + len(x):] = 0
+
+            # Save last M-1 input samples as new overlap
+            self._overlap = x[-self._overlap_len:].copy()
+
+            # FFT convolution on GPU
+            t_x = torch.from_numpy(extended).to(self._device)
+            X = torch.fft.rfft(t_x)
+            Y = X * self._H
+            y = torch.fft.irfft(Y, n=self._fft_size)
+
+            # Extract valid output
+            result = y[self._overlap_len:self._overlap_len + len(x)]
+            return result.cpu().numpy()
+
+        except RuntimeError as e:
+            if "HIP error" in str(e) or "invalid device function" in str(e):
+                print(f"GPUFIRFilter: ROCm failed ({e}), falling back to CPU")
+                self._backend = 'cpu'
+                return self._process_cpu(x)
+            raise
+
+    def _process_cpu(self, x):
+        from scipy.signal import fftconvolve
+        extended = np.concatenate([self._overlap, x])
+        self._overlap = x[-self._overlap_len:].copy()
+        y = fftconvolve(extended, self._coeffs, mode='full')
+        return y[self._overlap_len:self._overlap_len + len(x)].astype(np.float32)
+
+    def reset(self):
+        self._overlap = np.zeros(self._overlap_len, dtype=np.float32)
+
+    def cleanup(self):
+        self._H = None
+        if self._torch is not None:
+            try:
+                self._torch.cuda.synchronize()
+            except Exception:
+                pass
+        self._torch = None
+        self._device = None
+        self._backend = 'cpu'
+
+
+class GPUFIRBank:
+    """
+    GPU-accelerated bank of FIR filters sharing the same input.
+
+    Batches multiple filters into a single FFT + broadcast multiply + batch IFFT.
+    Each filter maintains its own overlap state.
+    """
+
+    def __init__(self, coeff_list, block_size):
+        self._n_filters = len(coeff_list)
+        self._coeffs = [np.asarray(c, dtype=np.float32) for c in coeff_list]
+        self._block_size = block_size
+        self._M = max(len(c) for c in self._coeffs)
+        self._overlap_len = self._M - 1
+
+        # FFT size: next power of 2 >= block_size + M - 1
+        fft_size = 1
+        while fft_size < block_size + self._overlap_len:
+            fft_size <<= 1
+        self._fft_size = fft_size
+
+        # Per-filter overlap buffers
+        self._overlaps = [np.zeros(self._overlap_len, dtype=np.float32)
+                          for _ in range(self._n_filters)]
+
+        # GPU state
+        self._torch = None
+        self._device = None
+        self._H = None  # shape (n_filters, fft_size//2+1)
+        self._backend = 'cpu'
+
+        self._init_rocm()
+
+    def _init_rocm(self):
+        try:
+            import torch
+            self._torch = torch
+            if torch.cuda.is_available():
+                self._device = torch.device('cuda')
+                # Pre-compute stacked frequency-domain filter responses
+                H_list = []
+                for c in self._coeffs:
+                    h_padded = np.zeros(self._fft_size, dtype=np.float32)
+                    h_padded[:len(c)] = c
+                    H_list.append(h_padded)
+                H_np = np.stack(H_list)  # (n_filters, fft_size)
+                H_t = torch.from_numpy(H_np).to(self._device)
+                self._H = torch.fft.rfft(H_t, dim=1)  # (n_filters, fft_size//2+1)
+                self._backend = 'rocm'
+        except (ImportError, RuntimeError) as e:
+            print(f"GPUFIRBank: ROCm init failed ({e}), using CPU")
+
+    def process(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        if self._backend == 'rocm':
+            return self._process_rocm(x)
+        return self._process_cpu(x)
+
+    def _process_rocm(self, x):
+        torch = self._torch
+        n = len(x)
+        try:
+            # Build extended input with overlap
+            extended = np.empty(self._fft_size, dtype=np.float32)
+            # Use first filter's overlap length (all share same M)
+            extended[:self._overlap_len] = self._overlaps[0]
+            extended[self._overlap_len:self._overlap_len + n] = x
+            if self._overlap_len + n < self._fft_size:
+                extended[self._overlap_len + n:] = 0
+
+            # Update all overlap buffers (shared input)
+            new_overlap = x[-self._overlap_len:].copy()
+            for i in range(self._n_filters):
+                self._overlaps[i] = new_overlap.copy()
+
+            # Single FFT of input
+            t_x = torch.from_numpy(extended).to(self._device)
+            X = torch.fft.rfft(t_x)  # (fft_size//2+1,)
+
+            # Broadcast multiply: (n_filters, fft_size//2+1) * (1, fft_size//2+1)
+            Y = self._H * X.unsqueeze(0)
+
+            # Batch IFFT
+            y = torch.fft.irfft(Y, n=self._fft_size, dim=1)  # (n_filters, fft_size)
+
+            # Extract valid output for each filter
+            results = y[:, self._overlap_len:self._overlap_len + n]
+            return tuple(results[i].cpu().numpy() for i in range(self._n_filters))
+
+        except RuntimeError as e:
+            if "HIP error" in str(e) or "invalid device function" in str(e):
+                print(f"GPUFIRBank: ROCm failed ({e}), falling back to CPU")
+                self._backend = 'cpu'
+                return self._process_cpu(x)
+            raise
+
+    def _process_cpu(self, x):
+        from scipy.signal import fftconvolve
+        n = len(x)
+        results = []
+        new_overlap = x[-(self._overlap_len):].copy()
+        for i in range(self._n_filters):
+            extended = np.concatenate([self._overlaps[i], x])
+            self._overlaps[i] = new_overlap.copy()
+            y = fftconvolve(extended, self._coeffs[i], mode='full')
+            results.append(y[self._overlap_len:self._overlap_len + n].astype(np.float32))
+        return tuple(results)
+
+    def reset(self):
+        for i in range(self._n_filters):
+            self._overlaps[i] = np.zeros(self._overlap_len, dtype=np.float32)
+
+    def cleanup(self):
+        self._H = None
+        if self._torch is not None:
+            try:
+                self._torch.cuda.synchronize()
+            except Exception:
+                pass
+        self._torch = None
+        self._device = None
+        self._backend = 'cpu'
+
+
 def fm_demodulate_arctan(iq_samples, sample_rate=250000, deviation=75000):
     """
     Convenience function for one-shot FM demodulation using arctangent-differentiate.
