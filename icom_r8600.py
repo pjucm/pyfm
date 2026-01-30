@@ -39,14 +39,24 @@ PC_ADDR = 0xE0
 # Sample rate codes for I/Q output (1A 13 01 01 BD SR)
 # BD = bit depth (00=16-bit, 01=24-bit)
 # SR = sample rate code
-# Note: Using 16-bit for all rates for maximum compatibility
+# Note: 5.12 MSPS only supports 16-bit; other rates support both
+# Using 16-bit by default for stability; 24-bit available but needs more testing
 SAMPLE_RATES = {
-    5120000: (0x00, 0x01),  # 5.12 MSPS, 16-bit only
+    5120000: (0x00, 0x01),  # 5.12 MSPS, 16-bit only (hardware limitation)
     3840000: (0x00, 0x02),  # 3.84 MSPS, 16-bit
     1920000: (0x00, 0x03),  # 1.92 MSPS, 16-bit
     960000:  (0x00, 0x04),  # 960 KSPS, 16-bit
     480000:  (0x00, 0x05),  # 480 KSPS, 16-bit
     240000:  (0x00, 0x06),  # 240 KSPS, 16-bit
+}
+
+# Alternative 24-bit sample rates (for future use when 24-bit is debugged)
+SAMPLE_RATES_24BIT = {
+    3840000: (0x01, 0x02),  # 3.84 MSPS, 24-bit
+    1920000: (0x01, 0x03),  # 1.92 MSPS, 24-bit
+    960000:  (0x01, 0x04),  # 960 KSPS, 24-bit
+    480000:  (0x01, 0x05),  # 480 KSPS, 24-bit
+    240000:  (0x01, 0x06),  # 240 KSPS, 24-bit
 }
 
 
@@ -262,9 +272,16 @@ class IcomR8600:
         self._bytes_per_sample = 4  # 16-bit: 2 bytes I + 2 bytes Q
 
         # I/Q gain - applied to normalized samples
-        # R8600 I/Q output level depends on RF gain settings
-        # Start with moderate gain; adjust based on signal strength
-        self._iq_gain = 100.0
+        # For FM demodulation, this should be 1.0 since phase detection is
+        # amplitude-independent. Higher gain only needed if downstream
+        # processing requires it.
+        self._iq_gain = 1.0
+
+        # DC offset tracking - per Icom I/Q Reference Guide, there's a DC
+        # component in the I/Q data that varies with sample rate. We use
+        # an exponential moving average to track and remove it.
+        self._dc_offset = 0.0 + 0.0j  # Complex DC offset estimate
+        self._dc_alpha = 0.001  # EMA smoothing factor (lower = slower tracking)
 
         # I/Q data buffer and thread
         self._iq_buffer = []
@@ -529,9 +546,18 @@ class IcomR8600:
                 if np.any(invalid_mask):
                     iq_int = iq_int[~invalid_mask]
 
-                # Convert to complex64, normalizing to [-1, 1] and applying gain
-                # R8600 outputs much lower levels than BB60D, so we boost here
-                iq = (iq_int[:, 0].astype(np.float32) + 1j * iq_int[:, 1].astype(np.float32)) / 32768.0 * self._iq_gain
+                # Convert to complex64, normalizing to [-1, 1]
+                iq = (iq_int[:, 0].astype(np.float32) + 1j * iq_int[:, 1].astype(np.float32)) / 32768.0
+
+                # Remove DC offset (per Icom I/Q Reference Guide, DC component exists)
+                # Update DC estimate with exponential moving average
+                block_dc = np.mean(iq)
+                self._dc_offset = self._dc_alpha * block_dc + (1 - self._dc_alpha) * self._dc_offset
+                iq = iq - self._dc_offset
+
+                # Apply gain (should be 1.0 for FM since demod is phase-based)
+                if self._iq_gain != 1.0:
+                    iq = iq * self._iq_gain
             else:
                 iq = np.zeros(0, dtype=np.complex64)
 
@@ -545,19 +571,47 @@ class IcomR8600:
             samples_to_use = min(samples_available, num_samples)
 
             if samples_to_use > 0:
-                # Parse 24-bit samples (little-endian signed)
-                iq = np.zeros(samples_to_use, dtype=np.complex64)
-                for i in range(samples_to_use):
-                    offset = i * 6
-                    # I sample (3 bytes, little-endian, signed)
-                    i_val = collected[offset] | (collected[offset + 1] << 8) | (collected[offset + 2] << 16)
-                    if i_val & 0x800000:  # Sign extend
-                        i_val -= 0x1000000
-                    # Q sample
-                    q_val = collected[offset + 3] | (collected[offset + 4] << 8) | (collected[offset + 5] << 16)
-                    if q_val & 0x800000:
-                        q_val -= 0x1000000
-                    iq[i] = (i_val / 8388608.0) + 1j * (q_val / 8388608.0)
+                # Parse 24-bit samples using numpy for efficiency
+                # Each sample is 6 bytes: I0 I1 I2 Q0 Q1 Q2 (little-endian)
+                raw = np.frombuffer(collected[:samples_to_use * 6], dtype=np.uint8)
+                raw = raw.reshape(-1, 6)
+
+                # Extract I and Q as 24-bit values (little-endian)
+                # Combine bytes: val = b0 | (b1 << 8) | (b2 << 16)
+                i_vals = (raw[:, 0].astype(np.int32) |
+                          (raw[:, 1].astype(np.int32) << 8) |
+                          (raw[:, 2].astype(np.int32) << 16))
+                q_vals = (raw[:, 3].astype(np.int32) |
+                          (raw[:, 4].astype(np.int32) << 8) |
+                          (raw[:, 5].astype(np.int32) << 16))
+
+                # Sign extend from 24-bit to 32-bit
+                i_vals = np.where(i_vals & 0x800000, i_vals - 0x1000000, i_vals)
+                q_vals = np.where(q_vals & 0x800000, q_vals - 0x1000000, q_vals)
+
+                # Filter out sync patterns per Icom I/Q Reference Guide:
+                # 24-bit sync is 6 bytes: 0x8000, 0x8001, 0x8002 (as 16-bit words)
+                # When parsed as 24-bit I/Q: I=0x018000=98304, Q=0x800280→-8387968
+                # Valid I/Q range is -8387967 to +8387966, so Q < -8387967 indicates sync
+                # Also check for I matching sync pattern (I == 98304 AND Q == -8387968)
+                sync_mask = (i_vals == 98304) & (q_vals == -8387968)
+                if np.any(sync_mask):
+                    i_vals = i_vals[~sync_mask]
+                    q_vals = q_vals[~sync_mask]
+
+                # Convert to complex64, normalizing to [-1, 1]
+                # Normalize by 8388608 (2^23) for full 24-bit range
+                iq = (i_vals.astype(np.float32) + 1j * q_vals.astype(np.float32)) / 8388608.0
+
+                # Remove DC offset (per Icom I/Q Reference Guide, DC component exists)
+                # Update DC estimate with exponential moving average
+                block_dc = np.mean(iq)
+                self._dc_offset = self._dc_alpha * block_dc + (1 - self._dc_alpha) * self._dc_offset
+                iq = iq - self._dc_offset
+
+                # Apply gain (should be 1.0 for FM since demod is phase-based)
+                if self._iq_gain != 1.0:
+                    iq = iq * self._iq_gain
             else:
                 iq = np.zeros(0, dtype=np.complex64)
 
@@ -578,6 +632,8 @@ class IcomR8600:
         """Flush stale IQ data from the buffer."""
         with self._iq_lock:
             self._iq_buffer.clear()
+        # Reset DC offset estimate (DC varies with frequency per Icom docs)
+        self._dc_offset = 0.0 + 0.0j
         self.total_sample_loss = 0
         self.recent_sample_loss = 0
 

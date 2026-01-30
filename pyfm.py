@@ -509,10 +509,11 @@ class FMRadio:
     IQ_BLOCK_SIZE = 8192  # ~26.2ms budget at 312.5kHz
 
     # Signal level calibration offset (dB)
-    # BB60D IQ samples need calibration to match true power in dBm.
-    # This offset was determined empirically by comparing to a calibrated
-    # spectrum analyzer. Adjust if your readings don't match.
-    SIGNAL_CAL_OFFSET_DB = -8.0
+    # IQ samples need calibration to match true power in dBm.
+    # These offsets were determined empirically by comparing to calibrated
+    # readings. The R8600 offset accounts for its different I/Q output level.
+    SIGNAL_CAL_OFFSET_DB_BB60D = -8.0
+    SIGNAL_CAL_OFFSET_DB_R8600 = -23.0  # Base offset before IQ gain compensation
 
     # Config file path (in same directory as script)
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
@@ -805,7 +806,15 @@ class FMRadio:
                 mean_power = np.mean(iq_subset.real**2 + iq_subset.imag**2)
                 if mean_power > 0:
                     # Apply calibration offset to convert raw IQ power to dBm
-                    dbm = 10 * np.log10(mean_power) + self.SIGNAL_CAL_OFFSET_DB
+                    # Must compensate for any IQ gain applied by the device
+                    if self.use_icom:
+                        # R8600: compensate for IQ gain (100x = +40 dB in power)
+                        iq_gain = getattr(self.device, '_iq_gain', 1.0)
+                        gain_compensation = -20 * np.log10(iq_gain) if iq_gain > 0 else 0
+                        dbm = 10 * np.log10(mean_power) + self.SIGNAL_CAL_OFFSET_DB_R8600 + gain_compensation
+                    else:
+                        # BB60D: no gain compensation needed
+                        dbm = 10 * np.log10(mean_power) + self.SIGNAL_CAL_OFFSET_DB_BB60D
                 else:
                     dbm = -140.0
                 self.signal_dbm = dbm  # No lock needed for single float assignment
