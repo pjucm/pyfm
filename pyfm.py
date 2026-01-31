@@ -411,7 +411,7 @@ class AudioPlayer:
         self.volume = 1.0
 
         # Adaptive rate control: target buffer level for rate adjustment
-        self._target_level_ms = 150
+        self._target_level_ms = 100
 
     def _audio_callback(self, outdata, frames, time_info, status):
         """Sounddevice callback for audio output."""
@@ -581,7 +581,7 @@ class FMRadio:
         self.audio_player = AudioPlayer(
             sample_rate=self.AUDIO_SAMPLE_RATE,
             channels=2,
-            latency=0.15  # 150ms latency for smooth playback
+            latency=0.05  # 50ms driver latency; rate control handles drift
         )
 
         # Stereo FM decoder (handles both stereo and mono signals)
