@@ -235,15 +235,19 @@ class RDSDecoder:
         nyq = sample_rate / 2
 
         # Design bandpass filter for 57 kHz RDS band (+/- 2.4 kHz)
+        # Use FIR filter for linear phase - works better with IC-R8600
         rds_bw = 2400
         low = (RDS_CARRIER_FREQ - rds_bw) / nyq
         high = (RDS_CARRIER_FREQ + rds_bw) / nyq
         low = max(0.01, low)
         high = min(0.99, high)
-        self.bpf_b, self.bpf_a = signal.butter(4, [low, high], btype='band')
+        self.bpf_taps = 201
+        self.bpf_b = signal.firwin(self.bpf_taps, [low, high], pass_zero=False,
+                                    window=('kaiser', 7.0))
+        self.bpf_a = 1.0
         self.bpf_zi = signal.lfilter_zi(self.bpf_b, self.bpf_a) * 0
 
-        # Design low-pass filter for baseband after multiply
+        # Design low-pass filter for baseband after demodulation
         lpf_cutoff = 1200 / nyq
         self.lpf_b, self.lpf_a = signal.butter(2, lpf_cutoff, btype='low')
         self.lpf_zi = signal.lfilter_zi(self.lpf_b, self.lpf_a) * 0
@@ -251,12 +255,14 @@ class RDSDecoder:
         # Delay line for delay-and-multiply
         self.delay_buffer = np.zeros(self.delay_samples)
 
-        # For coherent demod: use IIR filter for pilot to match RDS IIR filter
-        # Both filters are 4th order Butterworth, so group delay characteristics match
+        # For coherent demod: use FIR filter for pilot with SAME tap count as RDS BPF
+        # This ensures identical group delay for proper phase alignment
         pilot_low = 18500 / nyq
         pilot_high = 19500 / nyq
-        self.pilot_iir_b, self.pilot_iir_a = signal.butter(4, [pilot_low, pilot_high], btype='band')
-        self.pilot_iir_zi = signal.lfilter_zi(self.pilot_iir_b, self.pilot_iir_a) * 0
+        self.pilot_bpf_b = signal.firwin(self.bpf_taps, [pilot_low, pilot_high],
+                                          pass_zero=False, window=('kaiser', 7.0))
+        self.pilot_bpf_a = 1.0
+        self.pilot_bpf_zi = signal.lfilter_zi(self.pilot_bpf_b, self.pilot_bpf_a) * 0
 
         # Delay buffer for differential decoding in coherent mode
         self._coherent_delay_buf = np.zeros(self.delay_samples)
@@ -265,7 +271,7 @@ class RDSDecoder:
         self.timing_mu = 0.5              # Fractional sample offset within symbol (phase)
         self.timing_freq = 0.0            # Fractional accumulator for exact sample rate
         self.timing_freq_offset = 0.0     # Symbol rate offset (frequency error tracking)
-        self.timing_gain_p = 0.02         # Proportional gain for phase tracking (lower = less noise)
+        self.timing_gain_p = 0.03         # Proportional gain for phase tracking (increased)
         self.timing_gain_i = 0.003        # Integral gain for frequency tracking
         self.sample_buffer = []
 
@@ -318,11 +324,36 @@ class RDSDecoder:
         self._wrap_count_up = 0    # Times timing_mu wrapped 1.0 -> 0.0
         self._wrap_count_down = 0  # Times timing_mu wrapped 0.0 -> 1.0
 
+        # Phase/amplitude diagnostics for coherent demod debugging
+        self._pilot_rms = 0.0           # Smoothed pilot RMS level
+        self._pilot_peak = 0.0          # Peak pilot amplitude
+        self._carrier_rms = 0.0         # Smoothed 57 kHz carrier RMS
+        self._baseband_rms_pre_agc = 0.0  # Baseband before AGC
+        self._soft_symbols = deque(maxlen=1000)  # Soft decision values
+        self._symbol_snr_estimate = 0.0  # Estimated symbol SNR in dB
+        self._phase_diag_buffer = deque(maxlen=500)  # Phase diagnostic samples
+
+        # Timing log file for real-time analysis
+        self._timing_log_file = None
+        self._timing_log_counter = 0
+        self._timing_log_interval = 50  # Log every N symbols (~24 Hz at 1187.5 sym/s)
+
     def enable_diagnostics(self, enabled=True):
-        """Enable/disable diagnostic data collection."""
+        """Enable/disable diagnostic data collection and timing log."""
         self._diag_enabled = enabled
         if enabled:
             self._diag_buffer.clear()
+            self._soft_symbols.clear()
+            # Start timing log file
+            if self._timing_log_file is None:
+                self._timing_log_file = open('/tmp/rds_timing.log', 'w')
+                self._timing_log_file.write("sym_num,timing_mu,timing_err,timing_err_raw,freq_off,soft_sym,advance,blk_rate\n")
+                self._timing_log_counter = 0
+        else:
+            # Close timing log file
+            if self._timing_log_file:
+                self._timing_log_file.close()
+                self._timing_log_file = None
 
     def get_diagnostics(self):
         """
@@ -332,57 +363,184 @@ class RDSDecoder:
         - 'samples': list of (timing_mu, timing_error, timing_freq_offset) tuples
         - 'histogram': timing_mu distribution in 10 bins
         - 'stats': min, max, mean, std of timing_mu
+        - 'coherent': pilot/carrier/baseband amplitude metrics
+        - 'constellation': soft symbol statistics (SNR estimate)
         """
-        if not self._diag_buffer:
-            return None
-
-        samples = list(self._diag_buffer)
-        mu_values = [s[0] for s in samples]
-
-        # Histogram of timing_mu (10 bins from 0 to 1)
-        hist, bin_edges = np.histogram(mu_values, bins=10, range=(0, 1))
-
-        return {
-            'samples': samples,
-            'count': len(samples),
-            'histogram': hist.tolist(),
-            'bin_edges': bin_edges.tolist(),
-            'stats': {
-                'min': min(mu_values),
-                'max': max(mu_values),
-                'mean': np.mean(mu_values),
-                'std': np.std(mu_values),
+        result = {
+            'count': 0,
+            'coherent': {
+                'pilot_rms': self._pilot_rms,
+                'pilot_peak': self._pilot_peak,
+                'carrier_rms': self._carrier_rms,
+                'baseband_rms_pre_agc': self._baseband_rms_pre_agc,
             },
-            'wraps_up': self._wrap_count_up,
-            'wraps_down': self._wrap_count_down,
         }
 
-    def dump_diagnostics(self, filepath='/tmp/rds_timing_diag.txt'):
+        # Timing diagnostics
+        if self._diag_buffer:
+            samples = list(self._diag_buffer)
+            mu_values = [s[0] for s in samples]
+
+            # Histogram of timing_mu (10 bins from 0 to 1)
+            hist, bin_edges = np.histogram(mu_values, bins=10, range=(0, 1))
+
+            result.update({
+                'samples': samples,
+                'count': len(samples),
+                'histogram': hist.tolist(),
+                'bin_edges': bin_edges.tolist(),
+                'stats': {
+                    'min': min(mu_values),
+                    'max': max(mu_values),
+                    'mean': np.mean(mu_values),
+                    'std': np.std(mu_values),
+                },
+                'wraps_up': self._wrap_count_up,
+                'wraps_down': self._wrap_count_down,
+            })
+
+        # Constellation/soft symbol analysis
+        if self._soft_symbols:
+            soft = np.array(self._soft_symbols)
+            # For BPSK, symbols should cluster around +1 and -1 (after AGC)
+            # Symbol SNR estimate: mean |symbol| / std
+            abs_soft = np.abs(soft)
+            mean_amplitude = np.mean(abs_soft)
+            # Deviation from ideal ±1 decision points
+            positive = soft[soft > 0]
+            negative = soft[soft < 0]
+
+            if len(positive) > 10 and len(negative) > 10:
+                pos_mean = np.mean(positive)
+                pos_std = np.std(positive)
+                neg_mean = np.mean(negative)
+                neg_std = np.std(negative)
+
+                # Eye opening: distance between clusters relative to noise
+                cluster_separation = pos_mean - neg_mean
+                avg_noise = (pos_std + neg_std) / 2
+                if avg_noise > 1e-10:
+                    symbol_snr_linear = (cluster_separation / 2) / avg_noise
+                    symbol_snr_db = 20 * np.log10(max(symbol_snr_linear, 0.01))
+                    self._symbol_snr_estimate = symbol_snr_db
+                else:
+                    symbol_snr_db = 40.0  # Very clean signal
+
+                result['constellation'] = {
+                    'positive_mean': float(pos_mean),
+                    'positive_std': float(pos_std),
+                    'negative_mean': float(neg_mean),
+                    'negative_std': float(neg_std),
+                    'cluster_separation': float(cluster_separation),
+                    'symbol_snr_db': float(symbol_snr_db),
+                    'mean_amplitude': float(mean_amplitude),
+                    'sample_count': len(soft),
+                }
+
+                # Eye diagram: histogram of soft values (should be bimodal)
+                eye_hist, eye_edges = np.histogram(soft, bins=50, range=(-2, 2))
+                result['eye_histogram'] = eye_hist.tolist()
+                result['eye_edges'] = eye_edges.tolist()
+
+        return result
+
+    def dump_diagnostics(self, filepath='/tmp/rds_diag.txt'):
         """Dump diagnostic data to file (call when NOT processing)."""
         diag = self.get_diagnostics()
         if not diag:
             return False
 
         with open(filepath, 'w') as f:
-            f.write("RDS Timing Diagnostics\n")
-            f.write("=" * 50 + "\n\n")
+            f.write("RDS Phase/Amplitude Diagnostics\n")
+            f.write("=" * 60 + "\n\n")
 
-            stats = diag['stats']
-            f.write(f"Samples: {diag['count']}\n")
-            f.write(f"timing_mu: min={stats['min']:.4f} max={stats['max']:.4f} "
-                    f"mean={stats['mean']:.4f} std={stats['std']:.4f}\n")
-            f.write(f"Wraps: up={diag['wraps_up']} (late) down={diag['wraps_down']} (early)\n\n")
+            # Coherent demodulation signal levels
+            coh = diag.get('coherent', {})
+            f.write("COHERENT DEMODULATION SIGNAL LEVELS\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"  Pilot RMS:           {coh.get('pilot_rms', 0):.6f}\n")
+            f.write(f"  Pilot Peak:          {coh.get('pilot_peak', 0):.6f}\n")
+            f.write(f"  57kHz Carrier RMS:   {coh.get('carrier_rms', 0):.6f}\n")
+            f.write(f"  Baseband RMS (pre-AGC): {coh.get('baseband_rms_pre_agc', 0):.6f}\n")
+            # Pilot crest factor (peak/RMS) should be ~1.414 for a clean sinusoid
+            if coh.get('pilot_rms', 0) > 1e-10:
+                crest = coh.get('pilot_peak', 0) / coh.get('pilot_rms', 0)
+                f.write(f"  Pilot Crest Factor:  {crest:.3f} (ideal: 1.414)\n")
+            f.write("\n")
 
-            f.write("Histogram (timing_mu distribution):\n")
-            for i, count in enumerate(diag['histogram']):
-                lo = i * 0.1
-                hi = (i + 1) * 0.1
-                bar = '#' * (count // 20)
-                f.write(f"  {lo:.1f}-{hi:.1f}: {count:5d} {bar}\n")
+            # Constellation/symbol quality
+            const = diag.get('constellation', {})
+            if const:
+                f.write("SYMBOL CONSTELLATION ANALYSIS\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"  Positive cluster:  mean={const['positive_mean']:+.4f}  std={const['positive_std']:.4f}\n")
+                f.write(f"  Negative cluster:  mean={const['negative_mean']:+.4f}  std={const['negative_std']:.4f}\n")
+                f.write(f"  Cluster separation: {const['cluster_separation']:.4f}\n")
+                f.write(f"  Symbol SNR:        {const['symbol_snr_db']:.1f} dB\n")
+                f.write(f"  Mean |amplitude|:  {const['mean_amplitude']:.4f}\n")
+                f.write(f"  Samples analyzed:  {const['sample_count']}\n")
+                f.write("\n")
 
-            f.write(f"\nLast 100 samples (mu, error, freq_offset):\n")
-            for mu, err, foff in diag['samples'][-100:]:
-                f.write(f"  {mu:.4f}  {err:+.6f}  {foff:+.6f}\n")
+                # Quality assessment
+                f.write("QUALITY ASSESSMENT\n")
+                f.write("-" * 40 + "\n")
+                snr = const['symbol_snr_db']
+                if snr >= 15:
+                    f.write(f"  Symbol SNR: EXCELLENT ({snr:.1f} dB) - expect >90% block rate\n")
+                elif snr >= 10:
+                    f.write(f"  Symbol SNR: GOOD ({snr:.1f} dB) - expect 70-90% block rate\n")
+                elif snr >= 6:
+                    f.write(f"  Symbol SNR: MARGINAL ({snr:.1f} dB) - expect 40-70% block rate\n")
+                else:
+                    f.write(f"  Symbol SNR: POOR ({snr:.1f} dB) - expect <40% block rate\n")
+
+                # Check for phase issues (asymmetry in clusters)
+                pos_abs = abs(const['positive_mean'])
+                neg_abs = abs(const['negative_mean'])
+                if pos_abs > 1e-6 and neg_abs > 1e-6:
+                    asymmetry = abs(pos_abs - neg_abs) / max(pos_abs, neg_abs)
+                    if asymmetry > 0.2:
+                        f.write(f"  WARNING: Cluster asymmetry {asymmetry:.1%} - possible DC offset or phase error\n")
+
+                # Check for amplitude imbalance
+                if const['positive_std'] > 1e-6 and const['negative_std'] > 1e-6:
+                    std_ratio = const['positive_std'] / const['negative_std']
+                    if std_ratio > 1.5 or std_ratio < 0.67:
+                        f.write(f"  WARNING: Noise asymmetry (ratio={std_ratio:.2f}) - possible phase error\n")
+
+                f.write("\n")
+
+            # Eye diagram histogram
+            if 'eye_histogram' in diag:
+                f.write("EYE DIAGRAM (symbol value histogram)\n")
+                f.write("-" * 40 + "\n")
+                eye = diag['eye_histogram']
+                edges = diag['eye_edges']
+                max_count = max(eye) if eye else 1
+                for i, count in enumerate(eye):
+                    lo = edges[i]
+                    hi = edges[i + 1]
+                    bar_len = int(40 * count / max_count) if max_count > 0 else 0
+                    bar = '#' * bar_len
+                    f.write(f"  {lo:+.2f} to {hi:+.2f}: {count:5d} {bar}\n")
+                f.write("\n")
+
+            # Timing diagnostics
+            if diag.get('count', 0) > 0:
+                f.write("TIMING RECOVERY DIAGNOSTICS\n")
+                f.write("-" * 40 + "\n")
+                stats = diag.get('stats', {})
+                f.write(f"  Samples: {diag['count']}\n")
+                f.write(f"  timing_mu: min={stats.get('min', 0):.4f} max={stats.get('max', 0):.4f} "
+                        f"mean={stats.get('mean', 0):.4f} std={stats.get('std', 0):.4f}\n")
+                f.write(f"  Wraps: up={diag.get('wraps_up', 0)} (late) down={diag.get('wraps_down', 0)} (early)\n\n")
+
+                f.write("  Histogram (timing_mu distribution):\n")
+                for i, count in enumerate(diag.get('histogram', [])):
+                    lo = i * 0.1
+                    hi = (i + 1) * 0.1
+                    bar = '#' * (count // 20)
+                    f.write(f"    {lo:.1f}-{hi:.1f}: {count:5d} {bar}\n")
 
         return True
 
@@ -437,23 +595,40 @@ class RDSDecoder:
 
         RDS uses differential encoding, so after carrier mixing we multiply
         by a one-symbol-delayed version to perform differential decoding.
+
+        IMPORTANT: Both the RDS BPF and pilot BPF are FIR filters with the
+        same tap count (201), ensuring identical group delay (100 samples).
+        This is critical for phase alignment when tripling the pilot.
         """
         baseband = np.asarray(baseband, dtype=np.float64)
 
-        # Extract 19 kHz pilot using IIR BPF (matched to RDS BPF characteristics)
-        pilot, self.pilot_iir_zi = signal.lfilter(
-            self.pilot_iir_b, self.pilot_iir_a, baseband, zi=self.pilot_iir_zi
+        # Extract 19 kHz pilot using FIR BPF (same taps as RDS BPF for matched delay)
+        pilot, self.pilot_bpf_zi = signal.lfilter(
+            self.pilot_bpf_b, self.pilot_bpf_a, baseband, zi=self.pilot_bpf_zi
         )
 
-        # Normalize pilot to unit amplitude using RMS (more stable than max)
-        # For a sinusoid, RMS = amplitude / sqrt(2), so amplitude = RMS * sqrt(2)
+        # Normalize pilot to unit amplitude for tripling formula
         pilot_rms = np.sqrt(np.mean(pilot ** 2))
         if pilot_rms < 1e-10:
             return self._delay_multiply_demod(rds_signal)
+
+        # Diagnostics: track pilot quality
+        if self._diag_enabled:
+            self._pilot_rms = 0.9 * self._pilot_rms + 0.1 * pilot_rms
+            pilot_peak = np.max(np.abs(pilot))
+            self._pilot_peak = 0.9 * self._pilot_peak + 0.1 * pilot_peak
+
+        # Normalize to unit amplitude (RMS of sinusoid = peak/sqrt(2))
         pilot_norm = pilot / (pilot_rms * np.sqrt(2))
 
-        # Generate 57 kHz carrier: cos(3θ) = 4cos³(θ) - 3cos(θ)
+        # Generate 57 kHz carrier using tripling identity: cos(3θ) = 4cos³(θ) - 3cos(θ)
+        # This preserves phase relationship without FFT edge effects
         carrier_57k = 4 * pilot_norm**3 - 3 * pilot_norm
+
+        # Diagnostics: track carrier quality
+        if self._diag_enabled:
+            carrier_rms = np.sqrt(np.mean(carrier_57k ** 2))
+            self._carrier_rms = 0.9 * self._carrier_rms + 0.1 * carrier_rms
 
         # Mix RDS with carrier (carrier removal)
         coherent_product = rds_signal * carrier_57k
@@ -481,6 +656,11 @@ class RDSDecoder:
         bpsk_baseband, self.lpf_zi = signal.lfilter(
             self.lpf_b, self.lpf_a, diff_decoded, zi=self.lpf_zi
         )
+
+        # Diagnostics: track pre-AGC baseband level
+        if self._diag_enabled:
+            bb_rms = np.sqrt(np.mean(bpsk_baseband ** 2))
+            self._baseband_rms_pre_agc = 0.9 * self._baseband_rms_pre_agc + 0.1 * bb_rms
 
         return bpsk_baseband
 
@@ -562,12 +742,16 @@ class RDSDecoder:
             data_bit = 0 if curr_sample > 0 else 1
             self.bit_distribution[data_bit] += 1
 
+            # Diagnostics: capture soft symbol value for constellation analysis
+            if self._diag_enabled:
+                self._soft_symbols.append(curr_sample)
+
             # Gardner TED for phase and frequency adjustment (PI loop)
-            timing_error = -(curr_sample - prev_sample) * mid_sample
+            timing_error_raw = -(curr_sample - prev_sample) * mid_sample
             norm = abs(curr_sample) + abs(prev_sample) + abs(mid_sample) + 1e-10
-            timing_error = timing_error / norm
-            # Clamp error to prevent runaway near timing_mu boundaries
-            timing_error = max(-0.3, min(0.3, timing_error))
+            timing_error = timing_error_raw / norm
+            # Clamp error to prevent runaway
+            timing_error = max(-0.5, min(0.5, timing_error))
 
             # Proportional term: immediate phase correction
             self.timing_mu += self.timing_gain_p * timing_error
@@ -608,6 +792,17 @@ class RDSDecoder:
             # Diagnostic logging (cheap append to deque, no I/O)
             if self._diag_enabled:
                 self._diag_buffer.append((self.timing_mu, timing_error, self.timing_freq_offset))
+
+                # Periodic file logging for timing analysis
+                self._timing_log_counter += 1
+                if self._timing_log_file and self._timing_log_counter % self._timing_log_interval == 0:
+                    blk_rate = self.blocks_received / max(1, self.blocks_expected)
+                    self._timing_log_file.write(
+                        f"{self._timing_log_counter},{self.timing_mu:.4f},{timing_error:.6f},"
+                        f"{timing_error_raw:.6f},{self.timing_freq_offset:.6f},"
+                        f"{curr_sample:.4f},{advance},{blk_rate:.3f}\n"
+                    )
+                    self._timing_log_file.flush()
 
             # Track statistics (after wrapping, so we see actual operating range)
             self.timing_mu_min = min(self.timing_mu_min, self.timing_mu)
@@ -913,6 +1108,11 @@ class RDSDecoder:
             'timing_freq_offset': self.timing_freq_offset,
             # Error correction statistics
             'corrections_by_burst': self.corrections_by_burst[1:].copy(),  # Burst lengths 1-5
+            # Coherent demod diagnostics (always available when diagnostics enabled)
+            'pilot_rms': self._pilot_rms,
+            'carrier_rms': self._carrier_rms,
+            'baseband_rms': self._baseband_rms_pre_agc,
+            'symbol_snr_db': self._symbol_snr_estimate,
         }
 
     @property
@@ -954,7 +1154,7 @@ class RDSDecoder:
         # Filter states
         self.bpf_zi = signal.lfilter_zi(self.bpf_b, self.bpf_a) * 0
         self.lpf_zi = signal.lfilter_zi(self.lpf_b, self.lpf_a) * 0
-        self.pilot_iir_zi = signal.lfilter_zi(self.pilot_iir_b, self.pilot_iir_a) * 0
+        self.pilot_bpf_zi = signal.lfilter_zi(self.pilot_bpf_b, self.pilot_bpf_a) * 0
 
         # Delay buffers
         self.delay_buffer = np.zeros(self.delay_samples)
@@ -1009,3 +1209,15 @@ class RDSDecoder:
         self._diag_buffer.clear()
         self._wrap_count_up = 0
         self._wrap_count_down = 0
+        self._pilot_rms = 0.0
+        self._pilot_peak = 0.0
+        self._carrier_rms = 0.0
+        self._baseband_rms_pre_agc = 0.0
+        self._soft_symbols.clear()
+        self._symbol_snr_estimate = 0.0
+        self._phase_diag_buffer.clear()
+        # Close timing log file if open
+        if self._timing_log_file:
+            self._timing_log_file.close()
+            self._timing_log_file = None
+        self._timing_log_counter = 0

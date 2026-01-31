@@ -27,6 +27,8 @@ Controls:
     a: Toggle spectrum analyzer
     G: Toggle GPU demodulator (FM mode only)
     Q: Toggle squelch
+    d: Toggle RDS diagnostics (press twice to dump to /tmp/rds_diag.txt)
+    B: Toggle debug stats display
     q: Quit
 """
 
@@ -72,6 +74,62 @@ except ImportError as e:
 from demodulator import FMStereoDecoder, NBFMDecoder
 from gpu import GPUFMDemodulator, GPUResampler, GPUFIRBank, GPUFIRFilter
 from rds_decoder import RDSDecoder, pi_to_callsign
+
+
+def enable_realtime_mode():
+    """
+    Enable real-time scheduling for improved timing determinism.
+
+    This helps reduce jitter in audio processing and RDS decoding by:
+    1. Setting SCHED_FIFO real-time scheduling policy
+    2. Locking memory to prevent paging delays
+    3. Disabling Python GC during critical sections (optional)
+
+    Requires root privileges or CAP_SYS_NICE capability.
+    Run with: sudo ./pyfm.py --realtime [frequency]
+    Or grant capability: sudo setcap cap_sys_nice+ep /usr/bin/python3
+
+    Returns:
+        dict with status of each operation
+    """
+    import ctypes
+
+    results = {
+        'sched_fifo': False,
+        'mlockall': False,
+        'priority': None,
+        'errors': []
+    }
+
+    # Try to set SCHED_FIFO with priority 50 (range is 1-99)
+    try:
+        priority = 50
+        param = os.sched_param(priority)
+        os.sched_setscheduler(0, os.SCHED_FIFO, param)
+        results['sched_fifo'] = True
+        results['priority'] = priority
+    except PermissionError:
+        results['errors'].append("SCHED_FIFO: Permission denied (need root or CAP_SYS_NICE)")
+    except Exception as e:
+        results['errors'].append(f"SCHED_FIFO: {e}")
+
+    # Try to lock all memory (prevent paging)
+    try:
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        MCL_CURRENT = 1
+        MCL_FUTURE = 2
+        if libc.mlockall(MCL_CURRENT | MCL_FUTURE) == 0:
+            results['mlockall'] = True
+        else:
+            errno = ctypes.get_errno()
+            if errno == 1:  # EPERM
+                results['errors'].append("mlockall: Permission denied (need root or CAP_IPC_LOCK)")
+            else:
+                results['errors'].append(f"mlockall: Failed with errno {errno}")
+    except Exception as e:
+        results['errors'].append(f"mlockall: {e}")
+
+    return results
 
 
 # NOAA Weather Radio channels (NWS standard)
@@ -352,12 +410,8 @@ class AudioPlayer:
         self.running = False
         self.volume = 1.0
 
-        # Adaptive rate control: compensates for clock drift between
-        # BB60D and audio card by dropping samples when buffer grows too large.
-        # Only drops, no duplicates - the BB60D clock is slightly faster than
-        # the audio card, so buffer grows over time. We just trim the excess.
-        self._drop_threshold_ms = 400  # Drop when buffer exceeds this
-        self._samples_dropped = 0  # Stats tracking
+        # Adaptive rate control: target buffer level for rate adjustment
+        self._target_level_ms = 150
 
     def _audio_callback(self, outdata, frames, time_info, status):
         """Sounddevice callback for audio output."""
@@ -392,8 +446,8 @@ class AudioPlayer:
     def start(self):
         """Start audio playback stream."""
         self.running = True
-        # Pre-fill buffer with silence to add latency
-        prefill = int(self.sample_rate * self.latency)
+        # Pre-fill buffer to target level (accounts for first block adding more)
+        prefill = int(self.sample_rate * self._target_level_ms / 1000)
         self.write_pos = prefill
         self.read_pos = 0
 
@@ -417,12 +471,10 @@ class AudioPlayer:
     def reset(self):
         """Reset buffer to prefilled state (call after tuning)."""
         with self.buffer_lock:
-            prefill = int(self.sample_rate * self.latency)
+            prefill = int(self.sample_rate * self._target_level_ms / 1000)
             self.buffer[:] = 0  # Clear to silence
             self.write_pos = prefill
             self.read_pos = 0
-        # Reset drop counter
-        self._samples_dropped = 0
 
     @property
     def buffer_level_ms(self):
@@ -440,19 +492,13 @@ class AudioPlayer:
     def rate_control_stats(self):
         """Return adaptive rate control statistics."""
         return {
-            'dropped': self._samples_dropped,
-            'threshold_ms': self._drop_threshold_ms,
+            'target_ms': self._target_level_ms,
+            'current_ms': self.buffer_level_ms,
         }
 
     def queue_audio(self, audio_data):
         """
         Add audio data to the ring buffer.
-
-        Implements adaptive rate control to compensate for clock drift
-        between the sample source (BB60D) and audio output (sound card).
-        When buffer level drifts too far from target, single samples are
-        dropped or duplicated to maintain stable latency. At 48 kHz, one
-        sample is ~21 µs — well below audible threshold.
 
         Args:
             audio_data: numpy array of float32 audio samples
@@ -461,14 +507,6 @@ class AudioPlayer:
         # Convert mono to stereo if needed
         if audio_data.ndim == 1:
             audio_data = np.column_stack((audio_data, audio_data))
-
-        # Adaptive rate control: drop samples when buffer gets too full.
-        # BB60D clock runs slightly faster than audio card, so buffer grows
-        # over time. Drop one sample when we exceed threshold to trim excess.
-        if self.buffer_level_ms > self._drop_threshold_ms:
-            if len(audio_data) > 1:
-                audio_data = audio_data[1:]
-                self._samples_dropped += 1
 
         with self.buffer_lock:
             samples = len(audio_data)
@@ -709,15 +747,17 @@ class FMRadio:
                 block_size=self.IQ_BLOCK_SIZE
             )
 
-            self.gpu_resampler = GPUResampler(
-                up=self.stereo_decoder.resample_up,
-                down=self.stereo_decoder.resample_down,
-                n_input=self.IQ_BLOCK_SIZE
-            )
+            # GPU resampler disabled - using adaptive CPU resampling for rate control
+            # self.gpu_resampler = GPUResampler(
+            #     up=self.stereo_decoder.resample_up,
+            #     down=self.stereo_decoder.resample_down,
+            #     n_input=self.IQ_BLOCK_SIZE
+            # )
+            self.gpu_resampler = None
 
             # Flush stale IQ data that accumulated during init.
-            # The BB60D has been buffering for ~2-3 s; drain it so the
-            # audio loop starts with fresh samples and no sample-loss count.
+            # The audio loop has startup stabilization that discards blocks
+            # if the buffer fills too fast, so a simple flush here is sufficient.
             self.device.flush_iq()
 
             # Attach GPU components to stereo decoder (GPU enabled by default)
@@ -747,6 +787,10 @@ class FMRadio:
         self.running = False
         if self.audio_thread:
             self.audio_thread.join(timeout=1.0)
+        # Close rate control log file
+        if hasattr(self, '_rate_log_file') and self._rate_log_file:
+            self._rate_log_file.close()
+            self._rate_log_file = None
         # Detach GPU components from stereo decoder before cleanup
         if self.stereo_decoder:
             self.stereo_decoder.gpu_demodulator = None
@@ -781,6 +825,13 @@ class FMRadio:
             'sample_loss': 0,
             'iterations': 0,
         }
+
+        # Startup stabilization: discard blocks until buffer level is reasonable
+        startup_blocks = 0
+        max_startup_blocks = 50  # ~1 second worth
+
+        # Rate control logging
+        self._audio_loop_start = time.perf_counter()
 
         while self.running:
             try:
@@ -823,6 +874,33 @@ class FMRadio:
                 # Check squelch
                 squelched = self.squelch_enabled and dbm < self.squelch_threshold
 
+                # Adaptive rate control: adjust resample ratio based on buffer level
+                # If buffer > target, produce fewer samples; if buffer < target, produce more
+                # Proportional control: 1ms error = 50ppm adjustment
+                # (higher gain = less steady-state error, buffer settles closer to target)
+                buf_level = self.audio_player.buffer_level_ms
+                buf_target = self.audio_player._target_level_ms
+                buf_error = buf_level - buf_target  # positive = buffer too full
+                rate_adj = 1.0 - (buf_error * 0.00005)  # 50 ppm per ms error
+                rate_adj = max(0.99, min(1.01, rate_adj))  # clamp to ±1%
+                if self.weather_mode:
+                    self.nbfm_decoder.rate_adjust = rate_adj
+                else:
+                    self.stereo_decoder.rate_adjust = rate_adj
+
+                # Log rate control stats every ~1 second (60 blocks)
+                if hasattr(self, '_rate_log_counter'):
+                    self._rate_log_counter += 1
+                else:
+                    self._rate_log_counter = 0
+                    self._rate_log_file = open('/tmp/pyfm_rate_control.log', 'w')
+                    self._rate_log_file.write("time_s,buf_ms,target_ms,error_ms,adj_ppm\n")
+                if self._rate_log_counter % 60 == 0:
+                    elapsed = time.perf_counter() - self._audio_loop_start if hasattr(self, '_audio_loop_start') else 0
+                    adj_ppm = (rate_adj - 1.0) * 1e6
+                    self._rate_log_file.write(f"{elapsed:.1f},{buf_level:.1f},{buf_target:.0f},{buf_error:.1f},{adj_ppm:.1f}\n")
+                    self._rate_log_file.flush()
+
                 # Demodulate FM using appropriate decoder
                 t_demod_start = time.perf_counter()
                 if self.weather_mode:
@@ -863,6 +941,14 @@ class FMRadio:
                 # Update spectrum analyzer
                 if self.spectrum_enabled:
                     self.spectrum_analyzer.update(audio)
+
+                # Startup stabilization: discard audio blocks if buffer is filling too fast
+                # This handles the initial IQ backlog from USB/OS buffers
+                if startup_blocks < max_startup_blocks:
+                    startup_blocks += 1
+                    if self.audio_player.buffer_level_ms > self.audio_player._target_level_ms:
+                        # Buffer already has enough - don't queue this block
+                        continue
 
                 # Queue audio for playback
                 self.audio_player.queue_audio(audio)
@@ -1492,7 +1578,7 @@ def build_display(radio, width=80):
         if radio.gpu_enabled:
             backend = radio.gpu_backend or "unknown"
             demod_text.append(f"GPU ({backend})", style="green bold")
-            demod_text.append(" — demod + FIR + resample", style="green")
+            demod_text.append(" — demod + FIR", style="green")
         else:
             demod_text.append("CPU (quadrature)", style="dim")
         table.add_row("Demod:", demod_text)
@@ -1623,9 +1709,41 @@ def build_display(radio, width=80):
         # Adaptive rate control stats
         rc_stats = radio.audio_player.rate_control_stats
         rc_text = Text()
-        rc_text.append(f"drop @{rc_stats['threshold_ms']:.0f}ms", style="dim")
-        rc_text.append(f"  dropped:{rc_stats['dropped']}", style="cyan")
+        buf_level = rc_stats['current_ms']
+        buf_target = rc_stats['target_ms']
+        buf_error = buf_level - buf_target
+        rate_ppm = -buf_error * 10  # 10 ppm per ms error
+        rc_text.append(f"buf:{buf_level:.0f}ms", style="dim")
+        rc_text.append(f"  target:{buf_target:.0f}ms", style="dim")
+        # Show rate adjustment as ppm deviation from nominal
+        if abs(buf_error) < 20:
+            rc_text.append(f"  adj:{rate_ppm:+.0f}ppm", style="green")
+        else:
+            rc_text.append(f"  adj:{rate_ppm:+.0f}ppm", style="yellow")
         table.add_row("Rate Ctl:", rc_text)
+
+        # RDS coherent demod diagnostics (when enabled)
+        if not radio.weather_mode and radio.rds_decoder and radio.rds_decoder._diag_enabled:
+            rds_diag = Text()
+            pilot_rms = rds_snapshot.get('pilot_rms', 0)
+            carrier_rms = rds_snapshot.get('carrier_rms', 0)
+            bb_rms = rds_snapshot.get('baseband_rms', 0)
+            symbol_snr = rds_snapshot.get('symbol_snr_db', 0)
+            # Color symbol SNR based on quality
+            if symbol_snr >= 15:
+                snr_style = "green bold"
+            elif symbol_snr >= 10:
+                snr_style = "green"
+            elif symbol_snr >= 6:
+                snr_style = "yellow"
+            else:
+                snr_style = "red"
+            rds_diag.append(f"pilot:{pilot_rms:.4f} ", style="dim")
+            rds_diag.append(f"carrier:{carrier_rms:.3f} ", style="dim")
+            rds_diag.append(f"bb:{bb_rms:.4f} ", style="dim")
+            rds_diag.append(f"symSNR:", style="dim")
+            rds_diag.append(f"{symbol_snr:.1f}dB", style=snr_style)
+            table.add_row("RDS Coh:", rds_diag)
 
         # Demodulator stage profiling
         if not radio.weather_mode and radio.stereo_decoder and radio.stereo_decoder.profile_enabled:
@@ -1974,6 +2092,11 @@ def main():
         action="store_true",
         help="Show version info and exit"
     )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help="Enable real-time scheduling (requires sudo or CAP_SYS_NICE)"
+    )
 
     args = parser.parse_args()
 
@@ -1999,6 +2122,16 @@ def main():
         else:
             print("IC-R8600: not available")
         return
+
+    # Enable real-time scheduling if requested
+    if args.realtime:
+        rt_results = enable_realtime_mode()
+        if rt_results['sched_fifo']:
+            print(f"Real-time mode: SCHED_FIFO priority {rt_results['priority']}")
+        if rt_results['mlockall']:
+            print("Real-time mode: Memory locked")
+        for err in rt_results['errors']:
+            print(f"Warning: {err}")
 
     # Load config for defaults
     initial_freq = 89.9e6  # Default frequency
