@@ -518,25 +518,6 @@ class FMStereoDecoder:
 
         return np.column_stack((left, right))
 
-    def set_bass_boost(self, enabled):
-        """Enable or disable +3dB bass boost at 250 Hz."""
-        self.bass_boost_enabled = enabled
-
-    def set_treble_boost(self, enabled):
-        """Enable or disable +3dB treble boost at 3.5 kHz."""
-        self.treble_boost_enabled = enabled
-
-    def set_tone_controls(self, bass=True, treble=True):
-        """
-        Set both tone controls at once.
-
-        Args:
-            bass: Enable bass boost (+3dB at 250 Hz)
-            treble: Enable treble boost (+3dB at 3.5 kHz)
-        """
-        self.bass_boost_enabled = bass
-        self.treble_boost_enabled = treble
-
     def reset(self):
         """Reset decoder state (call when changing frequency)."""
         self.last_sample = complex(1, 0)
