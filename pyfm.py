@@ -819,6 +819,14 @@ class FMRadio:
         startup_blocks = 0
         max_startup_blocks = 50  # ~1 second worth
 
+        # PI rate control state
+        # Kp: proportional gain (50 ppm per ms error - fast response)
+        # Ki: integral gain (slow drift correction, 5x reduction to reduce oscillation)
+        self._rate_Kp = 0.00005    # 50 ppm/ms
+        self._rate_Ki = 0.0000004  # ~24 ppm/ms/second at 60 Hz (was 0.000002)
+        self._rate_integrator = 0.0
+        self._rate_integrator_max = 0.005  # ±5000 ppm max integrator contribution
+
         # Rate control logging
         self._audio_loop_start = time.perf_counter()
 
@@ -859,14 +867,22 @@ class FMRadio:
                 # Check squelch
                 squelched = self.squelch_enabled and dbm < self.squelch_threshold
 
-                # Adaptive rate control: adjust resample ratio based on buffer level
+                # Adaptive rate control: PI controller adjusts resample ratio based on buffer level
                 # If buffer > target, produce fewer samples; if buffer < target, produce more
-                # Proportional control: 1ms error = 50ppm adjustment
-                # (higher gain = less steady-state error, buffer settles closer to target)
+                # P term: fast response to sudden changes
+                # I term: eliminates steady-state error by learning the clock drift
                 buf_level = self.audio_player.buffer_level_ms
                 buf_target = self.audio_player._target_level_ms
                 buf_error = buf_level - buf_target  # positive = buffer too full
-                rate_adj = 1.0 - (buf_error * 0.00005)  # 50 ppm per ms error
+
+                # PI controller
+                p_term = buf_error * self._rate_Kp
+                self._rate_integrator += buf_error * self._rate_Ki
+                # Anti-windup: clamp integrator to prevent runaway
+                self._rate_integrator = max(-self._rate_integrator_max,
+                                            min(self._rate_integrator_max, self._rate_integrator))
+                i_term = self._rate_integrator
+                rate_adj = 1.0 - (p_term + i_term)
                 rate_adj = max(0.99, min(1.01, rate_adj))  # clamp to ±1%
                 if self.weather_mode:
                     self.nbfm_decoder.rate_adjust = rate_adj
@@ -879,11 +895,13 @@ class FMRadio:
                 else:
                     self._rate_log_counter = 0
                     self._rate_log_file = open('/tmp/pyfm_rate_control.log', 'w')
-                    self._rate_log_file.write("time_s,buf_ms,target_ms,error_ms,adj_ppm\n")
+                    self._rate_log_file.write("time_s,buf_ms,target_ms,error_ms,p_ppm,i_ppm,adj_ppm\n")
                 if self._rate_log_counter % 60 == 0:
                     elapsed = time.perf_counter() - self._audio_loop_start if hasattr(self, '_audio_loop_start') else 0
+                    p_ppm = p_term * 1e6
+                    i_ppm = i_term * 1e6
                     adj_ppm = (rate_adj - 1.0) * 1e6
-                    self._rate_log_file.write(f"{elapsed:.1f},{buf_level:.1f},{buf_target:.0f},{buf_error:.1f},{adj_ppm:.1f}\n")
+                    self._rate_log_file.write(f"{elapsed:.1f},{buf_level:.1f},{buf_target:.0f},{buf_error:.1f},{p_ppm:.1f},{i_ppm:.1f},{adj_ppm:.1f}\n")
                     self._rate_log_file.flush()
 
                 # Demodulate FM using appropriate decoder
