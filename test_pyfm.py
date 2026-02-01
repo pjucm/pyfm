@@ -16,12 +16,9 @@ Signal Flow:
                                                                     |
                  Matrix: L = L+R + L-R, R = L+R - L-R <-------------+
 
-Carrier Regeneration Methods:
-    1. PLL mode (use_pll=True): Tracks pilot phase, generates coherent carriers
-       KNOWN BUG: Decimates 19 kHz to ~4 kHz, causing severe aliasing
-
-    2. Pilot-squaring mode (use_pll=False): Uses identity 2*sin^2(x)-1 = -cos(2x)
-       WORKS CORRECTLY when transmitter uses -cos(2*pi*38000*t) subcarrier
+Carrier Regeneration:
+    Pilot-squaring method: Uses identity 2*sin^2(x)-1 = -cos(2x)
+    Works correctly when transmitter uses -cos(2*pi*38000*t) subcarrier.
 
 Group Delay Alignment:
     L+R path: LPF (63 samples) + delay buffer (100 samples) = 163 samples
@@ -47,13 +44,15 @@ Validation Targets:
     Stereo separation: > 30 dB (67+ dB typical with synthetic signal)
     L/R timing: < 5 samples at 48 kHz
     Frequency response: +/- 3 dB below 1 kHz
+    CPU/GPU demod parity: Correlation > 0.9999
 """
 
 import numpy as np
 from scipy import signal
 import sys
 
-from demodulator import FMStereoDecoder, PilotPLL
+from demodulator import FMStereoDecoder
+from gpu import GPUFMDemodulator
 
 
 # =============================================================================
@@ -416,6 +415,131 @@ def test_fm_demod_accuracy():
     return passed
 
 
+def test_gpu_demod_accuracy():
+    """
+    Test GPU FM demodulation accuracy.
+
+    Uses GPUFMDemodulator to demodulate FM signal and compares to expected.
+    If GPU is not available, test passes with a skip message.
+
+    Pass criteria: Correlation > 0.999, amplitude error < 1%
+    """
+    print("\n" + "=" * 60)
+    print("TEST: GPU FM Demodulation Accuracy")
+    print("=" * 60)
+
+    sample_rate = 250000
+    duration = 0.1  # 100 ms
+    test_freq = 1000  # 1 kHz test tone
+
+    # Generate test tone baseband
+    baseband_in = generate_test_tone(test_freq, duration, sample_rate, amplitude=0.5)
+
+    # FM modulate to I/Q
+    iq = fm_modulate(baseband_in, sample_rate, deviation=75000)
+
+    # Create GPU demodulator
+    gpu_demod = GPUFMDemodulator(sample_rate=sample_rate, deviation=75000)
+
+    if gpu_demod.backend == 'cpu':
+        print("  GPU not available - testing CPU fallback path")
+
+    # Demodulate
+    baseband_out = gpu_demod.demodulate(iq)
+
+    # Allow for settling - skip first and last samples
+    skip = 2000
+    baseband_in_trimmed = baseband_in[skip:-skip]
+    baseband_out_trimmed = baseband_out[skip:-skip]
+
+    # Compute correlation
+    correlation = np.corrcoef(baseband_in_trimmed, baseband_out_trimmed)[0, 1]
+
+    # Compute RMS amplitude ratio
+    rms_in = np.sqrt(np.mean(baseband_in_trimmed ** 2))
+    rms_out = np.sqrt(np.mean(baseband_out_trimmed ** 2))
+    amplitude_ratio = rms_out / rms_in
+    amplitude_error = abs(1.0 - amplitude_ratio) * 100
+
+    print(f"  Backend: {gpu_demod.backend}")
+    print(f"  Correlation: {correlation:.6f}")
+    print(f"  Amplitude ratio: {amplitude_ratio:.4f}")
+    print(f"  Amplitude error: {amplitude_error:.2f}%")
+
+    passed = correlation > 0.999 and amplitude_error < 1.0
+    print(f"  Result: {'PASS' if passed else 'FAIL'}")
+
+    gpu_demod.cleanup()
+    return passed
+
+
+def test_cpu_gpu_parity():
+    """
+    Test CPU and GPU demodulation produce matching results.
+
+    Compares FMStereoDecoder CPU path with GPUFMDemodulator output.
+    Both should produce effectively identical baseband signals.
+
+    Pass criteria: Correlation > 0.9999 between CPU and GPU output
+    """
+    print("\n" + "=" * 60)
+    print("TEST: CPU/GPU Demodulation Parity")
+    print("=" * 60)
+
+    sample_rate = 250000
+    duration = 0.1  # 100 ms
+    test_freq = 1000  # 1 kHz test tone
+
+    # Generate FM signal
+    baseband_in = generate_test_tone(test_freq, duration, sample_rate, amplitude=0.5)
+    iq = fm_modulate(baseband_in, sample_rate, deviation=75000)
+
+    # CPU demodulation via FMStereoDecoder
+    decoder = FMStereoDecoder(
+        iq_sample_rate=sample_rate,
+        audio_sample_rate=sample_rate,  # No resampling
+        deviation=75000,
+        deemphasis=1e-9
+    )
+    decoder.bass_boost_enabled = False
+    decoder.treble_boost_enabled = False
+    decoder.stereo_blend_enabled = False
+    _ = decoder.demodulate(iq)
+    cpu_baseband = decoder.last_baseband
+
+    # GPU demodulation
+    gpu_demod = GPUFMDemodulator(sample_rate=sample_rate, deviation=75000)
+    gpu_baseband = gpu_demod.demodulate(iq)
+
+    print(f"  GPU backend: {gpu_demod.backend}")
+
+    # Compare outputs (skip settling region)
+    skip = 2000
+    cpu_trimmed = cpu_baseband[skip:-skip]
+    gpu_trimmed = gpu_baseband[skip:-skip]
+
+    # Compute correlation
+    correlation = np.corrcoef(cpu_trimmed, gpu_trimmed)[0, 1]
+
+    # Compute max absolute difference
+    max_diff = np.max(np.abs(cpu_trimmed - gpu_trimmed))
+    mean_diff = np.mean(np.abs(cpu_trimmed - gpu_trimmed))
+
+    print(f"  Correlation: {correlation:.6f}")
+    print(f"  Max absolute difference: {max_diff:.6f}")
+    print(f"  Mean absolute difference: {mean_diff:.6f}")
+
+    # Both methods should produce nearly identical results
+    # The CPU uses quadrature discriminator (angle of product)
+    # The GPU uses arctangent-differentiate (atan2 + unwrap)
+    # Both are mathematically equivalent
+    passed = correlation > 0.9999
+    print(f"  Result: {'PASS' if passed else 'FAIL'} (target: correlation > 0.9999)")
+
+    gpu_demod.cleanup()
+    return passed
+
+
 def test_audio_snr():
     """
     Test decoded audio SNR with clean input.
@@ -442,14 +566,13 @@ def test_audio_snr():
     multiplex = generate_fm_stereo_multiplex(left, right, iq_rate, subcarrier_phase='neg_cos')
     iq = fm_modulate(multiplex, iq_rate)
 
-    # Create decoder with pilot-squaring (works correctly)
+    # Create decoder
     decoder = FMStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
         deemphasis=1e-9
     )
-    decoder.use_pll = False  # Use pilot-squaring (PLL has aliasing bug)
     decoder.bass_boost_enabled = False
     decoder.treble_boost_enabled = False
     decoder.stereo_blend_enabled = False
@@ -505,7 +628,6 @@ def test_thd_n():
         deviation=75000,
         deemphasis=1e-9
     )
-    decoder.use_pll = False
     decoder.bass_boost_enabled = False
     decoder.treble_boost_enabled = False
     decoder.stereo_blend_enabled = False
@@ -598,83 +720,10 @@ def test_mono_decode():
     return passed
 
 
-def test_pll_mode_bug():
-    """
-    Test PLL mode to verify/document the aliasing bug.
-
-    The PLL decimates 19 kHz to ~4 kHz, causing severe aliasing.
-    This test verifies the bug exists (expected to FAIL stereo decode).
-
-    This is a regression test - if it starts passing, the PLL was fixed!
-    """
-    print("\n" + "=" * 60)
-    print("TEST: PLL Mode (Known Bug Verification)")
-    print("=" * 60)
-
-    iq_rate = 250000
-    audio_rate = 48000
-    duration = 1.0
-
-    n_samples = int(duration * iq_rate)
-    t = np.arange(n_samples) / iq_rate
-
-    left = 0.5 * np.sin(2 * np.pi * 1000 * t)
-    right = np.zeros(n_samples)
-
-    # Use neg_cos (correct for pilot-squaring, should also work for proper PLL)
-    multiplex = generate_fm_stereo_multiplex(left, right, iq_rate, subcarrier_phase='neg_cos')
-    iq = fm_modulate(multiplex, iq_rate)
-
-    # Create decoder with PLL ENABLED (production default)
-    decoder = FMStereoDecoder(
-        iq_sample_rate=iq_rate,
-        audio_sample_rate=audio_rate,
-        deviation=75000,
-        deemphasis=1e-9
-    )
-    decoder.use_pll = True  # Production default - known to be broken
-    decoder.bass_boost_enabled = False
-    decoder.treble_boost_enabled = False
-    decoder.stereo_blend_enabled = False
-
-    audio = demodulate_with_settling(decoder, iq)
-
-    skip = len(audio) // 2
-    left_out = audio[skip:, 0]
-    right_out = audio[skip:, 1]
-
-    left_power = goertzel_power(left_out, 1000, audio_rate)
-    right_power = goertzel_power(right_out, 1000, audio_rate)
-    separation = 10 * np.log10(left_power / (right_power + 1e-12))
-
-    print(f"  PLL locked: {decoder.pilot_pll.locked}")
-    print(f"  Pilot detected: {decoder.pilot_detected}")
-    print(f"  Left power: {left_power:.6f}")
-    print(f"  Right power: {right_power:.6f}")
-    print(f"  Stereo separation: {separation:.1f} dB")
-    print()
-
-    # The bug: PLL reports "locked" but produces wrong carrier frequency
-    # due to aliasing (19 kHz -> ~3 kHz at 4 kHz decimated rate)
-    bug_present = separation < 10  # Should have >30 dB if working
-
-    if bug_present:
-        print("  BUG CONFIRMED: PLL aliasing prevents stereo decode")
-        print("  The PLL decimates 19 kHz pilot to ~4 kHz rate, causing aliasing")
-        print("  Recommendation: Use pilot-squaring mode (use_pll=False)")
-        print(f"  Result: EXPECTED FAILURE (bug documented)")
-        return True  # Test passes because we're verifying bug exists
-    else:
-        print("  PLL appears to be working - bug may have been fixed!")
-        print(f"  Result: PASS (stereo decode works)")
-        return True
-
-
 def test_stereo_decode():
     """
     Test stereo decoding with different tones on L and R.
 
-    Uses pilot-squaring mode which works correctly.
     Generates 1 kHz on left, 2 kHz on right.
 
     Pass criteria:
@@ -700,14 +749,13 @@ def test_stereo_decode():
     multiplex = generate_fm_stereo_multiplex(left, right, iq_rate, subcarrier_phase='neg_cos')
     iq = fm_modulate(multiplex, iq_rate)
 
-    # Create decoder with pilot-squaring (works correctly)
+    # Create decoder
     decoder = FMStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
         deemphasis=1e-9
     )
-    decoder.use_pll = False  # Use pilot-squaring
     decoder.bass_boost_enabled = False
     decoder.treble_boost_enabled = False
     decoder.stereo_blend_enabled = False
@@ -745,7 +793,6 @@ def test_stereo_separation():
     Test stereo separation across frequency range.
 
     Tests left-only tones at 100 Hz, 1 kHz, 5 kHz, 10 kHz, 12 kHz.
-    Uses pilot-squaring mode which works correctly.
 
     Pass criteria: >30 dB separation at all tested frequencies
     """
@@ -765,7 +812,6 @@ def test_stereo_separation():
         deviation=75000,
         deemphasis=1e-9
     )
-    decoder.use_pll = False  # Use pilot-squaring
     decoder.bass_boost_enabled = False
     decoder.treble_boost_enabled = False
     decoder.stereo_blend_enabled = False
@@ -850,7 +896,6 @@ def test_subcarrier_phase_sensitivity():
             deviation=75000,
             deemphasis=1e-9
         )
-        decoder.use_pll = False
         decoder.bass_boost_enabled = False
         decoder.treble_boost_enabled = False
         decoder.stereo_blend_enabled = False
@@ -921,7 +966,6 @@ def test_group_delay_alignment():
         deviation=75000,
         deemphasis=1e-9
     )
-    decoder.use_pll = False
     decoder.bass_boost_enabled = False
     decoder.treble_boost_enabled = False
     decoder.stereo_blend_enabled = False
@@ -977,7 +1021,6 @@ def test_frequency_response():
         deviation=75000,
         deemphasis=1e-9
     )
-    decoder.use_pll = False
     decoder.bass_boost_enabled = False
     decoder.treble_boost_enabled = False
     decoder.stereo_blend_enabled = False
@@ -1075,7 +1118,6 @@ def test_snr_with_noise():
             deviation=75000,
             deemphasis=1e-9
         )
-        decoder.use_pll = False
         decoder.bass_boost_enabled = False
         decoder.treble_boost_enabled = False
         decoder.stereo_blend_enabled = True
@@ -1108,18 +1150,16 @@ def run_all_tests():
     print("\n" + "=" * 60)
     print("FM STEREO DECODER TEST SUITE")
     print("=" * 60)
-    print("\nTesting demodulator.py (FMStereoDecoder, PilotPLL)")
+    print("\nTesting demodulator.py (FMStereoDecoder) and gpu.py (GPUFMDemodulator)")
     print("Signal flow: IQ -> FM Demod -> Pilot/L+R/L-R -> Matrix -> Audio")
-    print()
-    print("IMPORTANT: Tests use pilot-squaring mode (use_pll=False)")
-    print("because PLL mode has a known aliasing bug.")
 
     tests = [
         ("FM Demodulation Accuracy", test_fm_demod_accuracy),
+        ("GPU Demodulation Accuracy", test_gpu_demod_accuracy),
+        ("CPU/GPU Parity", test_cpu_gpu_parity),
         ("Audio SNR (Clean)", test_audio_snr),
         ("THD+N", test_thd_n),
         ("Mono Decoding", test_mono_decode),
-        ("PLL Mode Bug Verification", test_pll_mode_bug),
         ("Stereo Decoding", test_stereo_decode),
         ("Stereo Separation", test_stereo_separation),
         ("Subcarrier Phase Sensitivity", test_subcarrier_phase_sensitivity),
@@ -1154,14 +1194,31 @@ def run_all_tests():
     print(f"\n  {passed_count}/{total_count} tests passed")
 
     print()
-    print("KNOWN ISSUES:")
-    print("  1. PLL mode has aliasing bug (19 kHz aliased at ~4 kHz decimated rate)")
-    print("  2. Production default is use_pll=True, which is broken")
-    print("  3. Pilot-squaring works but requires TX to use -cos(2wt) subcarrier")
+    print("NOTES:")
+    print("  - Pilot-squaring requires TX to use -cos(2wt) subcarrier")
+    print("  - GPU tests require PyTorch with ROCm/CUDA (skipped if unavailable)")
 
     return passed_count == total_count
 
 
+def cleanup_gpu_and_exit(exit_code):
+    """Cleanup GPU resources and exit cleanly to prevent ROCm/PyTorch shutdown issues."""
+    import os
+    # Flush output buffers before any exit
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # Force immediate exit to avoid PyTorch/ROCm double-free during cleanup
+            os._exit(exit_code)
+    except ImportError:
+        pass
+    sys.exit(exit_code)
+
+
 if __name__ == "__main__":
     success = run_all_tests()
-    sys.exit(0 if success else 1)
+    cleanup_gpu_and_exit(0 if success else 1)
