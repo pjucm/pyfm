@@ -816,9 +816,10 @@ class FMRadio:
 
     def _audio_loop(self):
         """Background thread for IQ capture, demodulation, and signal measurement."""
-        # Startup stabilization: discard blocks until buffer level is reasonable
+        # Startup stabilization: process and discard blocks to drain IQ backlog
+        # We process at full speed but don't output audio until buffer stabilizes
         startup_blocks = 0
-        max_startup_blocks = 50  # ~1 second worth
+        max_startup_blocks = 100  # ~2 seconds to drain USB/OS backlog
 
         # PI rate control state
         # Kp: proportional gain (50 ppm per ms error - fast response)
@@ -876,15 +877,23 @@ class FMRadio:
                 buf_target = self.audio_player._target_level_ms
                 buf_error = buf_level - buf_target  # positive = buffer too full
 
-                # PI controller
-                p_term = buf_error * self._rate_Kp
-                self._rate_integrator += buf_error * self._rate_Ki
-                # Anti-windup: clamp integrator to prevent runaway
-                self._rate_integrator = max(-self._rate_integrator_max,
-                                            min(self._rate_integrator_max, self._rate_integrator))
-                i_term = self._rate_integrator
-                rate_adj = 1.0 - (p_term + i_term)
-                rate_adj = max(0.99, min(1.01, rate_adj))  # clamp to ±1%
+                # During startup, freeze PI controller to avoid integrator windup
+                # from processing the initial IQ backlog
+                if startup_blocks < max_startup_blocks:
+                    p_term = 0.0
+                    i_term = 0.0
+                    rate_adj = 1.0  # Unity rate during startup
+                else:
+                    # PI controller (only after startup stabilization)
+                    p_term = buf_error * self._rate_Kp
+                    self._rate_integrator += buf_error * self._rate_Ki
+                    # Anti-windup: clamp integrator to prevent runaway
+                    self._rate_integrator = max(-self._rate_integrator_max,
+                                                min(self._rate_integrator_max, self._rate_integrator))
+                    i_term = self._rate_integrator
+                    rate_adj = 1.0 - (p_term + i_term)
+                    rate_adj = max(0.99, min(1.01, rate_adj))  # clamp to ±1%
+
                 if self.weather_mode:
                     self.nbfm_decoder.rate_adjust = rate_adj
                 else:
@@ -941,13 +950,13 @@ class FMRadio:
                 if self.spectrum_enabled:
                     self.spectrum_analyzer.update(audio)
 
-                # Startup stabilization: discard audio blocks if buffer is filling too fast
-                # This handles the initial IQ backlog from USB/OS buffers
+                # Startup stabilization: let the stream settle after initial flush
                 if startup_blocks < max_startup_blocks:
                     startup_blocks += 1
-                    if self.audio_player.buffer_level_ms > self.audio_player._target_level_ms:
-                        # Buffer already has enough - don't queue this block
-                        continue
+                    # Reset audio buffer on last startup block for clean start
+                    if startup_blocks == max_startup_blocks:
+                        self.audio_player.reset()
+                    continue  # Discard this block
 
                 # Queue audio for playback
                 self.audio_player.queue_audio(audio)
