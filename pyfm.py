@@ -555,7 +555,7 @@ class FMRadio:
     # Config file path (in same directory as script)
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyfm.cfg')
 
-    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False):
+    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None):
         """
         Initialize FM Radio.
 
@@ -563,8 +563,10 @@ class FMRadio:
             initial_freq: Initial frequency in Hz
             use_icom: If True, use IC-R8600 instead of BB60D
             use_24bit: If True, use 24-bit I/Q samples (IC-R8600 only)
+            preamp: None (don't touch), True (force on), or False (force off)
         """
         self.use_icom = use_icom
+        self._preamp_setting = preamp  # None = don't touch, True = on, False = off
 
         if use_icom:
             if IcomR8600 is None:
@@ -708,6 +710,10 @@ class FMRadio:
             # we flush stale data before entering the audio loop.
             self.device.configure_iq_streaming(self.device.frequency, self.IQ_SAMPLE_RATE)
             actual_rate = self.device.iq_sample_rate
+
+            # Apply preamp setting if specified (IC-R8600 only)
+            if self._preamp_setting is not None and hasattr(self.device, 'set_preamp'):
+                self.device.set_preamp(self._preamp_setting)
 
             # Create all decoders and GPU objects with the correct rate.
             # PyTorch/ROCm init and scipy filter design are heavyweight
@@ -2095,6 +2101,12 @@ def main():
         dest="use_24bit",
         help="Use 24-bit I/Q samples (IC-R8600 only)"
     )
+    parser.add_argument(
+        "--preamp",
+        choices=["on", "off"],
+        default=None,
+        help="Force preamp on or off (IC-R8600 only, default: unchanged)"
+    )
 
     args = parser.parse_args()
 
@@ -2166,8 +2178,21 @@ def main():
         print("Error: --24bit requires IC-R8600 (use --icom)")
         sys.exit(1)
 
+    # Validate --preamp requires Icom
+    if args.preamp and not use_icom:
+        print("Error: --preamp requires IC-R8600 (use --icom)")
+        sys.exit(1)
+
+    # Convert preamp argument to boolean (None = don't touch)
+    preamp_setting = None
+    if args.preamp == "on":
+        preamp_setting = True
+    elif args.preamp == "off":
+        preamp_setting = False
+
     # Create radio instance
-    radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=args.use_24bit)
+    radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=args.use_24bit,
+                    preamp=preamp_setting)
 
     # Run rich UI
     try:
