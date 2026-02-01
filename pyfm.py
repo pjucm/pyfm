@@ -80,11 +80,9 @@ def enable_realtime_mode():
     This helps reduce jitter in audio processing and RDS decoding by:
     1. Setting SCHED_FIFO real-time scheduling policy
     2. Locking memory to prevent paging delays
-    3. Disabling Python GC during critical sections (optional)
 
-    Requires root privileges or CAP_SYS_NICE capability.
-    Run with: sudo ./pyfm.py --realtime [frequency]
-    Or grant capability: sudo setcap cap_sys_nice+ep /usr/bin/python3
+    Enabled by default. Requires root privileges or CAP_SYS_NICE capability.
+    Grant capability: sudo setcap cap_sys_nice+ep /usr/bin/python3
 
     Returns:
         dict with status of each operation
@@ -629,6 +627,9 @@ class FMRadio:
         # Weather radio mode (NBFM for NWS)
         self.weather_mode = False
         self.nbfm_decoder = None
+
+        # Real-time scheduling status (set by main after enable_realtime_mode)
+        self.rt_enabled = False
 
         # Load saved config (presets and last frequency)
         self._load_config()
@@ -1250,14 +1251,15 @@ def build_display(radio, width=80):
             freq_text.append(f"  ({wx_ch})", style="cyan bold")
     table.add_row("Frequency:", freq_text)
 
-    # Mode row - include bit depth for IC-R8600
+    # Mode row - include RT prefix and bit depth for IC-R8600
+    rt_prefix = "RT " if radio.rt_enabled else ""
     bit_depth_suffix = ""
     if hasattr(radio.device, '_bit_depth') and radio.device._bit_depth == 24:
         bit_depth_suffix = " [24-bit]"
     if radio.weather_mode:
-        table.add_row("Mode:", f"NBFM Weather Radio (5 kHz dev){bit_depth_suffix}")
+        table.add_row("Mode:", f"{rt_prefix}NBFM Weather Radio (5 kHz dev){bit_depth_suffix}")
     else:
-        table.add_row("Mode:", f"Wideband FM Stereo (75 kHz dev){bit_depth_suffix}")
+        table.add_row("Mode:", f"{rt_prefix}Wideband FM Stereo (75 kHz dev){bit_depth_suffix}")
 
     # Volume row
     vol_pct = int(radio.volume * 100)
@@ -1942,7 +1944,7 @@ def main():
     parser.add_argument(
         "--realtime",
         action="store_true",
-        help="Enable real-time scheduling (requires sudo or CAP_SYS_NICE)"
+        help="Show real-time scheduling status (RT enabled by default when available)"
     )
     parser.add_argument(
         "--24bit",
@@ -1982,9 +1984,11 @@ def main():
             print("IC-R8600: not available")
         return
 
-    # Enable real-time scheduling if requested
+    # Enable real-time scheduling by default (silently, unless errors)
+    rt_results = enable_realtime_mode()
+    rt_enabled = rt_results['sched_fifo']
     if args.realtime:
-        rt_results = enable_realtime_mode()
+        # Verbose output only when explicitly requested
         if rt_results['sched_fifo']:
             print(f"Real-time mode: SCHED_FIFO priority {rt_results['priority']}")
         if rt_results['mlockall']:
@@ -2049,6 +2053,7 @@ def main():
     # Create radio instance
     radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=use_24bit,
                     preamp=preamp_setting)
+    radio.rt_enabled = rt_enabled
 
     # Run rich UI
     try:
