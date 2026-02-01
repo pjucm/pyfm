@@ -472,9 +472,9 @@ class FMStereoDecoder:
 
         # Scale down to provide headroom for tone controls and over-modulated stations.
         # Applied BEFORE tone controls so boosts don't cause clipping.
-        # 0.5 (-6dB) provides headroom for +3dB bass and +3dB treble.
-        left = left * 0.5
-        right = right * 0.5
+        # 0.65 (-3.7dB) provides headroom for +3dB bass and +3dB treble.
+        left = left * 0.65
+        right = right * 0.65
 
         # Apply tone controls (bass and treble boost)
         if self.bass_boost_enabled:
@@ -500,7 +500,7 @@ class FMStereoDecoder:
         self._peak_amplitude = max(0.95 * self._peak_amplitude, peak)  # Fast attack, slow decay
 
         # Apply soft limiting to catch any remaining peaks.
-        # After 0.5 scaling + up to +6dB tone boost, signal is typically ~0.7 max.
+        # After 0.65 scaling + up to +6dB tone boost, signal is typically ~0.9 max.
         # Soft limiter using tanh handles any peaks that still exceed 1.0.
         tanh_scale = np.tanh(1.5)
         left = np.tanh(left * 1.5) / tanh_scale
@@ -758,7 +758,7 @@ class NBFMDecoder:
             audio = np.array([], dtype=np.float64)
 
         # Scale down to provide headroom for tone controls
-        audio = audio * 0.5
+        audio = audio * 0.65
 
         # Apply tone controls
         if self.bass_boost_enabled:
