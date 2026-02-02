@@ -11,6 +11,30 @@ import numpy as np
 from scipy import signal
 
 
+def _soft_clip(x, threshold=0.8):
+    """
+    Threshold-based soft clipper with tanh rolloff.
+
+    Signals below threshold pass through unchanged (0% THD).
+    Signals above threshold are soft-limited using tanh.
+
+    Args:
+        x: Input signal (numpy array)
+        threshold: Amplitude below which signal is unchanged (default 0.8)
+
+    Returns:
+        Soft-clipped signal, max output approaches 1.0 asymptotically
+    """
+    result = x.copy()
+    above = np.abs(x) > threshold
+    if np.any(above):
+        sign = np.sign(x[above])
+        excess = np.abs(x[above]) - threshold
+        # tanh rolloff for excess above threshold, scaled to use remaining headroom
+        result[above] = sign * (threshold + np.tanh(excess * 5) * (1 - threshold))
+    return result
+
+
 class FMStereoDecoder:
     """
     FM Stereo decoder for broadcast FM.
@@ -473,11 +497,10 @@ class FMStereoDecoder:
 
         # Apply soft limiting to catch any remaining peaks.
         # After 0.65 scaling + up to +6dB tone boost, signal is typically ~0.9 max.
-        # Soft limiter using tanh handles any peaks that still exceed 1.0.
-        tanh_scale = np.tanh(1.5)
-        left = np.tanh(left * 1.5) / tanh_scale
-        right = np.tanh(right * 1.5) / tanh_scale
-        # Hard clip to ensure output never exceeds ±1.0
+        # Threshold-based limiter: linear below 0.8, tanh rolloff above.
+        # This preserves 0% THD for normal signals while catching peaks.
+        left = _soft_clip(left, threshold=0.8)
+        right = _soft_clip(right, threshold=0.8)
         left = np.clip(left, -1.0, 1.0)
         right = np.clip(right, -1.0, 1.0)
         left = left.astype(np.float32)
@@ -747,8 +770,8 @@ class NBFMDecoder:
         self._peak_amplitude = max(0.95 * self._peak_amplitude, peak)
 
         # Apply soft limiting to catch any remaining peaks
-        tanh_scale = np.tanh(1.5)
-        audio = np.tanh(audio * 1.5) / tanh_scale
+        # Threshold-based limiter: linear below 0.8, tanh rolloff above.
+        audio = _soft_clip(audio, threshold=0.8)
         audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
 
         # Duplicate mono to stereo
