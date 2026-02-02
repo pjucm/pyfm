@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Phil's Panadapter
+Comment=Spectrum analyzer and waterfall display for SDR
+Exec=python3 /home/philj/dev/pyfm/panadapter.py
+Icon=/home/philj/.local/share/icons/panadapter.svg
+Terminal=false
+Categories=Audio;HamRadio;Science;
+Keywords=SDR;spectrum;waterfall;radio;weather;FM;
+StartupNotify=true
