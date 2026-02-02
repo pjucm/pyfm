@@ -101,6 +101,14 @@ def load_config():
                 if config.has_option('tuning', 'mode'):
                     settings['mode'] = config.get('tuning', 'mode').lower()
 
+            if config.has_section('display'):
+                if config.has_option('display', 'weather_span_khz'):
+                    settings['weather_span_khz'] = config.getfloat('display', 'weather_span_khz')
+                if config.has_option('display', 'fm_span_khz'):
+                    settings['fm_span_khz'] = config.getfloat('display', 'fm_span_khz')
+                if config.has_option('display', 'spectrum_averaging'):
+                    settings['spectrum_averaging'] = config.getfloat('display', 'spectrum_averaging')
+
         except (configparser.Error, ValueError) as e:
             print(f"Warning: Error reading config file: {e}")
 
@@ -108,7 +116,8 @@ def load_config():
 
 
 def save_config(use_icom=False, use_24bit=False, sample_rate=None,
-                frequency=None, mode='weather'):
+                frequency=None, mode='weather', weather_span_khz=None,
+                fm_span_khz=None, spectrum_averaging=None):
     """Save settings to config file.
 
     Args:
@@ -117,6 +126,8 @@ def save_config(use_icom=False, use_24bit=False, sample_rate=None,
         sample_rate: Sample rate in Hz
         frequency: Center frequency in Hz
         mode: 'weather' or 'fm_broadcast'
+        weather_span_khz: Spectrum span for weather mode in kHz
+        fm_span_khz: Spectrum span for FM broadcast mode in kHz
     """
     config = configparser.ConfigParser()
 
@@ -134,6 +145,15 @@ def save_config(use_icom=False, use_24bit=False, sample_rate=None,
     }
     if frequency:
         config['tuning']['frequency'] = f'{frequency:.0f}'
+
+    # Display section
+    config['display'] = {}
+    if weather_span_khz:
+        config['display']['weather_span_khz'] = f'{weather_span_khz:.1f}'
+    if fm_span_khz:
+        config['display']['fm_span_khz'] = f'{fm_span_khz:.1f}'
+    if spectrum_averaging is not None:
+        config['display']['spectrum_averaging'] = f'{spectrum_averaging:.2f}'
 
     try:
         with open(CONFIG_FILE, 'w') as f:
@@ -1045,7 +1065,8 @@ class MainWindow(QMainWindow):
     ICOM_SAMPLE_RATES = [240000, 480000, 960000, 1920000, 3840000, 5120000]
 
     def __init__(self, center_freq=DEFAULT_CENTER_FREQ, use_icom=False,
-                 sample_rate=None, use_24bit=False, initial_mode='weather'):
+                 sample_rate=None, use_24bit=False, initial_mode='weather',
+                 weather_span_khz=None, fm_span_khz=None, spectrum_averaging=None):
         super().__init__()
 
         self.center_freq = center_freq
@@ -1058,13 +1079,19 @@ class MainWindow(QMainWindow):
         self.use_24bit = use_24bit
         self.requested_sample_rate = sample_rate  # User-requested sample rate
 
+        # Spectrum span per mode (kHz) - None means full bandwidth
+        # Default: 100 kHz for weather, full bandwidth for FM
+        self.weather_span_khz = weather_span_khz if weather_span_khz else 100.0
+        self.fm_span_khz = fm_span_khz  # None = full bandwidth
+
         # Current mode (Weather Radio vs FM Broadcast)
         self.current_mode = self.MODE_FM_BROADCAST if initial_mode == 'fm_broadcast' else self.MODE_WEATHER
 
         # FFT processing
         self.fft_window = np.hanning(FFT_SIZE)
         self.spectrum_avg = None
-        self.avg_factor = 0.7  # Exponential averaging factor
+        # Exponential averaging factor (0.0-1.0, higher = more smoothing)
+        self.avg_factor = spectrum_averaging if spectrum_averaging is not None else 0.85
 
         # Demodulators (NBFM for weather, WBFM for broadcast)
         self.nbfm_demodulator = None
@@ -1369,10 +1396,25 @@ class MainWindow(QMainWindow):
         self.btn_up.setText(f'+{step_khz} kHz >>')
 
     def _set_initial_zoom(self):
-        """Set initial 100 kHz zoom after UI is ready."""
+        """Set initial zoom based on mode and saved span settings."""
         center_mhz = self.center_freq / 1e6
-        self.spectrum_widget.setXRange(center_mhz - 0.05, center_mhz + 0.05, padding=0)
-        self.waterfall_widget.plot.setXRange(center_mhz - 0.05, center_mhz + 0.05, padding=0)
+
+        # Get span for current mode
+        if self.current_mode == self.MODE_FM_BROADCAST:
+            span_khz = self.fm_span_khz
+        else:
+            span_khz = self.weather_span_khz
+
+        if span_khz:
+            # Use saved/default span
+            half_span_mhz = span_khz / 2000.0  # Convert kHz to MHz, then halve
+            self.spectrum_widget.setXRange(center_mhz - half_span_mhz, center_mhz + half_span_mhz, padding=0)
+            self.waterfall_widget.plot.setXRange(center_mhz - half_span_mhz, center_mhz + half_span_mhz, padding=0)
+        else:
+            # Full bandwidth
+            half_bw_mhz = self.bandwidth / 2e6
+            self.spectrum_widget.setXRange(center_mhz - half_bw_mhz, center_mhz + half_bw_mhz, padding=0)
+            self.waterfall_widget.plot.setXRange(center_mhz - half_bw_mhz, center_mhz + half_bw_mhz, padding=0)
 
     def setup_device(self):
         """Initialize device (BB60D or IC-R8600) and start data acquisition."""
@@ -1795,6 +1837,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up on window close."""
+        # Get current spectrum span and update the appropriate mode's setting
+        view_range = self.spectrum_widget.viewRange()[0]
+        current_span_khz = (view_range[1] - view_range[0]) * 1000  # MHz to kHz
+
+        if self.current_mode == self.MODE_FM_BROADCAST:
+            self.fm_span_khz = current_span_khz
+        else:
+            self.weather_span_khz = current_span_khz
+
         # Save current settings to config file
         sample_rate = None
         if self.device and hasattr(self.device, 'iq_sample_rate'):
@@ -1805,7 +1856,10 @@ class MainWindow(QMainWindow):
             use_24bit=self.use_24bit,
             sample_rate=sample_rate,
             frequency=self.center_freq,
-            mode=self.current_mode
+            mode=self.current_mode,
+            weather_span_khz=self.weather_span_khz,
+            fm_span_khz=self.fm_span_khz,
+            spectrum_averaging=self.avg_factor
         )
 
         # Stop audio output
@@ -1850,6 +1904,9 @@ def main():
     use_24bit = config.get('use_24bit', False)
     sample_rate = config.get('sample_rate', None)
     mode = config.get('mode', 'weather')
+    weather_span_khz = config.get('weather_span_khz', None)
+    fm_span_khz = config.get('fm_span_khz', None)
+    spectrum_averaging = config.get('spectrum_averaging', None)
 
     # Determine initial frequency based on mode
     if 'frequency' in config:
@@ -1911,7 +1968,10 @@ def main():
         use_icom=use_icom,
         sample_rate=sample_rate,
         use_24bit=use_24bit,
-        initial_mode=mode
+        initial_mode=mode,
+        weather_span_khz=weather_span_khz,
+        fm_span_khz=fm_span_khz,
+        spectrum_averaging=spectrum_averaging
     )
     window.show()
 
