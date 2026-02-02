@@ -613,7 +613,6 @@ class FMRadio:
         self.audio_thread = None
         self.error_message = None
         self.signal_dbm = -140.0
-        self.tuning_lock = threading.Lock()
         self.is_tuning = False
 
         # Frequency presets (1-5), initialized to None
@@ -798,9 +797,8 @@ class FMRadio:
                     time.sleep(0.01)
                     continue
 
-                with self.tuning_lock:
-                    # Get IQ samples
-                    iq = self.device.fetch_iq(self.IQ_BLOCK_SIZE)
+                # Get IQ samples
+                iq = self.device.fetch_iq(self.IQ_BLOCK_SIZE)
 
                 # Check again after fetch - if tuning started mid-fetch, discard samples
                 if self.is_tuning:
@@ -935,23 +933,22 @@ class FMRadio:
         """Tune up by 100 kHz (FM) or 25 kHz (Weather)."""
         self.is_tuning = True
         self.error_message = None
-        with self.tuning_lock:
-            if self.weather_mode:
-                # Weather: 25 kHz steps within 162.400-162.550 MHz
-                new_freq = self.device.frequency + 25000
-                if new_freq > 162.550e6:
-                    new_freq = 162.400e6  # Wrap around
-                self.device.set_frequency(new_freq)
-                self.device.flush_iq()
-                self.nbfm_decoder.reset()
-            else:
-                # FM broadcast: 100 kHz steps
-                self.device.tune_up()
-                self.stereo_decoder.reset()
-                if self.rds_decoder:
-                    self.rds_decoder.reset()
-                    self.rds_data = {}
-            self.audio_player.reset()  # Refill buffer after tuning
+        if self.weather_mode:
+            # Weather: 25 kHz steps within 162.400-162.550 MHz
+            new_freq = self.device.frequency + 25000
+            if new_freq > 162.550e6:
+                new_freq = 162.400e6  # Wrap around
+            self.device.set_frequency(new_freq)
+            self.device.flush_iq()
+            self.nbfm_decoder.reset()
+        else:
+            # FM broadcast: 100 kHz steps
+            self.device.tune_up()
+            self.stereo_decoder.reset()
+            if self.rds_decoder:
+                self.rds_decoder.reset()
+                self.rds_data = {}
+        self.audio_player.reset()  # Refill buffer after tuning
         self.is_tuning = False
         if not self.weather_mode:
             self._save_config()
@@ -960,23 +957,22 @@ class FMRadio:
         """Tune down by 100 kHz (FM) or 25 kHz (Weather)."""
         self.is_tuning = True
         self.error_message = None
-        with self.tuning_lock:
-            if self.weather_mode:
-                # Weather: 25 kHz steps within 162.400-162.550 MHz
-                new_freq = self.device.frequency - 25000
-                if new_freq < 162.400e6:
-                    new_freq = 162.550e6  # Wrap around
-                self.device.set_frequency(new_freq)
-                self.device.flush_iq()
-                self.nbfm_decoder.reset()
-            else:
-                # FM broadcast: 100 kHz steps
-                self.device.tune_down()
-                self.stereo_decoder.reset()
-                if self.rds_decoder:
-                    self.rds_decoder.reset()
-                    self.rds_data = {}
-            self.audio_player.reset()  # Refill buffer after tuning
+        if self.weather_mode:
+            # Weather: 25 kHz steps within 162.400-162.550 MHz
+            new_freq = self.device.frequency - 25000
+            if new_freq < 162.400e6:
+                new_freq = 162.550e6  # Wrap around
+            self.device.set_frequency(new_freq)
+            self.device.flush_iq()
+            self.nbfm_decoder.reset()
+        else:
+            # FM broadcast: 100 kHz steps
+            self.device.tune_down()
+            self.stereo_decoder.reset()
+            if self.rds_decoder:
+                self.rds_decoder.reset()
+                self.rds_data = {}
+        self.audio_player.reset()  # Refill buffer after tuning
         self.is_tuning = False
         if not self.weather_mode:
             self._save_config()
@@ -993,17 +989,16 @@ class FMRadio:
                 return False
         self.is_tuning = True
         self.error_message = None
-        with self.tuning_lock:
-            self.device.set_frequency(freq_hz)
-            self.device.flush_iq()
-            if self.weather_mode:
-                self.nbfm_decoder.reset()
-            else:
-                self.stereo_decoder.reset()
-                if self.rds_decoder:
-                    self.rds_decoder.reset()
-                    self.rds_data = {}
-            self.audio_player.reset()  # Refill buffer after tuning
+        self.device.set_frequency(freq_hz)
+        self.device.flush_iq()
+        if self.weather_mode:
+            self.nbfm_decoder.reset()
+        else:
+            self.stereo_decoder.reset()
+            if self.rds_decoder:
+                self.rds_decoder.reset()
+                self.rds_data = {}
+        self.audio_player.reset()  # Refill buffer after tuning
         self.is_tuning = False
         if not self.weather_mode:
             self._save_config()
@@ -1110,37 +1105,36 @@ class FMRadio:
         self.error_message = None
         self.weather_mode = not self.weather_mode
 
-        with self.tuning_lock:
-            if self.weather_mode:
-                # Switch to weather mode: tune to WX1 (162.550 MHz)
-                freq = WX_CHANNELS[1]
-                self.device.set_frequency(freq)
-                self.device.flush_iq()
-                self.nbfm_decoder.reset()
-                # Disable RDS in weather mode
-                self.rds_enabled = False
-                self.rds_data = {}
-            else:
-                # Switch to FM mode: restore last FM frequency from config
-                freq = 89.9e6  # Default
-                config_path = self.CONFIG_FILE
-                if os.path.exists(config_path):
-                    config = configparser.ConfigParser()
-                    try:
-                        config.read(config_path)
-                        if config.has_option('radio', 'last_frequency'):
-                            freq_mhz = config.getfloat('radio', 'last_frequency')
-                            if 88.0 <= freq_mhz <= 108.0:
-                                freq = freq_mhz * 1e6
-                    except (ValueError, configparser.Error):
-                        pass
-                self.device.set_frequency(freq)
-                self.device.flush_iq()
-                self.stereo_decoder.reset()
-                if self.rds_decoder:
-                    self.rds_decoder.reset()
+        if self.weather_mode:
+            # Switch to weather mode: tune to WX1 (162.550 MHz)
+            freq = WX_CHANNELS[1]
+            self.device.set_frequency(freq)
+            self.device.flush_iq()
+            self.nbfm_decoder.reset()
+            # Disable RDS in weather mode
+            self.rds_enabled = False
+            self.rds_data = {}
+        else:
+            # Switch to FM mode: restore last FM frequency from config
+            freq = 89.9e6  # Default
+            config_path = self.CONFIG_FILE
+            if os.path.exists(config_path):
+                config = configparser.ConfigParser()
+                try:
+                    config.read(config_path)
+                    if config.has_option('radio', 'last_frequency'):
+                        freq_mhz = config.getfloat('radio', 'last_frequency')
+                        if 88.0 <= freq_mhz <= 108.0:
+                            freq = freq_mhz * 1e6
+                except (ValueError, configparser.Error):
+                    pass
+            self.device.set_frequency(freq)
+            self.device.flush_iq()
+            self.stereo_decoder.reset()
+            if self.rds_decoder:
+                self.rds_decoder.reset()
 
-            self.audio_player.reset()
+        self.audio_player.reset()
 
         self.is_tuning = False
 
