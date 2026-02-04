@@ -49,7 +49,7 @@ class FMStereoDecoder:
     """
 
     def __init__(self, iq_sample_rate=250000, audio_sample_rate=48000,
-                 deviation=75000, deemphasis=75e-6):
+                 deviation=75000, deemphasis=75e-6, force_mono=False):
         """
         Initialize FM stereo decoder.
 
@@ -58,10 +58,12 @@ class FMStereoDecoder:
             audio_sample_rate: Output audio sample rate in Hz
             deviation: FM deviation in Hz (75 kHz for broadcast FM)
             deemphasis: De-emphasis time constant in seconds
+            force_mono: If True, always output mono (skip stereo decoding)
         """
         self.iq_sample_rate = iq_sample_rate
         self.audio_sample_rate = audio_sample_rate
         self.deviation = deviation
+        self.force_mono = force_mono
 
         # Pilot detection state
         self._pilot_detected = False
@@ -371,7 +373,7 @@ class FMStereoDecoder:
         if profiling:
             t0 = self._prof('lr_sum_lpf', t0)
 
-        if self._pilot_detected:
+        if self._pilot_detected and not self.force_mono:
             # Extract L-R subcarrier region (23-53 kHz)
             lr_diff_mod, self.lr_diff_bpf_state = signal.lfilter(
                 self.lr_diff_bpf, 1.0, baseband, zi=self.lr_diff_bpf_state

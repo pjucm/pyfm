@@ -551,18 +551,22 @@ class FMRadio:
     # Config file path (in same directory as script)
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
 
-    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None):
+    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None,
+                 rds_enabled=False, realtime=True):
         """
         Initialize FM Radio.
 
         Args:
             initial_freq: Initial frequency in Hz
             use_icom: If True, use IC-R8600 instead of BB60D
+            rds_enabled: If True, enable auto-RDS when pilot tone detected
+            realtime: If True, real-time scheduling was requested (for config save)
             use_24bit: If True, use 24-bit I/Q samples (IC-R8600 only)
             preamp: None (don't touch), True (force on), or False (force off)
         """
         self.use_icom = use_icom
         self.use_24bit = use_24bit
+        self.use_realtime = realtime  # For config save
         self._preamp_setting = preamp  # None = don't touch, True = on, False = off
 
         if use_icom:
@@ -591,8 +595,8 @@ class FMRadio:
         self.rds_enabled = False
         self.rds_data = {}
 
-        # Auto stereo mode (enabled by default)
-        self.auto_mode_enabled = True
+        # Auto RDS mode (disabled by default, enable with --rds flag)
+        self.auto_mode_enabled = rds_enabled
 
         # Debug displays (hidden by default)
         self.show_buffer_stats = False
@@ -621,6 +625,9 @@ class FMRadio:
         # Tone control settings (applied when stereo decoder is created)
         self._initial_bass_boost = True
         self._initial_treble_boost = True
+
+        # Force mono mode (skip stereo decoding even when pilot detected)
+        self.force_mono = False
 
         # Weather radio mode (NBFM for NWS)
         self.weather_mode = False
@@ -656,6 +663,10 @@ class FMRadio:
                 self._initial_bass_boost = config.getboolean('tone', 'bass_boost')
             if config.has_option('tone', 'treble_boost'):
                 self._initial_treble_boost = config.getboolean('tone', 'treble_boost')
+
+            # Load audio settings
+            if config.has_option('audio', 'force_mono'):
+                self.force_mono = config.getboolean('audio', 'force_mono')
         except (ValueError, configparser.Error):
             # Ignore invalid config
             pass
@@ -668,7 +679,8 @@ class FMRadio:
         config['radio'] = {
             'last_frequency': f'{self.device.frequency / 1e6:.1f}',
             'device': 'icom' if self.use_icom else 'bb60d',
-            'use_24bit': str(self.use_24bit).lower()
+            'use_24bit': str(self.use_24bit).lower(),
+            'realtime': str(self.use_realtime).lower()
         }
 
         # Presets section
@@ -683,6 +695,11 @@ class FMRadio:
         config['tone'] = {
             'bass_boost': str(self.bass_boost_enabled).lower(),
             'treble_boost': str(self.treble_boost_enabled).lower()
+        }
+
+        # Audio section
+        config['audio'] = {
+            'force_mono': str(self.force_mono).lower()
         }
 
         try:
@@ -702,15 +719,16 @@ class FMRadio:
             actual_rate = self.device.iq_sample_rate
 
             # Apply preamp setting if specified (IC-R8600 only)
-            if self._preamp_setting is not None and hasattr(self.device, 'set_preamp'):
-                self.device.set_preamp(self._preamp_setting)
+            #if self._preamp_setting is not None and hasattr(self.device, 'set_preamp'):
+            #    self.device.set_preamp(self._preamp_setting)
 
             # Create decoders
             self.stereo_decoder = FMStereoDecoder(
                 iq_sample_rate=actual_rate,
                 audio_sample_rate=self.AUDIO_SAMPLE_RATE,
                 deviation=75000,
-                deemphasis=75e-6
+                deemphasis=75e-6,
+                force_mono=self.force_mono
             )
             self.stereo_decoder.bass_boost_enabled = self._initial_bass_boost
             self.stereo_decoder.treble_boost_enabled = self._initial_treble_boost
@@ -939,7 +957,7 @@ class FMRadio:
             if new_freq > 162.550e6:
                 new_freq = 162.400e6  # Wrap around
             self.device.set_frequency(new_freq)
-            self.device.flush_iq()
+            # self.device.flush_iq()
             self.nbfm_decoder.reset()
         else:
             # FM broadcast: 100 kHz steps
@@ -948,7 +966,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
                 self.rds_data = {}
-        self.audio_player.reset()  # Refill buffer after tuning
+        self.audio_player.reset()
         self.is_tuning = False
         if not self.weather_mode:
             self._save_config()
@@ -963,7 +981,7 @@ class FMRadio:
             if new_freq < 162.400e6:
                 new_freq = 162.550e6  # Wrap around
             self.device.set_frequency(new_freq)
-            self.device.flush_iq()
+            # self.device.flush_iq()
             self.nbfm_decoder.reset()
         else:
             # FM broadcast: 100 kHz steps
@@ -972,7 +990,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
                 self.rds_data = {}
-        self.audio_player.reset()  # Refill buffer after tuning
+        self.audio_player.reset()
         self.is_tuning = False
         if not self.weather_mode:
             self._save_config()
@@ -990,7 +1008,7 @@ class FMRadio:
         self.is_tuning = True
         self.error_message = None
         self.device.set_frequency(freq_hz)
-        self.device.flush_iq()
+        # self.device.flush_iq()
         if self.weather_mode:
             self.nbfm_decoder.reset()
         else:
@@ -998,7 +1016,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
                 self.rds_data = {}
-        self.audio_player.reset()  # Refill buffer after tuning
+        self.audio_player.reset()
         self.is_tuning = False
         if not self.weather_mode:
             self._save_config()
@@ -1109,7 +1127,7 @@ class FMRadio:
             # Switch to weather mode: tune to WX1 (162.550 MHz)
             freq = WX_CHANNELS[1]
             self.device.set_frequency(freq)
-            self.device.flush_iq()
+            # self.device.flush_iq()
             self.nbfm_decoder.reset()
             # Disable RDS in weather mode
             self.rds_enabled = False
@@ -1129,7 +1147,7 @@ class FMRadio:
                 except (ValueError, configparser.Error):
                     pass
             self.device.set_frequency(freq)
-            self.device.flush_iq()
+            # self.device.flush_iq()
             self.stereo_decoder.reset()
             if self.rds_decoder:
                 self.rds_decoder.reset()
@@ -2046,6 +2064,11 @@ def main():
         default=None,
         help="Force preamp on or off (IC-R8600 only, default: unchanged)"
     )
+    parser.add_argument(
+        "--rds",
+        action="store_true",
+        help="Enable RDS decoding (auto-enables when pilot tone detected)"
+    )
 
     args = parser.parse_args()
 
@@ -2072,22 +2095,11 @@ def main():
             print("IC-R8600: not available")
         return
 
-    # Enable real-time scheduling by default (silently, unless errors)
-    rt_results = enable_realtime_mode()
-    rt_enabled = rt_results['sched_fifo']
-    if args.realtime:
-        # Verbose output only when explicitly requested
-        if rt_results['sched_fifo']:
-            print(f"Real-time mode: SCHED_FIFO priority {rt_results['priority']}")
-        if rt_results['mlockall']:
-            print("Real-time mode: Memory locked")
-        for err in rt_results['errors']:
-            print(f"Warning: {err}")
-
     # Load config for defaults
     initial_freq = 89.9e6  # Default frequency
     use_icom = False  # Default device
     use_24bit = False  # Default 16-bit I/Q
+    use_realtime = True  # Default to real-time scheduling enabled
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
     if os.path.exists(config_path):
         config = configparser.ConfigParser()
@@ -2102,8 +2114,26 @@ def main():
                 use_icom = (device == 'icom')
             if config.has_option('radio', 'use_24bit'):
                 use_24bit = config.getboolean('radio', 'use_24bit')
+            if config.has_option('radio', 'realtime'):
+                use_realtime = config.getboolean('radio', 'realtime')
         except (ValueError, configparser.Error):
             pass
+
+    # Enable real-time scheduling (controlled by config, default: enabled)
+    rt_enabled = False
+    if use_realtime:
+        rt_results = enable_realtime_mode()
+        rt_enabled = rt_results['sched_fifo']
+        if args.realtime:
+            # Verbose output only when explicitly requested
+            if rt_results['sched_fifo']:
+                print(f"Real-time mode: SCHED_FIFO priority {rt_results['priority']}")
+            if rt_results['mlockall']:
+                print("Real-time mode: Memory locked")
+            for err in rt_results['errors']:
+                print(f"Warning: {err}")
+    elif args.realtime:
+        print("Real-time mode: Disabled in config (set realtime=true in pjfm.cfg to enable)")
 
     # Command-line arguments override config
     if args.frequency is not None:
@@ -2140,7 +2170,7 @@ def main():
 
     # Create radio instance
     radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=use_24bit,
-                    preamp=preamp_setting)
+                    preamp=preamp_setting, rds_enabled=args.rds, realtime=use_realtime)
     radio.rt_enabled = rt_enabled
 
     # Check for headless mode (for automated PI loop tuning)

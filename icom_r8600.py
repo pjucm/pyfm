@@ -544,18 +544,13 @@ class IcomR8600:
         except (PermissionError, OSError):
             pass  # Silently fall back to normal scheduling
 
-        # Calculate adaptive read size based on sample rate
-        # Target ~30ms of data per read for good balance of latency and efficiency
-        # At high rates (5.12 MSPS 16-bit = 20.5 MB/s), 30ms = 614KB
-        # At low rates (240 kSPS 16-bit = 960 KB/s), 30ms = 29KB
+        # Fixed read size for USB efficiency
+        # 64KB works well across all sample rates
+        read_size = 65536
         bytes_per_sample = 6 if self._bit_depth == 24 else 4
         bytes_per_sec = self.iq_sample_rate * bytes_per_sample
-        target_latency_ms = 30
-        read_size = int(target_latency_ms * bytes_per_sec / 1000)
-        # Clamp to reasonable range: 32KB min (USB efficiency), 1MB max (memory)
-        read_size = max(32768, min(read_size, 1048576))
-        # Round up to nearest 16KB for USB alignment
-        read_size = ((read_size + 16383) // 16384) * 16384
+
+        print(f"IQ Reader: read_size={read_size/1024:.0f}KB, data_rate={bytes_per_sec/1e6:.2f}MB/s")
 
         while self._running:
             try:
@@ -728,6 +723,16 @@ class IcomR8600:
                     self._fetch_slow_count += 1
                 self._fetch_active = False
                 return np.zeros(num_samples, dtype=np.complex64)
+
+            # After alignment, buffer was trimmed - collect more data if needed
+            # Reset timeout to give post-alignment collection a fresh window
+            timeout = time.time() + 1.0
+            while len(self._iq_byte_buf) < bytes_needed and time.time() < timeout:
+                with self._iq_lock:
+                    while self._iq_buffer:
+                        self._iq_byte_buf += self._iq_buffer.pop(0)
+                if len(self._iq_byte_buf) < bytes_needed:
+                    time.sleep(0.001)
 
         # Parse samples from byte buffer using sync-based framing
         buf = self._iq_byte_buf
@@ -980,7 +985,13 @@ class IcomR8600:
                 civ_timeouts: Count of CI-V command timeouts
                 initial_aligns: Count of initial stream alignment operations
                 flush_during_fetch: Count of flush_iq() called while fetch active
+                usb_buffer_kb: Size of pending USB buffer chunks in KB
+                parse_buffer_kb: Size of byte buffer awaiting parsing in KB
         """
+        with self._iq_lock:
+            usb_buffer_bytes = sum(len(chunk) for chunk in self._iq_buffer)
+        parse_buffer_bytes = len(self._iq_byte_buf)
+
         return {
             'sync_misses': self._sync_misses,
             'sync_invalid_24': self._sync_invalid_24,
@@ -992,6 +1003,8 @@ class IcomR8600:
             'civ_timeouts': self._civ_timeouts,
             'initial_aligns': self._initial_aligns,
             'flush_during_fetch': self._flush_during_fetch,
+            'usb_buffer_kb': usb_buffer_bytes / 1024,
+            'parse_buffer_kb': parse_buffer_bytes / 1024,
         }
 
     def set_frequency(self, freq):
