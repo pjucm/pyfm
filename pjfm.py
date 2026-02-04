@@ -38,6 +38,7 @@ import configparser
 import os
 import numpy as np
 import time
+from collections import deque
 
 try:
     import sounddevice as sd
@@ -556,6 +557,8 @@ class FMRadio:
     IQ_SAMPLE_RATE = 250000  # Results in 312.5kHz (40MHz/128) for BB60D, ~480kHz for R8600
     AUDIO_SAMPLE_RATE = 48000
     IQ_BLOCK_SIZE = 8192  # ~26.2ms budget at 312.5kHz
+    IQ_QUEUE_MAX_BLOCKS = 8
+    IQ_QUEUE_TIMEOUT_S = 0.2
     IQ_LOSS_MUTE_BLOCKS = 1
     IQ_LOSS_FLUSH_THRESHOLD = 3
     IQ_LOSS_FLUSH_COOLDOWN_S = 0.5
@@ -641,6 +644,13 @@ class FMRadio:
         self._iq_loss_events = 0
         self._iq_loss_mute_remaining = 0
         self._last_iq_flush_time = 0.0
+        self._iq_queue = deque()
+        self._iq_lock = threading.Lock()
+        self._iq_cond = threading.Condition(self._iq_lock)
+        self._iq_thread = None
+        self._iq_running = False
+        self._iq_queue_drops = 0
+        self._last_iq_queue_drops = 0
 
         # Frequency presets (1-5), initialized to None
         self.presets = [None, None, None, None, None]
@@ -744,6 +754,7 @@ class FMRadio:
             self._iq_loss_events = 0
             self._iq_loss_mute_remaining = 0
             self._last_iq_flush_time = 0.0
+            self._last_iq_queue_drops = 0
 
             # Apply preamp setting if specified (IC-R8600 only)
             #if self._preamp_setting is not None and hasattr(self.device, 'set_preamp'):
@@ -768,6 +779,11 @@ class FMRadio:
                 deviation=5000
             )
 
+            self._clear_iq_queue()
+            self._iq_running = True
+            self._iq_thread = threading.Thread(target=self._iq_capture_loop, daemon=True)
+            self._iq_thread.start()
+
             self.audio_player.start()
             self.running = True
 
@@ -784,12 +800,52 @@ class FMRadio:
         self.running = False
         if self.audio_thread:
             self.audio_thread.join(timeout=1.0)
+        if self._iq_thread:
+            self._iq_running = False
+            with self._iq_cond:
+                self._iq_cond.notify_all()
+            self._iq_thread.join(timeout=1.0)
+            self._iq_thread = None
         # Close rate control log file
         if hasattr(self, '_rate_log_file') and self._rate_log_file:
             self._rate_log_file.close()
             self._rate_log_file = None
         self.audio_player.stop()
         self.device.close()
+
+    def _clear_iq_queue(self):
+        with self._iq_cond:
+            self._iq_queue.clear()
+            self._iq_cond.notify_all()
+
+    def _get_iq_block(self):
+        with self._iq_cond:
+            if not self._iq_queue:
+                self._iq_cond.wait(timeout=self.IQ_QUEUE_TIMEOUT_S)
+            if self._iq_queue:
+                return self._iq_queue.popleft()
+        return None
+
+    def _iq_capture_loop(self):
+        """Background thread to continuously capture IQ blocks."""
+        while self._iq_running:
+            try:
+                if self.is_tuning:
+                    time.sleep(0.01)
+                    continue
+                iq = self.device.fetch_iq(self.IQ_BLOCK_SIZE)
+            except Exception as exc:
+                if not self.is_tuning:
+                    self.error_message = str(exc)
+                time.sleep(0.01)
+                continue
+
+            with self._iq_cond:
+                self._iq_queue.append(iq)
+                if len(self._iq_queue) > self.IQ_QUEUE_MAX_BLOCKS:
+                    self._iq_queue.popleft()
+                    self._iq_queue_drops += 1
+                self._iq_cond.notify()
 
     def _audio_loop(self):
         """Background thread for IQ capture, demodulation, and signal measurement."""
@@ -842,13 +898,21 @@ class FMRadio:
                     time.sleep(0.01)
                     continue
 
-                # Get IQ samples
-                iq = self.device.fetch_iq(self.IQ_BLOCK_SIZE)
+                # Get IQ samples from capture thread
+                iq = self._get_iq_block()
 
                 # Check again after fetch - if tuning started mid-fetch, discard samples
                 if self.is_tuning:
                     continue
                 loss_now = False
+                with self._iq_cond:
+                    queue_drops = self._iq_queue_drops
+                if queue_drops > self._last_iq_queue_drops:
+                    self._last_iq_queue_drops = queue_drops
+                    loss_now = True
+                if iq is None:
+                    loss_now = True
+                    iq = np.zeros(self.IQ_BLOCK_SIZE, dtype=np.complex64)
                 total_loss = getattr(self.device, 'total_sample_loss', 0)
                 if total_loss < self._last_total_sample_loss:
                     # Counters reset (e.g., flush) - realign baseline.
@@ -871,6 +935,7 @@ class FMRadio:
                                 (now - self._last_iq_flush_time) >= self.IQ_LOSS_FLUSH_COOLDOWN_S):
                             self._last_iq_flush_time = now
                             self.device.flush_iq()
+                            self._clear_iq_queue()
                             if self.stereo_decoder:
                                 self.stereo_decoder.reset()
                             if self.nbfm_decoder:
@@ -882,6 +947,7 @@ class FMRadio:
                             self._rate_integrator = 0.0
                             self._filtered_error = 0.0
                             self._last_total_sample_loss = getattr(self.device, 'total_sample_loss', 0)
+                            self._last_iq_queue_drops = self._iq_queue_drops
                             continue
 
                 # Measure signal power from IQ data (use subset for speed)
@@ -1036,6 +1102,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
                 self.rds_data = {}
+        self._clear_iq_queue()
         self.audio_player.reset()
         self.is_tuning = False
         if not self.weather_mode:
@@ -1060,6 +1127,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
                 self.rds_data = {}
+        self._clear_iq_queue()
         self.audio_player.reset()
         self.is_tuning = False
         if not self.weather_mode:
@@ -1086,6 +1154,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
                 self.rds_data = {}
+        self._clear_iq_queue()
         self.audio_player.reset()
         self.is_tuning = False
         if not self.weather_mode:
@@ -1222,6 +1291,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
 
+        self._clear_iq_queue()
         self.audio_player.reset()
 
         self.is_tuning = False
@@ -1712,8 +1782,15 @@ def build_display(radio, width=80):
             civ_timeouts = getattr(radio.device, '_civ_timeouts', 0)
             loss_text.append(f"  fetch:{fetch_slow}", style="red bold" if fetch_slow else "green bold")
             fetch_style = "red bold" if fetch_thresh and fetch_last_ms > fetch_thresh else "cyan bold"
-            loss_text.append(f"/{fetch_last_ms:.0f}ms", style=fetch_style)
+            loss_text.append(f"/{fetch_last_ms:<2.0f}ms", style=fetch_style)
             loss_text.append(f"  civ:{civ_timeouts}", style="red bold" if civ_timeouts else "green bold")
+        queue_drops = getattr(radio, '_iq_queue_drops', 0)
+        queue_len = 0
+        if hasattr(radio, '_iq_cond'):
+            with radio._iq_cond:
+                queue_len = len(radio._iq_queue)
+        loss_text.append(f"  qdrop:{queue_drops}", style="red bold" if queue_drops else "green bold")
+        loss_text.append(f"  qlen:{queue_len}", style="cyan bold")
 
         table.add_row("IQ Loss:", loss_text)
 
