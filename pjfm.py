@@ -473,6 +473,7 @@ class AudioPlayer:
             self.buffer[:] = 0  # Clear to silence
             self.write_pos = prefill
             self.read_pos = 0
+            self.overflow_samples = 0
 
     @property
     def buffer_level_ms(self):
@@ -923,6 +924,13 @@ class FMRadio:
         self._audio_loop_start = time.perf_counter()
         self._pi_log_path = os.environ.get('PYFM_PI_LOG', '/tmp/pjfm_pi_detailed.log')
         self._pi_log_detailed = os.environ.get('PYFM_PI_LOG') is not None
+        # Audio buffer overflow recovery tracking
+        self._overflow_window_start = time.perf_counter()
+        self._overflow_samples_window = self.audio_player.overflow_samples
+        self._last_overflow_recovery = 0.0
+        self._overflow_window_s = 2.0
+        self._overflow_threshold_ms = 500.0
+        self._overflow_recovery_cooldown_s = 2.0
 
         while self.running:
             try:
@@ -1112,6 +1120,33 @@ class FMRadio:
 
                 # Queue audio for playback
                 self.audio_player.queue_audio(audio)
+
+                # Detect runaway buffer overflow and recover by resetting audio state.
+                overflow_samples = self.audio_player.overflow_samples
+                now = time.perf_counter()
+                if now - self._overflow_window_start > self._overflow_window_s:
+                    self._overflow_window_start = now
+                    self._overflow_samples_window = overflow_samples
+                else:
+                    overflow_delta = overflow_samples - self._overflow_samples_window
+                    overflow_ms = overflow_delta / self.audio_player.sample_rate * 1000.0
+                    if (overflow_ms >= self._overflow_threshold_ms and
+                            (now - self._last_overflow_recovery) >= self._overflow_recovery_cooldown_s):
+                        self._last_overflow_recovery = now
+                        self._overflow_window_start = now
+                        self._overflow_samples_window = 0
+                        self.audio_player.reset()
+                        self._clear_iq_queue()
+                        if self.stereo_decoder:
+                            self.stereo_decoder.reset()
+                        if self.nbfm_decoder:
+                            self.nbfm_decoder.reset()
+                        if self.rds_decoder:
+                            self.rds_decoder.reset()
+                            self.rds_data = {}
+                        self._rate_integrator = 0.0
+                        self._filtered_error = 0.0
+                        continue
 
             except Exception as e:
                 # Ignore errors during tuning
