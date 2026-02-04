@@ -315,7 +315,8 @@ class IcomR8600:
         self._sync_invalid_24 = 0  # Counter for 24-bit samples rejected as invalid
         self._fetch_last_ms = 0.0  # Last fetch_iq duration in ms
         self._fetch_slow_count = 0  # Count of slow fetch_iq calls
-        self._fetch_slow_threshold_ms = 50.0  # Slow fetch threshold in ms
+        self._fetch_slow_threshold_ms = 50.0  # Minimum slow fetch threshold in ms
+        self._fetch_slow_multiplier = 2.0  # Slow threshold = max(min_threshold, expected_ms * multiplier)
         self._civ_timeouts = 0  # Count of CI-V response timeouts
         self._buffer_overflow_count = 0  # Count of buffer overflow events
         self._iq_lock = threading.Lock()
@@ -979,7 +980,14 @@ class IcomR8600:
 
         duration_ms = (time.perf_counter() - start_time) * 1000.0
         self._fetch_last_ms = duration_ms
-        if duration_ms > self._fetch_slow_threshold_ms:
+        slow_threshold_ms = self._fetch_slow_threshold_ms
+        if self.iq_sample_rate:
+            expected_ms = num_samples / float(self.iq_sample_rate) * 1000.0
+            dynamic_threshold = expected_ms * self._fetch_slow_multiplier
+            if dynamic_threshold > slow_threshold_ms:
+                slow_threshold_ms = dynamic_threshold
+                self._fetch_slow_threshold_ms = slow_threshold_ms
+        if duration_ms > slow_threshold_ms:
             self._fetch_slow_count += 1
         self._fetch_active = False
         return iq[:num_samples]
