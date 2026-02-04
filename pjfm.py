@@ -636,7 +636,7 @@ class FMRadio:
 
         # Squelch
         self.squelch_enabled = True
-        self.squelch_threshold = -95.0  # dBm
+        self.squelch_threshold = -100.0  # dBm
 
         self.running = False
         self.audio_thread = None
@@ -703,6 +703,13 @@ class FMRadio:
             # Load audio settings
             if config.has_option('audio', 'force_mono'):
                 self.force_mono = config.getboolean('audio', 'force_mono')
+
+            # Load squelch settings
+            if config.has_option('radio', 'squelch_threshold'):
+                try:
+                    self.squelch_threshold = float(config.get('radio', 'squelch_threshold'))
+                except ValueError:
+                    pass
         except (ValueError, configparser.Error):
             # Ignore invalid config
             pass
@@ -717,7 +724,8 @@ class FMRadio:
             'device': 'icom' if self.use_icom else 'bb60d',
             'use_24bit': str(self.use_24bit).lower(),
             'realtime': str(self.use_realtime).lower(),
-            'iq_sample_rate': str(self.iq_sample_rate)
+            'iq_sample_rate': str(self.iq_sample_rate),
+            'squelch_threshold': f'{self.squelch_threshold:.1f}',
         }
 
         # Presets section
@@ -1047,7 +1055,10 @@ class FMRadio:
                 # (pilot = station has stereo/RDS capability)
                 # Don't enable RDS on noise - require signal above squelch threshold
                 if not self.weather_mode and self.auto_mode_enabled and self.stereo_decoder:
-                    pilot_present = self.stereo_decoder.pilot_detected and dbm >= self.squelch_threshold
+                    snr_ok = self.stereo_decoder.snr_db >= self.stereo_decoder.stereo_blend_low
+                    pilot_present = (self.stereo_decoder.pilot_detected and
+                                     dbm >= self.squelch_threshold and
+                                     snr_ok)
                     if pilot_present and not self.rds_enabled:
                         self.rds_enabled = True
                         # Reset decoder to clear any stale filter/timing state

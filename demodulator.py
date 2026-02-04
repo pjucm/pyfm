@@ -160,10 +160,10 @@ class FMStereoDecoder:
 
         # Stereo blend settings (blend to mono when SNR is low)
         # Thresholds based on pilot SNR measurement:
-        # - 8 dB: very weak signal, use mono to reduce noise
+        # - 10 dB: weak signal, use mono to reduce noise
         # - 20 dB: good signal, full stereo separation
         self.stereo_blend_enabled = True
-        self.stereo_blend_low = 8.0     # Below this SNR: full mono
+        self.stereo_blend_low = 10.0     # Below this SNR: full mono
         self.stereo_blend_high = 20.0   # Above this SNR: full stereo
         self._blend_factor = 1.0        # Current blend (0=mono, 1=stereo)
 
@@ -343,19 +343,41 @@ class FMStereoDecoder:
         pilot_power = np.sqrt(np.mean(pilot ** 2))
         # Smooth the pilot level measurement
         self._pilot_level = 0.9 * self._pilot_level + 0.1 * pilot_power
+        pilot_present = self._pilot_level > self.pilot_threshold
+        self._pilot_detected = pilot_present
 
         if profiling:
             t0 = self._prof('pilot_bpf', t0)
 
-        # Pilot detection and 38 kHz carrier regeneration via pilot-squaring
-        # Uses trig identity: cos(2x) = 2*cos^2(x) - 1
-        carrier_38k = None
-        if self._pilot_level > self.pilot_threshold:
-            pilot_normalized = pilot / (np.abs(pilot).max() + 1e-10)
-            carrier_38k = 2 * pilot_normalized ** 2 - 1
-            self._pilot_detected = True
-        else:
-            self._pilot_detected = False
+        # Pilot-referenced SNR measurement (moved earlier for stereo gating)
+        # The 19 kHz pilot is broadcast at a fixed level (~9% of deviation),
+        # so comparing pilot power to noise floor gives a consistent metric.
+        if self.noise_bpf is not None:
+            noise_filtered, self.noise_bpf_state = signal.lfilter(
+                self.noise_bpf, 1.0, baseband, zi=self.noise_bpf_state
+            )
+            noise_power = np.mean(noise_filtered ** 2)
+
+            # Pilot power from the smoothed pilot level (already RMS, square for power)
+            pilot_power = self._pilot_level ** 2
+
+            # Normalize noise to pilot bandwidth for fair comparison
+            # Pilot BPF: 1 kHz, Noise BPF: 10 kHz
+            noise_in_pilot_bw = noise_power * (self.pilot_bandwidth / self.noise_bandwidth)
+
+            # Smooth the noise measurement
+            self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_in_pilot_bw, 1e-12)
+
+            # Calculate SNR in dB (pilot power vs noise in same bandwidth)
+            if self._noise_power > 0 and pilot_power > 0:
+                self._snr_db = 10 * np.log10(pilot_power / self._noise_power)
+
+        if profiling:
+            t0 = self._prof('noise_bpf', t0)
+
+        # Gate stereo decode on pilot presence and SNR to avoid expensive
+        # L-R processing when the signal is too weak to be useful.
+        stereo_allowed = pilot_present and not self.force_mono and self._snr_db >= self.stereo_blend_low
 
         # Extract L+R (mono, 0-15 kHz)
         lr_sum, self.lr_sum_lpf_state = signal.lfilter(
@@ -373,7 +395,12 @@ class FMStereoDecoder:
         if profiling:
             t0 = self._prof('lr_sum_lpf', t0)
 
-        if self._pilot_detected and not self.force_mono:
+        if stereo_allowed:
+            # Pilot detection and 38 kHz carrier regeneration via pilot-squaring
+            # Uses trig identity: cos(2x) = 2*cos^2(x) - 1
+            pilot_normalized = pilot / (np.abs(pilot).max() + 1e-10)
+            carrier_38k = 2 * pilot_normalized ** 2 - 1
+
             # Extract L-R subcarrier region (23-53 kHz)
             lr_diff_mod, self.lr_diff_bpf_state = signal.lfilter(
                 self.lr_diff_bpf, 1.0, baseband, zi=self.lr_diff_bpf_state
@@ -417,39 +444,18 @@ class FMStereoDecoder:
             right = lr_sum
             self._blend_factor = 0.0  # Track that we're in mono
 
-        # Pilot-referenced SNR measurement
-        # The 19 kHz pilot is broadcast at a fixed level (~9% of deviation),
-        # so comparing pilot power to noise floor gives a consistent metric.
-        if self.noise_bpf is not None:
-            noise_filtered, self.noise_bpf_state = signal.lfilter(
-                self.noise_bpf, 1.0, baseband, zi=self.noise_bpf_state
-            )
-            noise_power = np.mean(noise_filtered ** 2)
-
-            # Pilot power from the smoothed pilot level (already RMS, square for power)
-            pilot_power = self._pilot_level ** 2
-
-            # Normalize noise to pilot bandwidth for fair comparison
-            # Pilot BPF: 1 kHz, Noise BPF: 10 kHz
-            noise_in_pilot_bw = noise_power * (self.pilot_bandwidth / self.noise_bandwidth)
-
-            # Smooth the noise measurement
-            self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_in_pilot_bw, 1e-12)
-
-            # Calculate SNR in dB (pilot power vs noise in same bandwidth)
-            if self._noise_power > 0 and pilot_power > 0:
-                self._snr_db = 10 * np.log10(pilot_power / self._noise_power)
-
-        if profiling:
-            t0 = self._prof('noise_bpf', t0)
-
         # Resample to audio rate with adaptive rate control
         # Adjusts output length to compensate for clock drift between IQ source and audio card
         nominal_output = int(round(len(left) * self._nominal_ratio))
         adjusted_output = int(round(nominal_output * self._rate_adjust))
         if adjusted_output > 0:
-            left = signal.resample(left, adjusted_output)
-            right = signal.resample(right, adjusted_output)
+            if stereo_allowed:
+                left = signal.resample(left, adjusted_output)
+                right = signal.resample(right, adjusted_output)
+            else:
+                mono = signal.resample(left, adjusted_output)
+                left = mono
+                right = mono
         else:
             left = np.array([], dtype=np.float64)
             right = np.array([], dtype=np.float64)
