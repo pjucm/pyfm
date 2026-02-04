@@ -331,6 +331,7 @@ class RDSDecoder:
         self._baseband_rms_pre_agc = 0.0  # Baseband before AGC
         self._soft_symbols = deque(maxlen=1000)  # Soft decision values
         self._symbol_snr_estimate = 0.0  # Estimated symbol SNR in dB
+        self._symbol_snr_counter = 0     # Counter for periodic symbol SNR updates
         self._phase_diag_buffer = deque(maxlen=500)  # Phase diagnostic samples
 
         # Timing log file for real-time analysis
@@ -571,7 +572,7 @@ class RDSDecoder:
         self.rds_signal_level = 0.9 * self.rds_signal_level + 0.1 * rds_power
 
         # Demodulate BPSK
-        if use_coherent is not None:
+        if use_coherent:
             bpsk_baseband = self._coherent_demod(rds_signal, baseband)
         else:
             bpsk_baseband = self._delay_multiply_demod(rds_signal)
@@ -583,6 +584,25 @@ class RDSDecoder:
 
         # Symbol timing recovery and bit extraction
         self._extract_symbols(bpsk_baseband)
+
+        # Update symbol SNR estimate periodically using soft symbol history
+        self._symbol_snr_counter += 1
+        if self._symbol_snr_counter >= 10:
+            self._symbol_snr_counter = 0
+            if len(self._soft_symbols) > 200:
+                soft = np.array(self._soft_symbols)
+                positive = soft[soft > 0]
+                negative = soft[soft < 0]
+                if len(positive) > 10 and len(negative) > 10:
+                    pos_mean = np.mean(positive)
+                    pos_std = np.std(positive)
+                    neg_mean = np.mean(negative)
+                    neg_std = np.std(negative)
+                    cluster_separation = pos_mean - neg_mean
+                    avg_noise = (pos_std + neg_std) / 2
+                    if avg_noise > 1e-10:
+                        symbol_snr_linear = (cluster_separation / 2) / avg_noise
+                        self._symbol_snr_estimate = 20 * np.log10(max(symbol_snr_linear, 0.01))
 
         return self._get_result()
 
@@ -711,8 +731,8 @@ class RDSDecoder:
         sps_frac = sps - sps_int       # 0.157894...
         half_sps = sps / 2.0
 
-        # Need at least 2 symbols worth of samples plus margin
-        while len(self.sample_buffer) >= sps_int * 2 + 2:
+        # Need enough samples for interpolated early/center/late
+        while True:
             # Use timing_mu for interpolation (phase within symbol)
             mu = self.timing_mu
             if mu < 0:
@@ -720,35 +740,32 @@ class RDSDecoder:
             elif mu > 1:
                 mu = 1
 
-            # Sample indices with interpolation
-            prev_idx = 0
-            prev_sample = self.sample_buffer[prev_idx]
-
-            # Midpoint
-            mid_pos = half_sps
-            mid_idx = int(mid_pos)
-            mid_frac = mid_pos - mid_idx
-            if mid_idx + 1 >= len(self.sample_buffer):
+            pos_prev = mu
+            pos_mid = mu + half_sps
+            pos_next = mu + sps
+            if len(self.sample_buffer) < int(pos_next) + 2:
                 break
-            mid_sample = (1 - mid_frac) * self.sample_buffer[mid_idx] + mid_frac * self.sample_buffer[mid_idx + 1]
 
-            # Current symbol
-            curr_idx = sps_int
-            if curr_idx + 1 >= len(self.sample_buffer):
-                break
-            curr_sample = (1 - mu) * self.sample_buffer[curr_idx] + mu * self.sample_buffer[curr_idx + 1]
+            def interp(pos):
+                idx = int(pos)
+                frac = pos - idx
+                return (1 - frac) * self.sample_buffer[idx] + frac * self.sample_buffer[idx + 1]
 
-            # Hard decision
-            data_bit = 0 if curr_sample > 0 else 1
+            prev_sample = interp(pos_prev)
+            mid_sample = interp(pos_mid)
+            next_sample = interp(pos_next)
+
+            # Hard decision (use center/late sample)
+            data_bit = 0 if next_sample > 0 else 1
             self.bit_distribution[data_bit] += 1
 
             # Diagnostics: capture soft symbol value for constellation analysis
             if self._diag_enabled:
-                self._soft_symbols.append(curr_sample)
+                self._soft_symbols.append(next_sample)
 
             # Gardner TED for phase and frequency adjustment (PI loop)
-            timing_error_raw = -(curr_sample - prev_sample) * mid_sample
-            norm = abs(curr_sample) + abs(prev_sample) + abs(mid_sample) + 1e-10
+            timing_error_raw = -(next_sample - prev_sample) * mid_sample
+            norm = abs(next_sample) + abs(prev_sample) + abs(mid_sample) + 1e-10
             timing_error = timing_error_raw / norm
             # Clamp error to prevent runaway
             timing_error = max(-0.5, min(0.5, timing_error))
@@ -800,7 +817,7 @@ class RDSDecoder:
                     self._timing_log_file.write(
                         f"{self._timing_log_counter},{self.timing_mu:.4f},{timing_error:.6f},"
                         f"{timing_error_raw:.6f},{self.timing_freq_offset:.6f},"
-                        f"{curr_sample:.4f},{advance},{blk_rate:.3f}\n"
+                        f"{next_sample:.4f},{advance},{blk_rate:.3f}\n"
                     )
                     self._timing_log_file.flush()
 
@@ -1215,6 +1232,7 @@ class RDSDecoder:
         self._baseband_rms_pre_agc = 0.0
         self._soft_symbols.clear()
         self._symbol_snr_estimate = 0.0
+        self._symbol_snr_counter = 0
         self._phase_diag_buffer.clear()
         # Close timing log file if open
         if self._timing_log_file:
