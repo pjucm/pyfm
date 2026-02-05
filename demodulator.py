@@ -606,25 +606,19 @@ class NBFMDecoder:
         self._signal_power = 0.0
         self._noise_power = 1e-10
 
-        # Design noise measurement bandpass filter (10-15 kHz)
-        # Must be outside NBFM signal bandwidth (Carson's rule: 2*(5kHz + 3kHz) = 16kHz)
-        # but close enough that FM noise triangle doesn't skew the measurement.
-        # FM demod noise PSD increases as f², so measuring at 12.5 kHz vs 1.5 kHz
-        # audio center requires correction factor of (12.5/1.5)² ≈ 69x = 18 dB.
-        noise_low = 10000 / nyq
-        noise_high = min(15000 / nyq, 0.95)
-        if noise_high > noise_low + 0.01:  # Need at least some bandwidth
-            self.noise_bpf = signal.firwin(51, [noise_low, noise_high],
-                                           pass_zero=False, window='hamming')
-            self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
-            # Actual bandwidth in Hz
-            self.noise_bandwidth = (noise_high - noise_low) * nyq
-            # FM noise triangle correction: noise at band center vs 1.5 kHz audio center
-            noise_center_hz = (10000 + 15000) / 2
-            self._fm_noise_correction = (noise_center_hz / 1500) ** 2
-        else:
-            self.noise_bpf = None
-            self._fm_noise_correction = 1.0
+        # Design noise measurement bandpass filter (4-6 kHz)
+        # Must be WITHIN the 7.5 kHz channel filter passband (otherwise we measure
+        # attenuated noise and get falsely high SNR), but above audio content (3 kHz).
+        # FM demod noise PSD increases as f², so measuring at 5 kHz vs 1.5 kHz
+        # audio center requires correction factor of (5/1.5)² ≈ 11x.
+        noise_low = 4000 / nyq
+        noise_high = 6000 / nyq
+        self.noise_bpf = signal.firwin(101, [noise_low, noise_high],
+                                       pass_zero=False, window='hamming')
+        self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
+        self.noise_bandwidth = 2000  # Hz (4-6 kHz)
+        # FM noise triangle correction: noise at 5 kHz vs 1.5 kHz audio center
+        self._fm_noise_correction = (5000 / 1500) ** 2  # ≈ 11x
 
         # Audio bandwidth for SNR scaling
         self.audio_bandwidth = 3000  # Hz
@@ -753,26 +747,25 @@ class NBFMDecoder:
         )
 
         # SNR measurement
-        # Measure signal power from the filtered audio
+        # Measure signal power from the filtered audio (0-3 kHz)
         signal_power = np.mean(audio ** 2)
 
-        # Measure noise power in a band outside the FM signal spectrum
-        if self.noise_bpf is not None:
-            noise_filtered, self.noise_bpf_state = signal.lfilter(
-                self.noise_bpf, 1.0, baseband, zi=self.noise_bpf_state
-            )
-            noise_power = np.mean(noise_filtered ** 2)
-            # Scale noise from measurement bandwidth to audio bandwidth,
-            # and apply FM noise triangle correction (noise PSD ∝ f² after FM demod)
-            noise_power_scaled = (noise_power * (self.audio_bandwidth / self.noise_bandwidth)
-                                  / self._fm_noise_correction)
+        # Measure noise power in a band above audio but within channel filter (4-6 kHz)
+        noise_filtered, self.noise_bpf_state = signal.lfilter(
+            self.noise_bpf, 1.0, baseband, zi=self.noise_bpf_state
+        )
+        noise_power = np.mean(noise_filtered ** 2)
+        # Scale noise from measurement bandwidth to audio bandwidth,
+        # and apply FM noise triangle correction (noise PSD ∝ f² after FM demod)
+        noise_power_scaled = (noise_power * (self.audio_bandwidth / self.noise_bandwidth)
+                              / self._fm_noise_correction)
 
-            # Smooth the measurements
-            self._signal_power = 0.9 * self._signal_power + 0.1 * signal_power
-            self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_power_scaled, 1e-12)
+        # Smooth the measurements
+        self._signal_power = 0.9 * self._signal_power + 0.1 * signal_power
+        self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_power_scaled, 1e-12)
 
-            if self._noise_power > 0:
-                self._snr_db = 10 * np.log10(self._signal_power / self._noise_power)
+        if self._noise_power > 0:
+            self._snr_db = 10 * np.log10(self._signal_power / self._noise_power)
 
         # Resample to audio rate with adaptive rate control
         # Adjusts output length to compensate for clock drift
@@ -819,7 +812,6 @@ class NBFMDecoder:
         # Reset filter states
         self.channel_lpf_state = signal.lfilter_zi(self.channel_lpf, 1.0)
         self.audio_lpf_state = signal.lfilter_zi(self.audio_lpf, 1.0)
-        if self.noise_bpf is not None:
-            self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
+        self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
         self.bass_state_l = signal.lfilter_zi(self.bass_b, self.bass_a)
         self.treble_state_l = signal.lfilter_zi(self.treble_b, self.treble_a)
