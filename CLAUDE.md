@@ -22,7 +22,7 @@ in software, and plays audio through the default Linux audio device.
 
 | Key | Function |
 |-----|----------|
-| ←/→ | Tune down/up (100 kHz FM, 25 kHz Weather) |
+| ←/→ | Tune down/up (200 kHz FM, 25 kHz Weather) |
 | ↑/↓ | Volume up/down |
 | 1-5 | Recall preset (FM) or WX1-WX7 (Weather) |
 | !@#$% | Set preset to current frequency (FM mode) |

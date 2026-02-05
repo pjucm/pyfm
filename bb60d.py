@@ -138,7 +138,7 @@ class BB60D:
     # FM broadcast band limits (North America)
     FM_MIN_FREQ = 88.0e6
     FM_MAX_FREQ = 108.0e6
-    FM_STEP = 100e3  # 100 kHz step
+    FM_STEP = 200e3  # 200 kHz step (North American FM standard)
 
     # Full device frequency range (BB60D supports 9 kHz to 6.4 GHz)
     MIN_FREQ = BB_MIN_FREQ  # 9 kHz

@@ -15,7 +15,7 @@ Usage:
     ./pjfm.py [frequency_mhz]
 
 Controls:
-    Left/Right arrows: Tune down/up by 100 kHz (FM) or 25 kHz (Weather)
+    Left/Right arrows: Tune down/up by 200 kHz (FM) or 25 kHz (Weather)
     Up/Down arrows: Volume up/down
     1-5: Recall frequency preset (FM mode)
     1-7: Recall WX channel (Weather mode)
@@ -1159,7 +1159,7 @@ class FMRadio:
         return self.signal_dbm  # No lock needed for single float read
 
     def tune_up(self):
-        """Tune up by 100 kHz (FM) or 25 kHz (Weather)."""
+        """Tune up by 200 kHz (FM) or 25 kHz (Weather)."""
         self.is_tuning = True
         self.error_message = None
         if self.weather_mode:
@@ -1171,7 +1171,7 @@ class FMRadio:
             # self.device.flush_iq()
             self.nbfm_decoder.reset()
         else:
-            # FM broadcast: 100 kHz steps
+            # FM broadcast: 200 kHz steps (North American standard)
             self.device.tune_up()
             self.stereo_decoder.reset()
             if self.rds_decoder:
@@ -1184,7 +1184,7 @@ class FMRadio:
             self._save_config()
 
     def tune_down(self):
-        """Tune down by 100 kHz (FM) or 25 kHz (Weather)."""
+        """Tune down by 200 kHz (FM) or 25 kHz (Weather)."""
         self.is_tuning = True
         self.error_message = None
         if self.weather_mode:
@@ -1196,7 +1196,7 @@ class FMRadio:
             # self.device.flush_iq()
             self.nbfm_decoder.reset()
         else:
-            # FM broadcast: 100 kHz steps
+            # FM broadcast: 200 kHz steps (North American standard)
             self.device.tune_down()
             self.stereo_decoder.reset()
             if self.rds_decoder:

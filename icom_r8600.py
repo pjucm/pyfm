@@ -271,7 +271,7 @@ class IcomR8600:
     # FM broadcast band
     FM_MIN_FREQ = 88.0e6
     FM_MAX_FREQ = 108.0e6
-    FM_STEP = 100e3
+    FM_STEP = 200e3  # 200 kHz step (North American FM standard)
 
     DEFAULT_FREQ = 89.9e6
 
