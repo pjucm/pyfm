@@ -589,6 +589,13 @@ class NBFMDecoder:
         # Design filters (all at IQ sample rate)
         nyq = iq_sample_rate / 2
 
+        # Channel filter BEFORE FM demodulation (critical for noise rejection)
+        # NBFM channel is ±7.5 kHz; filter reduces noise bandwidth going into discriminator
+        # This prevents high-frequency noise spikes from causing phase jumps
+        channel_cutoff = 7500 / nyq
+        self.channel_lpf = signal.firwin(101, channel_cutoff, window='hamming')
+        self.channel_lpf_state = signal.lfilter_zi(self.channel_lpf, 1.0)
+
         # Audio lowpass filter (3 kHz for NBFM voice)
         audio_cutoff = 3000 / nyq
         self.audio_lpf = signal.firwin(101, audio_cutoff, window='hamming')
@@ -599,18 +606,25 @@ class NBFMDecoder:
         self._signal_power = 0.0
         self._noise_power = 1e-10
 
-        # Design noise measurement bandpass filter (20-30 kHz)
-        # Must be well outside NBFM signal bandwidth (Carson's rule: 2*(5kHz + 3kHz) = 16kHz)
-        # Using 20-30kHz to be safely outside the signal spectrum
-        noise_low = 20000 / nyq
-        noise_high = min(30000 / nyq, 0.95)
-        if noise_high > noise_low:
+        # Design noise measurement bandpass filter (10-15 kHz)
+        # Must be outside NBFM signal bandwidth (Carson's rule: 2*(5kHz + 3kHz) = 16kHz)
+        # but close enough that FM noise triangle doesn't skew the measurement.
+        # FM demod noise PSD increases as f², so measuring at 12.5 kHz vs 1.5 kHz
+        # audio center requires correction factor of (12.5/1.5)² ≈ 69x = 18 dB.
+        noise_low = 10000 / nyq
+        noise_high = min(15000 / nyq, 0.95)
+        if noise_high > noise_low + 0.01:  # Need at least some bandwidth
             self.noise_bpf = signal.firwin(51, [noise_low, noise_high],
                                            pass_zero=False, window='hamming')
             self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
-            self.noise_bandwidth = 10000  # Hz
+            # Actual bandwidth in Hz
+            self.noise_bandwidth = (noise_high - noise_low) * nyq
+            # FM noise triangle correction: noise at band center vs 1.5 kHz audio center
+            noise_center_hz = (10000 + 15000) / 2
+            self._fm_noise_correction = (noise_center_hz / 1500) ** 2
         else:
             self.noise_bpf = None
+            self._fm_noise_correction = 1.0
 
         # Audio bandwidth for SNR scaling
         self.audio_bandwidth = 3000  # Hz
@@ -719,9 +733,16 @@ class NBFMDecoder:
         if len(iq_samples) == 0:
             return np.zeros((0, 2), dtype=np.float32)
 
+        # Channel filter BEFORE FM demodulation to reduce noise bandwidth
+        # This is critical - without it, high-frequency noise causes phase spikes
+        # that result in crackling audio when the limiter engages
+        iq_filtered, self.channel_lpf_state = signal.lfilter(
+            self.channel_lpf, 1.0, iq_samples, zi=self.channel_lpf_state
+        )
+
         # FM demodulation (quadrature discriminator)
-        samples = np.concatenate([[self.last_sample], iq_samples])
-        self.last_sample = iq_samples[-1]
+        samples = np.concatenate([[self.last_sample], iq_filtered])
+        self.last_sample = iq_filtered[-1]
 
         product = samples[1:] * np.conj(samples[:-1])
         baseband = np.angle(product) * (self.iq_sample_rate / (2 * np.pi * self.deviation))
@@ -741,8 +762,10 @@ class NBFMDecoder:
                 self.noise_bpf, 1.0, baseband, zi=self.noise_bpf_state
             )
             noise_power = np.mean(noise_filtered ** 2)
-            # Scale noise from measurement bandwidth to audio bandwidth
-            noise_power_scaled = noise_power * (self.audio_bandwidth / self.noise_bandwidth)
+            # Scale noise from measurement bandwidth to audio bandwidth,
+            # and apply FM noise triangle correction (noise PSD ∝ f² after FM demod)
+            noise_power_scaled = (noise_power * (self.audio_bandwidth / self.noise_bandwidth)
+                                  / self._fm_noise_correction)
 
             # Smooth the measurements
             self._signal_power = 0.9 * self._signal_power + 0.1 * signal_power
@@ -760,8 +783,8 @@ class NBFMDecoder:
         else:
             audio = np.array([], dtype=np.float64)
 
-        # Scale down to provide headroom for tone controls
-        audio = audio * 0.65
+        # Scale down to provide headroom (0.4 matches panadapter's conservative gain)
+        audio = audio * 0.4
 
         # Apply tone controls
         if self.bass_boost_enabled:
@@ -794,6 +817,7 @@ class NBFMDecoder:
         self._peak_amplitude = 0.0
 
         # Reset filter states
+        self.channel_lpf_state = signal.lfilter_zi(self.channel_lpf, 1.0)
         self.audio_lpf_state = signal.lfilter_zi(self.audio_lpf, 1.0)
         if self.noise_bpf is not None:
             self.noise_bpf_state = signal.lfilter_zi(self.noise_bpf, 1.0)
