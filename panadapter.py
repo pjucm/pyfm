@@ -38,13 +38,19 @@ import pyqtgraph as pg
 from pyqtgraph import ColorMap
 import sounddevice as sd
 
-from bb60d import BB60D, BB_MIN_FREQ, BB_MAX_FREQ
+try:
+    from bb60d import BB60D, BB_MIN_FREQ, BB_MAX_FREQ
+except (ImportError, RuntimeError):
+    BB60D = None
+    BB_MIN_FREQ = 9.0e3
+    BB_MAX_FREQ = 6.4e9
+
 from demodulator import FMStereoDecoder
 
 # Optional IC-R8600 support
 try:
     from icom_r8600 import IcomR8600
-except ImportError:
+except (ImportError, RuntimeError):
     IcomR8600 = None
 
 
@@ -1026,13 +1032,13 @@ class SMeterWidget(QFrame):
         # S-meter text readout (fixed width to prevent layout jumping)
         self.reading_label = QLabel('S0')
         self.reading_label.setFixedWidth(60)
-        self.reading_label.setStyleSheet('font-family: monospace; font-weight: bold; font-size: 14px;')
+        self.reading_label.setStyleSheet('font-family: "Menlo", monospace; font-weight: bold; font-size: 14px;')
         layout.addWidget(self.reading_label)
 
         # dBm readout (fixed width to prevent layout jumping)
         self.dbm_label = QLabel('-120 dBm')
         self.dbm_label.setFixedWidth(120)
-        self.dbm_label.setStyleSheet('font-family: monospace; color: #888;')
+        self.dbm_label.setStyleSheet('font-family: "Menlo", monospace; color: #888;')
         layout.addWidget(self.dbm_label)
 
     def set_level(self, dbm):
@@ -1142,13 +1148,13 @@ class PeakMeterWidget(QFrame):
         # Level readout
         self.level_label = QLabel('0.00')
         self.level_label.setFixedWidth(45)
-        self.level_label.setStyleSheet('font-family: monospace; font-weight: bold;')
+        self.level_label.setStyleSheet('font-family: "Menlo", monospace; font-weight: bold;')
         layout.addWidget(self.level_label)
 
         # Limiter indicator
         self.limiter_label = QLabel('')
         self.limiter_label.setFixedWidth(50)
-        self.limiter_label.setStyleSheet('font-family: monospace; font-weight: bold; color: #ff6600;')
+        self.limiter_label.setStyleSheet('font-family: "Menlo", monospace; font-weight: bold; color: #ff6600;')
         layout.addWidget(self.limiter_label)
 
         layout.addStretch()
@@ -1192,10 +1198,10 @@ class PeakMeterWidget(QFrame):
         # Update limiter indicator
         if peak >= 1.0:
             self.limiter_label.setText('CLIP')
-            self.limiter_label.setStyleSheet('font-family: monospace; font-weight: bold; color: #ff0000;')
+            self.limiter_label.setStyleSheet('font-family: "Menlo", monospace; font-weight: bold; color: #ff0000;')
         elif peak >= self.LIMITER_THRESHOLD:
             self.limiter_label.setText('LIMIT')
-            self.limiter_label.setStyleSheet('font-family: monospace; font-weight: bold; color: #ff6600;')
+            self.limiter_label.setStyleSheet('font-family: "Menlo", monospace; font-weight: bold; color: #ff6600;')
         else:
             self.limiter_label.setText('')
 
@@ -1409,7 +1415,7 @@ class MainWindow(QMainWindow):
         demod_layout.addWidget(self.stereo_label)
         self.stereo_indicator = QLabel('MONO')
         self.stereo_indicator.setMinimumWidth(60)
-        self.stereo_indicator.setStyleSheet('font-family: monospace; color: black;')
+        self.stereo_indicator.setStyleSheet('font-family: "Menlo", monospace; color: black;')
         demod_layout.addWidget(self.stereo_indicator)
 
         # SNR indicator (fixed width to prevent layout jumping)
@@ -1417,7 +1423,7 @@ class MainWindow(QMainWindow):
         demod_layout.addWidget(self.snr_label)
         self.snr_indicator = QLabel('-- dB')
         self.snr_indicator.setFixedWidth(90)
-        self.snr_indicator.setStyleSheet('font-family: monospace; color: black;')
+        self.snr_indicator.setStyleSheet('font-family: "Menlo", monospace; color: black;')
         demod_layout.addWidget(self.snr_indicator)
 
         # Initially hide stereo/SNR indicators (only show in FM Broadcast mode)
@@ -1750,12 +1756,12 @@ class MainWindow(QMainWindow):
                 self.stereo_indicator.setText(f'{blend_pct}%')
         else:
             self.stereo_indicator.setText('MONO')
-        self.stereo_indicator.setStyleSheet('font-family: monospace; color: black;')
+        self.stereo_indicator.setStyleSheet('font-family: "Menlo", monospace; color: black;')
 
         # Update SNR indicator
         snr = self.wbfm_demodulator.snr_db
         self.snr_indicator.setText(f'{snr:2.0f} dB')
-        self.snr_indicator.setStyleSheet('font-family: monospace; color: black;')
+        self.snr_indicator.setStyleSheet('font-family: "Menlo", monospace; color: black;')
 
     def _update_peak_meter(self):
         """Update peak meter with audio peak level from demodulator."""
