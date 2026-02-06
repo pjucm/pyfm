@@ -1259,7 +1259,7 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         """Initialize the user interface."""
         self.setWindowTitle(f"Phil's Panadapter - Weather Radio - {self.center_freq/1e6:.3f} MHz")
-        self.setGeometry(100, 100, 2000, 1500)
+        self.setGeometry(100, 100, 1400, 900)
 
         # Central widget and layout
         central_widget = QWidget()
