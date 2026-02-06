@@ -1168,11 +1168,12 @@ class FMRadio:
             if new_freq > 162.550e6:
                 new_freq = 162.400e6  # Wrap around
             self.device.set_frequency(new_freq)
-            # self.device.flush_iq()
+            self.device.flush_iq()
             self.nbfm_decoder.reset()
         else:
             # FM broadcast: 200 kHz steps (North American standard)
             self.device.tune_up()
+            self.device.flush_iq()
             self.stereo_decoder.reset()
             if self.rds_decoder:
                 self.rds_decoder.reset()
@@ -1193,11 +1194,12 @@ class FMRadio:
             if new_freq < 162.400e6:
                 new_freq = 162.550e6  # Wrap around
             self.device.set_frequency(new_freq)
-            # self.device.flush_iq()
+            self.device.flush_iq()
             self.nbfm_decoder.reset()
         else:
             # FM broadcast: 200 kHz steps (North American standard)
             self.device.tune_down()
+            self.device.flush_iq()
             self.stereo_decoder.reset()
             if self.rds_decoder:
                 self.rds_decoder.reset()
@@ -1221,7 +1223,7 @@ class FMRadio:
         self.is_tuning = True
         self.error_message = None
         self.device.set_frequency(freq_hz)
-        # self.device.flush_iq()
+        self.device.flush_iq()
         if self.weather_mode:
             self.nbfm_decoder.reset()
         else:
@@ -1343,7 +1345,7 @@ class FMRadio:
             # Switch to weather mode: tune to WX1 (162.550 MHz)
             freq = WX_CHANNELS[1]
             self.device.set_frequency(freq)
-            # self.device.flush_iq()
+            self.device.flush_iq()
             self.nbfm_decoder.reset()
             # Disable RDS in weather mode
             self.rds_enabled = False
@@ -1363,7 +1365,7 @@ class FMRadio:
                 except (ValueError, configparser.Error):
                     pass
             self.device.set_frequency(freq)
-            # self.device.flush_iq()
+            self.device.flush_iq()
             self.stereo_decoder.reset()
             if self.rds_decoder:
                 self.rds_decoder.reset()
@@ -1575,13 +1577,13 @@ def build_display(radio, width=80):
         bw_label = "3kHz"
     else:
         # WBFM broadcast thresholds (15-53 kHz audio bandwidth)
-        if snr > 40:
+        if snr > 35:
             snr_text.append(f"{snr:.1f} dB", style="green bold")
             snr_text.append("  (Excellent)", style="green")
-        elif snr > 30:
+        elif snr > 25:
             snr_text.append(f"{snr:.1f} dB", style="green bold")
             snr_text.append("  (Good)", style="green")
-        elif snr > 20:
+        elif snr > 15:
             snr_text.append(f"{snr:.1f} dB", style="yellow bold")
             snr_text.append("  (Fair)", style="yellow")
         elif snr > 10:
