@@ -557,7 +557,7 @@ class FMRadio:
     """
 
     # IQ streaming parameters
-    IQ_SAMPLE_RATE = 240000  # Requested IQ sample rate (Hz); actual rate depends on device
+    IQ_SAMPLE_RATE = 480000  # Requested IQ sample rate (Hz); actual rate depends on device
     AUDIO_SAMPLE_RATE = 48000
     IQ_BLOCK_SIZE = 8192  # ~26.2ms budget at 312.5kHz
     IQ_QUEUE_MAX_BLOCKS = 8
@@ -2293,7 +2293,7 @@ def main():
         "--iq-rate",
         type=int,
         default=None,
-        help="Requested IQ sample rate in Hz (default: config or 240000)"
+        help="Requested IQ sample rate in Hz (default: config or 480000)"
     )
     parser.add_argument(
         "--rds",

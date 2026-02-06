@@ -219,7 +219,7 @@ class RDSDecoder:
 
     def __init__(self, sample_rate=250000, matched_filter=False, matched_filter_len=None,
                  timing_gain_p=None, timing_gain_i=None, lpf_cutoff=None,
-                 bpf_bandwidth=None, agc_alpha=None):
+                 bpf_bandwidth=None, agc_alpha=None, pilot_alpha=None):
         """
         Initialize RDS decoder.
 
@@ -233,6 +233,7 @@ class RDSDecoder:
             lpf_cutoff: Post-demod LPF cutoff in Hz (default: 800)
             bpf_bandwidth: RDS BPF half-bandwidth in Hz (default: 2000)
             agc_alpha: AGC tracking speed, 0-1 (default: 0.05, slower=more stable)
+            pilot_alpha: Pilot RMS smoothing factor, 0-1 (default: 0.05)
         """
         self.sample_rate = sample_rate
         self.samples_per_symbol = sample_rate / RDS_SYMBOL_RATE
@@ -288,8 +289,9 @@ class RDSDecoder:
         self.pilot_bpf_a = 1.0
         self.pilot_bpf_zi = signal.lfilter_zi(self.pilot_bpf_b, self.pilot_bpf_a) * 0
 
-        # Delay buffer for differential decoding
-        self._diff_delay_buf = np.zeros(self._diff_delay)
+        # Delay buffers for differential decoding
+        self._diff_delay_buf_coherent = np.zeros(self._diff_delay)
+        self._diff_delay_buf_noncoherent = np.zeros(self._diff_delay)
 
         # Symbol timing recovery state (Gardner TED with PI loop)
         # Default gains reduced from 0.03/0.003 for better low-SNR stability
@@ -303,6 +305,10 @@ class RDSDecoder:
         # AGC parameters - slow tracking for noise immunity
         self._agc_alpha = agc_alpha if agc_alpha is not None else 0.05
         self._agc_rms = 0.1  # Initial AGC estimate
+
+        # Pilot RMS tracking for stable coherent normalization
+        self._pilot_alpha = pilot_alpha if pilot_alpha is not None else 0.05
+        self._pilot_rms_est = 0.0
 
         # Bit buffer and block sync state
         self.bit_buffer = []
@@ -580,7 +586,9 @@ class RDSDecoder:
 
         Args:
             baseband: FM-demodulated baseband signal at sample_rate
-            use_coherent: Deprecated, ignored. Coherent demod always used.
+            use_coherent: If True, use pilot-assisted coherent demodulation.
+                          If False, use noncoherent delay-multiply demodulation.
+                          If None, defaults to True.
 
         Returns:
             Dictionary containing decoded RDS data and status
@@ -599,8 +607,13 @@ class RDSDecoder:
         rds_power = np.sqrt(np.mean(rds_signal ** 2))
         self.rds_signal_level = 0.9 * self.rds_signal_level + 0.1 * rds_power
 
-        # Coherent BPSK demodulation using pilot-derived carrier
-        bpsk_baseband = self._coherent_demod(rds_signal, baseband)
+        if use_coherent is None:
+            use_coherent = True
+
+        if use_coherent:
+            bpsk_baseband = self._coherent_demod(rds_signal, baseband)
+        else:
+            bpsk_baseband = self._noncoherent_demod(rds_signal)
 
         # AGC - normalize signal amplitude for consistent symbol decisions
         # Use slow-tracking AGC to avoid noise modulation at low SNR
@@ -635,6 +648,61 @@ class RDSDecoder:
 
         return self._get_result()
 
+    def _delay_multiply(self, signal_in, coherent_path):
+        """Differential decode by multiplying with one-symbol-delayed samples."""
+        n = len(signal_in)
+        delay = self._diff_delay
+        if coherent_path:
+            delay_buf = self._diff_delay_buf_coherent
+        else:
+            delay_buf = self._diff_delay_buf_noncoherent
+
+        delayed = np.zeros(n, dtype=np.float64)
+        if n >= delay:
+            delayed[:delay] = delay_buf
+            delayed[delay:] = signal_in[:n - delay]
+            new_delay_buf = signal_in[-delay:].copy()
+        else:
+            delayed[:n] = delay_buf[:n]
+            new_delay_buf = delay_buf.copy()
+            new_delay_buf[:-n] = delay_buf[n:]
+            new_delay_buf[-n:] = signal_in
+
+        if coherent_path:
+            self._diff_delay_buf_coherent = new_delay_buf
+        else:
+            self._diff_delay_buf_noncoherent = new_delay_buf
+
+        return signal_in * delayed
+
+    def _post_demod_filter(self, diff_decoded):
+        """Low-pass filter differential product to recover RDS symbol baseband."""
+        if self.matched_filter:
+            bpsk_baseband, self.mf_zi = signal.lfilter(
+                self.mf_b, self.mf_a, diff_decoded, zi=self.mf_zi
+            )
+        else:
+            bpsk_baseband, self.lpf_zi = signal.lfilter(
+                self.lpf_b, self.lpf_a, diff_decoded, zi=self.lpf_zi
+            )
+        return bpsk_baseband
+
+    def _noncoherent_demod(self, rds_signal):
+        """
+        Noncoherent RDS demod using one-symbol delay-multiply.
+
+        This path does not require pilot lock and is useful as a fallback when
+        pilot quality is too poor for stable coherent demodulation.
+        """
+        diff_decoded = self._delay_multiply(rds_signal, coherent_path=False)
+        bpsk_baseband = self._post_demod_filter(diff_decoded)
+
+        if self._diag_enabled:
+            bb_rms = np.sqrt(np.mean(bpsk_baseband ** 2))
+            self._baseband_rms_pre_agc = 0.9 * self._baseband_rms_pre_agc + 0.1 * bb_rms
+
+        return bpsk_baseband
+
     def _coherent_demod(self, rds_signal, baseband):
         """
         Coherent BPSK demodulation using pilot-derived 57 kHz carrier.
@@ -656,11 +724,16 @@ class RDSDecoder:
             self.pilot_bpf_b, self.pilot_bpf_a, baseband, zi=self.pilot_bpf_zi
         )
 
-        # Normalize pilot to unit amplitude for tripling formula
+        # Track pilot RMS for diagnostics and robust normalization.
         pilot_rms = np.sqrt(np.mean(pilot ** 2))
         if pilot_rms < 1e-10:
-            # No pilot detected - return zeros (RDS requires pilot for coherent demod)
+            # No pilot detected in this chunk.
             return np.zeros(len(rds_signal))
+        if self._pilot_rms_est <= 1e-10:
+            self._pilot_rms_est = pilot_rms
+        else:
+            alpha = self._pilot_alpha
+            self._pilot_rms_est = (1.0 - alpha) * self._pilot_rms_est + alpha * pilot_rms
 
         # Diagnostics: track pilot quality
         if self._diag_enabled:
@@ -669,7 +742,8 @@ class RDSDecoder:
             self._pilot_peak = 0.9 * self._pilot_peak + 0.1 * pilot_peak
 
         # Normalize to unit amplitude (RMS of sinusoid = peak/sqrt(2))
-        pilot_norm = pilot / (pilot_rms * np.sqrt(2))
+        pilot_norm = pilot / max(pilot_rms * np.sqrt(2), 1e-10)
+        pilot_norm = np.clip(pilot_norm, -2.0, 2.0)
 
         # Generate 57 kHz carrier using tripling identity: cos(3θ) = 4cos³(θ) - 3cos(θ)
         # This preserves phase relationship without FFT edge effects
@@ -683,34 +757,9 @@ class RDSDecoder:
         # Mix RDS with carrier (carrier removal)
         coherent_product = rds_signal * carrier_57k
 
-        # Differential decoding: multiply by one-symbol-delayed version
-        n = len(coherent_product)
-        delay = self._diff_delay
-
-        delayed = np.zeros(n)
-        if n >= delay:
-            delayed[:delay] = self._diff_delay_buf
-            delayed[delay:] = coherent_product[:n - delay]
-        else:
-            delayed[:n] = self._diff_delay_buf[:n]
-
-        if n >= delay:
-            self._diff_delay_buf = coherent_product[-delay:].copy()
-        else:
-            self._diff_delay_buf[:-n] = self._diff_delay_buf[n:]
-            self._diff_delay_buf[-n:] = coherent_product
-
-        diff_decoded = coherent_product * delayed
-
-        # Low-pass filter to extract baseband
-        if self.matched_filter:
-            bpsk_baseband, self.mf_zi = signal.lfilter(
-                self.mf_b, self.mf_a, diff_decoded, zi=self.mf_zi
-            )
-        else:
-            bpsk_baseband, self.lpf_zi = signal.lfilter(
-                self.lpf_b, self.lpf_a, diff_decoded, zi=self.lpf_zi
-            )
+        # Differential decoding and low-pass extraction
+        diff_decoded = self._delay_multiply(coherent_product, coherent_path=True)
+        bpsk_baseband = self._post_demod_filter(diff_decoded)
 
         # Diagnostics: track pre-AGC baseband level
         if self._diag_enabled:
@@ -1178,8 +1227,9 @@ class RDSDecoder:
         if self.matched_filter:
             self.mf_zi = signal.lfilter_zi(self.mf_b, self.mf_a) * 0
 
-        # Delay buffer for differential decoding
-        self._diff_delay_buf = np.zeros(self._diff_delay)
+        # Delay buffers for differential decoding
+        self._diff_delay_buf_coherent = np.zeros(self._diff_delay)
+        self._diff_delay_buf_noncoherent = np.zeros(self._diff_delay)
 
         # Timing recovery
         self.timing_mu = 0.5
@@ -1228,6 +1278,7 @@ class RDSDecoder:
 
         # AGC state
         self._agc_rms = 0.1
+        self._pilot_rms_est = 0.0
 
         # Diagnostics
         self._diag_buffer.clear()
