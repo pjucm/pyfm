@@ -1503,11 +1503,12 @@ class MainWindow(QMainWindow):
         self.tuned_freq = center_freq  # Currently tuned frequency for demod
 
         # PI rate controller for audio clock drift compensation.
-        # Qt event loop batches audio_ready signals into bursts every ~100ms.
-        # PI fires once per burst via 60Hz throttle (burst rate ~10Hz < 60Hz).
+        # Audio samples are written from the data thread via a direct signal
+        # connection so buffer updates stay independent of GUI event-loop stalls
+        # (for example during window minimize/maximize transitions).
+        # PI updates are throttled to 60 Hz to keep control behavior stable.
         # P-dominant design: large Kp for fast initial correction, tiny Ki
         # for slow fine-tuning to eliminate steady-state error.
-        # Heavy EMA (alpha=0.005) filters ±15ms burst-jitter noise.
         # Validated via simulation (pi_tuner_panadapter.py) across ±1000 ppm.
         self._rate_Kp = 0.00005       # 50 ppm/ms — proportional gain
         self._rate_Ki = 0.00000002    # 0.02 ppm/ms — integral gain (slow)
@@ -1518,10 +1519,10 @@ class MainWindow(QMainWindow):
         # near steady-state instead of spending ~20s converging from zero.
         self._rate_integrator = 0.0012     # → _rate_adj ≈ 0.9988 (-1200 ppm)
         self._rate_integrator_max = 0.002  # ±2000 ppm max
-        self._error_filter_alpha = 0.005   # EMA — ~20s time constant at 10Hz burst rate
+        self._error_filter_alpha = 0.005   # EMA smoothing (~3.3s time constant at 60 Hz)
         self._filtered_error = 0.0
         self._rate_adj = 1.0 - self._rate_integrator  # Start at seeded value
-        self._pi_interval = 1.0 / 60  # Throttle: fires once per burst (~10Hz)
+        self._pi_interval = 1.0 / 60  # Throttle PI updates to 60 Hz max
         self._pi_last_update = 0.0
 
         self.setup_ui()
@@ -1997,7 +1998,9 @@ class MainWindow(QMainWindow):
             if self.current_mode == self.MODE_FM_BROADCAST:
                 self.data_thread.rds_thread = self.rds_thread
             self.data_thread.data_ready.connect(self.process_iq_data)
-            self.data_thread.audio_ready.connect(self.on_audio_ready)
+            # Keep audio writes off the GUI event queue so window-state changes
+            # do not briefly starve the output buffer and trigger underruns.
+            self.data_thread.audio_ready.connect(self.on_audio_ready, Qt.DirectConnection)
             self.data_thread.squelch_status.connect(self.on_squelch_status)
             self.data_thread.error.connect(self.on_error)
             self.data_thread.start()
@@ -2433,7 +2436,7 @@ class MainWindow(QMainWindow):
         if self.audio_output:
             self.audio_output.write(audio_samples)
 
-            # PI rate controller — throttled so it fires once per burst (~10Hz)
+            # PI rate controller — throttled to avoid per-block control noise.
             now = time.monotonic()
             if now - self._pi_last_update < self._pi_interval:
                 return
@@ -2445,7 +2448,7 @@ class MainWindow(QMainWindow):
             target_ms = self.audio_output.latency * 1000
             buf_error = buf_ms - target_ms  # positive = too full
 
-            # EMA filter to smooth burst-jitter noise
+            # EMA filter to smooth short-term buffer jitter
             self._filtered_error = (self._error_filter_alpha * buf_error +
                                     (1.0 - self._error_filter_alpha) * self._filtered_error)
 
