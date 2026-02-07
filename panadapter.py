@@ -46,6 +46,10 @@ except (ImportError, RuntimeError):
     BB_MAX_FREQ = 6.4e9
 
 from demodulator import FMStereoDecoder
+try:
+    from pll_stereo_decoder import PLLStereoDecoder
+except ImportError:
+    PLLStereoDecoder = None
 from rds_decoder import RDSDecoder, pi_to_callsign
 
 # Optional IC-R8600 support
@@ -77,6 +81,8 @@ FM_BROADCAST_STEP = 200e3   # 200 kHz button step for FM broadcast (NA channel s
 FM_BROADCAST_SNAP = 100e3   # 100 kHz click-to-tune snap (all valid FM channels)
 FM_BROADCAST_DEFAULT = 89.9e6  # Default FM broadcast frequency
 FM_BROADCAST_SAMPLE_RATE = 1250000  # 1.25 MHz for wider spectrum view (decimated for audio)
+DEFAULT_STEREO_DECODER = 'pll'  # 'pll' or 'squaring'
+VALID_STEREO_DECODERS = ('pll', 'squaring')
 
 # Configuration file path (same directory as script)
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panadapter.cfg')
@@ -117,6 +123,12 @@ def load_config():
                 if config.has_option('display', 'spectrum_averaging'):
                     settings['spectrum_averaging'] = config.getfloat('display', 'spectrum_averaging')
 
+            if config.has_section('demod'):
+                if config.has_option('demod', 'stereo_decoder'):
+                    decoder = config.get('demod', 'stereo_decoder').strip().lower()
+                    if decoder in VALID_STEREO_DECODERS:
+                        settings['stereo_decoder'] = decoder
+
         except (configparser.Error, ValueError) as e:
             print(f"Warning: Error reading config file: {e}")
 
@@ -125,7 +137,7 @@ def load_config():
 
 def save_config(use_icom=False, use_24bit=False, sample_rate=None,
                 frequency=None, mode='weather', weather_span_khz=None,
-                fm_span_khz=None, spectrum_averaging=None):
+                fm_span_khz=None, spectrum_averaging=None, stereo_decoder=None):
     """Save settings to config file.
 
     Args:
@@ -136,6 +148,7 @@ def save_config(use_icom=False, use_24bit=False, sample_rate=None,
         mode: 'weather' or 'fm_broadcast'
         weather_span_khz: Spectrum span for weather mode in kHz
         fm_span_khz: Spectrum span for FM broadcast mode in kHz
+        stereo_decoder: 'pll' or 'squaring' for WBFM stereo decoding
     """
     config = configparser.ConfigParser()
 
@@ -162,6 +175,13 @@ def save_config(use_icom=False, use_24bit=False, sample_rate=None,
         config['display']['fm_span_khz'] = f'{fm_span_khz:.1f}'
     if spectrum_averaging is not None:
         config['display']['spectrum_averaging'] = f'{spectrum_averaging:.2f}'
+
+    # Demod section
+    config['demod'] = {}
+    decoder = (stereo_decoder or DEFAULT_STEREO_DECODER).strip().lower()
+    if decoder not in VALID_STEREO_DECODERS:
+        decoder = DEFAULT_STEREO_DECODER
+    config['demod']['stereo_decoder'] = decoder
 
     try:
         with open(CONFIG_FILE, 'w') as f:
@@ -390,8 +410,8 @@ class NBFMDemodulator:
 class WBFMStereoDemodulator:
     """Wideband FM stereo demodulator for FM broadcast (88-108 MHz).
 
-    Wraps FMStereoDecoder, providing stereo decoding with pilot detection
-    and SNR-based blending.
+    Wraps either PLLStereoDecoder or FMStereoDecoder, providing stereo
+    decoding with pilot detection and SNR-based blending.
 
     Supports higher input sample rates by using efficient FIR decimation to
     ~312.5 kHz for optimal stereo decoder performance.
@@ -400,12 +420,16 @@ class WBFMStereoDemodulator:
     # Target sample rate for stereo decoder (matches pjfm default of 480 kHz)
     TARGET_RATE = 480000
 
-    def __init__(self, input_sample_rate, audio_sample_rate=AUDIO_SAMPLE_RATE):
+    def __init__(self, input_sample_rate, audio_sample_rate=AUDIO_SAMPLE_RATE,
+                 stereo_decoder=DEFAULT_STEREO_DECODER):
         self.input_sample_rate = input_sample_rate
         self.audio_sample_rate = audio_sample_rate
         self.tuned_offset = 0
         self.squelch_level = -100
         self.squelch_open = False
+        self.stereo_decoder_name = str(stereo_decoder).strip().lower()
+        if self.stereo_decoder_name not in VALID_STEREO_DECODERS:
+            self.stereo_decoder_name = DEFAULT_STEREO_DECODER
 
         # Calculate decimation factor to get close to TARGET_RATE
         # Use integer decimation for efficiency
@@ -422,8 +446,18 @@ class WBFMStereoDemodulator:
         else:
             self.decim_filter = None
 
-        # Create the stereo decoder at the decimated rate
-        self.stereo_decoder = FMStereoDecoder(
+        # Create the stereo decoder at the decimated rate.
+        decoder_class = FMStereoDecoder
+        if self.stereo_decoder_name == 'pll':
+            if PLLStereoDecoder is not None:
+                decoder_class = PLLStereoDecoder
+            else:
+                print("Warning: PLL stereo decoder unavailable; using pilot-squaring decoder")
+                self.stereo_decoder_name = 'squaring'
+        else:
+            self.stereo_decoder_name = 'squaring'
+
+        self.stereo_decoder = decoder_class(
             iq_sample_rate=self.decimated_rate,
             audio_sample_rate=audio_sample_rate,
             deviation=WBFM_DEVIATION,
@@ -1429,7 +1463,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self, center_freq=DEFAULT_CENTER_FREQ, use_icom=False,
                  sample_rate=None, use_24bit=False, initial_mode='weather',
-                 weather_span_khz=None, fm_span_khz=None, spectrum_averaging=None):
+                 weather_span_khz=None, fm_span_khz=None, spectrum_averaging=None,
+                 stereo_decoder=DEFAULT_STEREO_DECODER):
         super().__init__()
 
         self.center_freq = center_freq
@@ -1441,6 +1476,9 @@ class MainWindow(QMainWindow):
         self.use_icom = use_icom
         self.use_24bit = use_24bit
         self.requested_sample_rate = sample_rate  # User-requested sample rate
+        self.stereo_decoder = str(stereo_decoder).strip().lower()
+        if self.stereo_decoder not in VALID_STEREO_DECODERS:
+            self.stereo_decoder = DEFAULT_STEREO_DECODER
 
         # Spectrum span per mode (kHz) - None means full bandwidth
         # Default: 100 kHz for weather, full bandwidth for FM
@@ -1939,10 +1977,14 @@ class MainWindow(QMainWindow):
             self.nbfm_demodulator.reset()
 
             # Use stereo demodulator for FM broadcast (better audio quality)
-            self.wbfm_demodulator = WBFMStereoDemodulator(self.device.iq_sample_rate)
+            self.wbfm_demodulator = WBFMStereoDemodulator(
+                self.device.iq_sample_rate,
+                stereo_decoder=self.stereo_decoder
+            )
             self.wbfm_demodulator.set_squelch(self.squelch_slider.value())
             self.wbfm_demodulator.set_tuned_offset(self.tuned_freq - self.center_freq)
             self.wbfm_demodulator.reset()
+            self.stereo_decoder = self.wbfm_demodulator.stereo_decoder_name
 
             # Set active demodulator based on mode
             self.demodulator = self.nbfm_demodulator if self.current_mode == self.MODE_WEATHER else self.wbfm_demodulator
@@ -2468,7 +2510,8 @@ class MainWindow(QMainWindow):
             mode=self.current_mode,
             weather_span_khz=self.weather_span_khz,
             fm_span_khz=self.fm_span_khz,
-            spectrum_averaging=self.avg_factor
+            spectrum_averaging=self.avg_factor,
+            stereo_decoder=self.stereo_decoder
         )
 
         # Stop audio output
@@ -2506,6 +2549,8 @@ def main():
                         help='Use 24-bit I/Q samples (IC-R8600 only, default: 16-bit)')
     parser.add_argument('--mode', choices=['weather', 'fm'], default=None,
                         help='Initial mode: weather or fm (default: from config)')
+    parser.add_argument('--stereo-decoder', choices=['pll', 'squaring'], default=None,
+                        help='FM stereo decoder: pll or squaring (default: from config, then pll)')
     args = parser.parse_args()
 
     # Load saved config
@@ -2516,6 +2561,7 @@ def main():
     use_24bit = config.get('use_24bit', False)
     sample_rate = config.get('sample_rate', None)
     mode = config.get('mode', 'weather')
+    stereo_decoder = config.get('stereo_decoder', DEFAULT_STEREO_DECODER)
     weather_span_khz = config.get('weather_span_khz', None)
     fm_span_khz = config.get('fm_span_khz', None)
     spectrum_averaging = config.get('spectrum_averaging', None)
@@ -2545,6 +2591,8 @@ def main():
 
     if args.mode is not None:
         mode = 'fm_broadcast' if args.mode == 'fm' else 'weather'
+    if args.stereo_decoder is not None:
+        stereo_decoder = args.stereo_decoder
 
     # Validate conflicting options
     if args.icom and args.bb60d:
@@ -2583,7 +2631,8 @@ def main():
         initial_mode=mode,
         weather_span_khz=weather_span_khz,
         fm_span_khz=fm_span_khz,
-        spectrum_averaging=spectrum_averaging
+        spectrum_averaging=spectrum_averaging,
+        stereo_decoder=stereo_decoder
     )
     window.show()
 

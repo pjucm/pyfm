@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""
+PLL-based FM Stereo Decoder
+
+Drop-in replacement for FMStereoDecoder that uses a second-order Type 2 PLL
+for 38 kHz carrier regeneration instead of pilot-squaring.
+
+Advantages over pilot-squaring:
+- Narrow loop bandwidth (30 Hz) rejects pilot noise
+- Phase-coherent carrier tracking
+- Explicit lock/unlock detection with hysteresis
+"""
+
+import time
+import numpy as np
+from scipy import signal as sp_signal
+
+from demodulator import _soft_clip
+
+
+class PLLStereoDecoder:
+    """
+    FM Stereo decoder using PLL-based carrier recovery.
+
+    Uses a second-order Type 2 PLL locked to the 19 kHz pilot tone
+    to regenerate a phase-coherent 38 kHz carrier via frequency doubling.
+    """
+
+    def __init__(self, iq_sample_rate=250000, audio_sample_rate=48000,
+                 deviation=75000, deemphasis=75e-6, force_mono=False):
+        self.iq_sample_rate = iq_sample_rate
+        self.audio_sample_rate = audio_sample_rate
+        self.deviation = deviation
+        self.force_mono = force_mono
+
+        # Pilot detection state
+        self._pilot_detected = False
+        self._pilot_level = 0.0
+        self.pilot_threshold = 0.05
+
+        # State for continuous processing
+        self.last_sample = complex(1, 0)
+
+        # Adaptive rate control
+        self._rate_adjust = 1.0
+        self._nominal_ratio = audio_sample_rate / iq_sample_rate
+
+        # Design filters (all at IQ sample rate)
+        nyq = iq_sample_rate / 2
+
+        # Pilot bandpass filter (18.5-19.5 kHz)
+        pilot_low = 18500 / nyq
+        pilot_high = 19500 / nyq
+        self.pilot_bpf = sp_signal.firwin(201, [pilot_low, pilot_high],
+                                           pass_zero=False, window=('kaiser', 7.0))
+        self.pilot_bpf_state = sp_signal.lfilter_zi(self.pilot_bpf, 1.0)
+
+        # L+R lowpass filter (15 kHz)
+        lr_sum_cutoff = 15000 / nyq
+        self.lr_sum_lpf = sp_signal.firwin(127, lr_sum_cutoff, window=('kaiser', 6.0))
+        self.lr_sum_lpf_state = sp_signal.lfilter_zi(self.lr_sum_lpf, 1.0)
+
+        # L-R bandpass filter (23-53 kHz)
+        lr_diff_low = 23000 / nyq
+        lr_diff_high = min(53000 / nyq, 0.95)
+        self.lr_diff_bpf = sp_signal.firwin(201, [lr_diff_low, lr_diff_high],
+                                             pass_zero=False, window=('kaiser', 7.0))
+        self.lr_diff_bpf_state = sp_signal.lfilter_zi(self.lr_diff_bpf, 1.0)
+
+        # L-R lowpass filter after demodulation (15 kHz)
+        self.lr_diff_lpf = sp_signal.firwin(127, lr_sum_cutoff, window=('kaiser', 6.0))
+        self.lr_diff_lpf_state = sp_signal.lfilter_zi(self.lr_diff_lpf, 1.0)
+
+        # De-emphasis filter (at output audio rate)
+        fs = audio_sample_rate
+        a = np.exp(-1.0 / (deemphasis * fs))
+        self.deem_b = np.array([1.0 - a])
+        self.deem_a = np.array([1.0, -a])
+        self.deem_state_l = sp_signal.lfilter_zi(self.deem_b, self.deem_a)
+        self.deem_state_r = sp_signal.lfilter_zi(self.deem_b, self.deem_a)
+
+        # Noise measurement bandpass filter
+        noise_low_hz = 90000
+        noise_high_hz = 100000
+        noise_low = noise_low_hz / nyq
+        noise_high = min(noise_high_hz / nyq, 0.90)
+        if noise_high > noise_low and noise_low < 0.90:
+            self.noise_bpf = sp_signal.firwin(51, [noise_low, noise_high],
+                                               pass_zero=False, window=('kaiser', 5.0))
+            self.noise_bpf_state = sp_signal.lfilter_zi(self.noise_bpf, 1.0)
+            self.noise_bandwidth = noise_high_hz - noise_low_hz
+        else:
+            self.noise_bpf = None
+
+        # SNR measurement state
+        self._snr_db = 0.0
+        self._noise_power = 1e-10
+        self.pilot_bandwidth = 1000
+
+        # Peak amplitude tracking
+        self._peak_amplitude = 0.0
+
+        # Group delay compensation buffer for L+R path
+        self._lr_sum_delay = (len(self.lr_diff_bpf) - 1) // 2
+        self._lr_sum_delay_buf = np.zeros(self._lr_sum_delay, dtype=np.float64)
+
+        # Store last baseband for RDS processing
+        self._last_baseband = None
+        self._last_pilot = None
+
+        # Tone controls
+        self.bass_boost_enabled = True
+        self.treble_boost_enabled = True
+        self._setup_tone_filters()
+
+        # Stereo blend settings
+        self.stereo_blend_enabled = True
+        self.stereo_blend_low = 10.0
+        self.stereo_blend_high = 20.0
+        self._blend_factor = 1.0
+
+        # --- PLL state ---
+        # Second-order Type 2 PLL for 19 kHz pilot tracking
+        # Natural frequency Bn=30 Hz, damping ζ=0.707
+        # Kp and Ki derived from standard PLL design equations:
+        #   ωn = 2π·Bn / (ζ + 1/(4ζ)) ≈ 2π·30 / 1.4142 ≈ 133.3 rad/s
+        #   Kp = 2·ζ·ωn / fs
+        #   Ki = ωn² / fs²
+        self._pll_omega0 = 2 * np.pi * 19000 / iq_sample_rate  # Nominal 19 kHz in rad/sample
+        self._pll_phase = 0.0           # NCO phase accumulator
+        self._pll_integrator = 0.0      # Loop filter integrator
+
+        # PLL loop gains (Bn=30 Hz, ζ=0.707, fs=iq_sample_rate)
+        omega_n = 2 * np.pi * 30 / (0.707 + 1 / (4 * 0.707))  # ~133.3 rad/s
+        self._pll_Kp = 2 * 0.707 * omega_n / iq_sample_rate
+        self._pll_Ki = (omega_n ** 2) / (iq_sample_rate ** 2)
+
+        # Phase error IIR lowpass to remove 2×pilot (38 kHz) component.
+        # Without this, the 38 kHz term in the PE biases the integrator and
+        # creates ~28° steady-state phase offset at 38 kHz.
+        # Cutoff ~5 kHz: well below 38 kHz for good rejection, well above
+        # the 30 Hz loop bandwidth for negligible phase lag (<0.5°).
+        # α = 2π·fc / (fs + 2π·fc) ≈ 0.065 at 480 kHz
+        self._pll_pe_alpha = 2 * np.pi * 5000 / (iq_sample_rate + 2 * np.pi * 5000)
+        self._pll_pe_filtered = 0.0
+
+        # Lock detector: EMA of squared phase error
+        self._pll_lock_alpha = 0.001
+        self._pll_pe_avg = 1.0  # Start unlocked
+        self._pll_locked = False
+        self._pll_lock_threshold = 0.01    # Lock when pe_avg < this
+        self._pll_unlock_threshold = 0.05  # Unlock when pe_avg > this
+
+        # Per-stage profiling
+        self.profile_enabled = False
+        self._profile = {
+            'fm_demod': 0.0,
+            'pilot_bpf': 0.0,
+            'pll': 0.0,
+            'lr_sum_lpf': 0.0,
+            'lr_diff_bpf': 0.0,
+            'lr_diff_lpf': 0.0,
+            'noise_bpf': 0.0,
+            'resample': 0.0,
+            'deemphasis': 0.0,
+            'tone': 0.0,
+            'limiter': 0.0,
+            'total': 0.0,
+        }
+
+    def _design_low_shelf(self, fc, gain_db, fs):
+        """Design low shelf biquad filter coefficients (Audio EQ Cookbook)."""
+        A = 10 ** (gain_db / 40)
+        w0 = 2 * np.pi * fc / fs
+        alpha = np.sin(w0) / 2 * np.sqrt(2)
+        cos_w0 = np.cos(w0)
+        sqrt_A = np.sqrt(A)
+        two_sqrt_A_alpha = 2 * sqrt_A * alpha
+
+        b0 = A * ((A + 1) - (A - 1) * cos_w0 + two_sqrt_A_alpha)
+        b1 = 2 * A * ((A - 1) - (A + 1) * cos_w0)
+        b2 = A * ((A + 1) - (A - 1) * cos_w0 - two_sqrt_A_alpha)
+        a0 = (A + 1) + (A - 1) * cos_w0 + two_sqrt_A_alpha
+        a1 = -2 * ((A - 1) + (A + 1) * cos_w0)
+        a2 = (A + 1) + (A - 1) * cos_w0 - two_sqrt_A_alpha
+
+        b = np.array([b0/a0, b1/a0, b2/a0])
+        a = np.array([1.0, a1/a0, a2/a0])
+        return b, a
+
+    def _design_high_shelf(self, fc, gain_db, fs):
+        """Design high shelf biquad filter coefficients (Audio EQ Cookbook)."""
+        A = 10 ** (gain_db / 40)
+        w0 = 2 * np.pi * fc / fs
+        alpha = np.sin(w0) / 2 * np.sqrt(2)
+        cos_w0 = np.cos(w0)
+        sqrt_A = np.sqrt(A)
+        two_sqrt_A_alpha = 2 * sqrt_A * alpha
+
+        b0 = A * ((A + 1) + (A - 1) * cos_w0 + two_sqrt_A_alpha)
+        b1 = -2 * A * ((A - 1) + (A + 1) * cos_w0)
+        b2 = A * ((A + 1) + (A - 1) * cos_w0 - two_sqrt_A_alpha)
+        a0 = (A + 1) - (A - 1) * cos_w0 + two_sqrt_A_alpha
+        a1 = 2 * ((A - 1) - (A + 1) * cos_w0)
+        a2 = (A + 1) - (A - 1) * cos_w0 - two_sqrt_A_alpha
+
+        b = np.array([b0/a0, b1/a0, b2/a0])
+        a = np.array([1.0, a1/a0, a2/a0])
+        return b, a
+
+    def _setup_tone_filters(self):
+        """Set up bass and treble shelf filters (+3dB)."""
+        fs = self.audio_sample_rate
+        self.bass_b, self.bass_a = self._design_low_shelf(250, 3.0, fs)
+        self.bass_state_l = sp_signal.lfilter_zi(self.bass_b, self.bass_a)
+        self.bass_state_r = sp_signal.lfilter_zi(self.bass_b, self.bass_a)
+        self.treble_b, self.treble_a = self._design_high_shelf(3500, 3.0, fs)
+        self.treble_state_l = sp_signal.lfilter_zi(self.treble_b, self.treble_a)
+        self.treble_state_r = sp_signal.lfilter_zi(self.treble_b, self.treble_a)
+
+    @property
+    def pilot_detected(self):
+        """Returns True if 19 kHz pilot tone is detected (PLL locked)."""
+        return self._pll_locked
+
+    @property
+    def snr_db(self):
+        """Return the current SNR estimate in dB."""
+        return self._snr_db
+
+    @property
+    def peak_amplitude(self):
+        """Return peak amplitude (before limiting). >1.0 means limiter is active."""
+        return self._peak_amplitude
+
+    @property
+    def stereo_blend_factor(self):
+        """Return current stereo blend factor (0=mono, 1=full stereo)."""
+        return self._blend_factor
+
+    @property
+    def rate_adjust(self):
+        """Return current rate adjustment factor for adaptive resampling."""
+        return self._rate_adjust
+
+    @rate_adjust.setter
+    def rate_adjust(self, value):
+        """Set rate adjustment factor (0.99-1.01 typical range for clock drift)."""
+        self._rate_adjust = max(0.98, min(1.02, value))
+
+    @property
+    def profile(self):
+        """Return per-stage profiling data (EMA-smoothed microseconds)."""
+        return dict(self._profile)
+
+    @property
+    def last_baseband(self):
+        """Returns the last FM baseband signal for RDS processing."""
+        return self._last_baseband
+
+    @property
+    def last_pilot(self):
+        """Returns the last extracted 19 kHz pilot signal."""
+        return self._last_pilot
+
+    @property
+    def pll_locked(self):
+        """Returns True if the PLL is locked to the pilot tone."""
+        return self._pll_locked
+
+    @property
+    def pll_phase_error_rms(self):
+        """Return RMS phase error in degrees."""
+        return np.degrees(np.sqrt(max(self._pll_pe_avg, 0.0)))
+
+    @property
+    def pll_frequency_offset(self):
+        """Return PLL frequency offset from nominal 19 kHz in Hz."""
+        return self._pll_integrator * self.iq_sample_rate / (2 * np.pi)
+
+    def _prof(self, key, t0):
+        """Record EMA-smoothed stage timing in microseconds."""
+        elapsed = (time.perf_counter() - t0) * 1e6
+        self._profile[key] = 0.9 * self._profile[key] + 0.1 * elapsed
+        return time.perf_counter()
+
+    def _pll_process(self, pilot_filtered):
+        """
+        Process pilot signal through PLL, return 38 kHz carrier.
+
+        The PLL tracks the 19 kHz pilot and outputs cos(2·phase) which gives
+        a phase-coherent 38 kHz carrier. The frequency doubling resolves the
+        180° ambiguity: cos(2(θ+π)) = cos(2θ).
+
+        Args:
+            pilot_filtered: BPF-filtered pilot signal (numpy array)
+
+        Returns:
+            carrier_38k: 38 kHz carrier signal (numpy array)
+        """
+        n = len(pilot_filtered)
+        carrier_38k = np.empty(n, dtype=np.float64)
+
+        # Local copies for speed in the tight loop
+        phase = self._pll_phase
+        integrator = self._pll_integrator
+        pe_filt = self._pll_pe_filtered
+        pe_avg = self._pll_pe_avg
+        omega0 = self._pll_omega0
+        Kp = self._pll_Kp
+        Ki = self._pll_Ki
+        pe_alpha = self._pll_pe_alpha
+        lock_alpha = self._pll_lock_alpha
+        TWO_PI = 2 * np.pi
+
+        for i in range(n):
+            # Use current phase for this sample's carrier output.
+            # Emitting after phase advance introduces an ~1-sample lead at 38 kHz,
+            # which directly degrades stereo separation.
+            carrier_38k[i] = np.cos(2 * phase)
+
+            # Phase detector: multiply input by -sin(phase) of NCO
+            pe = pilot_filtered[i] * (-np.sin(phase))
+
+            # IIR lowpass to remove 2×pilot (38 kHz) from PE
+            pe_filt = pe_filt + pe_alpha * (pe - pe_filt)
+
+            # PI loop filter
+            integrator += Ki * pe_filt
+            correction = Kp * pe_filt + integrator
+
+            # NCO: advance phase
+            phase += omega0 + correction
+            # Wrap to [0, 2π)
+            phase = phase % TWO_PI
+
+            # Lock detector: EMA of squared filtered phase error
+            pe_avg = pe_avg + lock_alpha * (pe_filt * pe_filt - pe_avg)
+
+        # Store state back
+        self._pll_phase = phase
+        self._pll_integrator = integrator
+        self._pll_pe_filtered = pe_filt
+        self._pll_pe_avg = pe_avg
+
+        # Lock detection with hysteresis
+        if self._pll_locked:
+            if pe_avg > self._pll_unlock_threshold:
+                self._pll_locked = False
+        else:
+            if pe_avg < self._pll_lock_threshold:
+                self._pll_locked = True
+
+        return carrier_38k
+
+    def demodulate(self, iq_samples):
+        """
+        Demodulate FM stereo signal from IQ samples.
+
+        Args:
+            iq_samples: numpy array of complex64 IQ samples
+
+        Returns:
+            numpy array of shape (N, 2) with L and R channels as float32
+        """
+        if len(iq_samples) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        profiling = self.profile_enabled
+        if profiling:
+            t_total = time.perf_counter()
+            t0 = t_total
+
+        # FM demodulation (quadrature discriminator)
+        samples = np.concatenate([[self.last_sample], iq_samples])
+        self.last_sample = iq_samples[-1]
+        product = samples[1:] * np.conj(samples[:-1])
+        baseband = np.angle(product) * (self.iq_sample_rate / (2 * np.pi * self.deviation))
+
+        # Store baseband for RDS processing
+        self._last_baseband = baseband
+
+        if profiling:
+            t0 = self._prof('fm_demod', t0)
+
+        # Extract pilot (19 kHz)
+        pilot, self.pilot_bpf_state = sp_signal.lfilter(
+            self.pilot_bpf, 1.0, baseband, zi=self.pilot_bpf_state
+        )
+
+        # Store pilot for RDS decoder
+        self._last_pilot = pilot
+
+        # Measure pilot level for SNR (still needed even with PLL lock detection)
+        pilot_power = np.sqrt(np.mean(pilot ** 2))
+        self._pilot_level = 0.9 * self._pilot_level + 0.1 * pilot_power
+
+        if profiling:
+            t0 = self._prof('pilot_bpf', t0)
+
+        # Run PLL on pilot signal (always runs to maintain tracking)
+        carrier_38k = self._pll_process(pilot)
+
+        if profiling:
+            t0 = self._prof('pll', t0)
+
+        # Pilot-referenced SNR measurement
+        if self.noise_bpf is not None:
+            noise_filtered, self.noise_bpf_state = sp_signal.lfilter(
+                self.noise_bpf, 1.0, baseband, zi=self.noise_bpf_state
+            )
+            noise_power = np.mean(noise_filtered ** 2)
+            pilot_pwr = self._pilot_level ** 2
+            noise_in_pilot_bw = noise_power * (self.pilot_bandwidth / self.noise_bandwidth)
+            self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_in_pilot_bw, 1e-12)
+            if self._noise_power > 0 and pilot_pwr > 0:
+                self._snr_db = 10 * np.log10(pilot_pwr / self._noise_power)
+
+        if profiling:
+            t0 = self._prof('noise_bpf', t0)
+
+        # Use PLL lock state for stereo gating
+        stereo_allowed = self._pll_locked and not self.force_mono and self._snr_db >= self.stereo_blend_low
+
+        # Extract L+R (mono, 0-15 kHz)
+        lr_sum, self.lr_sum_lpf_state = sp_signal.lfilter(
+            self.lr_sum_lpf, 1.0, baseband, zi=self.lr_sum_lpf_state
+        )
+
+        # Apply group delay compensation
+        delay = self._lr_sum_delay
+        delayed = np.empty_like(lr_sum)
+        delayed[:delay] = self._lr_sum_delay_buf
+        delayed[delay:] = lr_sum[:-delay] if delay > 0 else lr_sum
+        self._lr_sum_delay_buf = lr_sum[-delay:].copy()
+        lr_sum = delayed
+
+        if profiling:
+            t0 = self._prof('lr_sum_lpf', t0)
+
+        if stereo_allowed:
+            # Extract L-R subcarrier region (23-53 kHz)
+            lr_diff_mod, self.lr_diff_bpf_state = sp_signal.lfilter(
+                self.lr_diff_bpf, 1.0, baseband, zi=self.lr_diff_bpf_state
+            )
+
+            if profiling:
+                t0 = self._prof('lr_diff_bpf', t0)
+
+            # Demodulate L-R using PLL-derived 38 kHz carrier
+            lr_diff_demod = lr_diff_mod * carrier_38k * 2  # *2 for DSB-SC gain
+
+            # Lowpass filter the demodulated L-R
+            lr_diff, self.lr_diff_lpf_state = sp_signal.lfilter(
+                self.lr_diff_lpf, 1.0, lr_diff_demod, zi=self.lr_diff_lpf_state
+            )
+
+            if profiling:
+                t0 = self._prof('lr_diff_lpf', t0)
+
+            # Matrix decode
+            left_stereo = lr_sum + lr_diff
+            right_stereo = lr_sum - lr_diff
+
+            # Stereo blend based on SNR
+            if self.stereo_blend_enabled:
+                target_blend = (self._snr_db - self.stereo_blend_low) / (self.stereo_blend_high - self.stereo_blend_low)
+                target_blend = max(0.0, min(1.0, target_blend))
+                self._blend_factor = 0.95 * self._blend_factor + 0.05 * target_blend
+                left = self._blend_factor * left_stereo + (1.0 - self._blend_factor) * lr_sum
+                right = self._blend_factor * right_stereo + (1.0 - self._blend_factor) * lr_sum
+            else:
+                left = left_stereo
+                right = right_stereo
+        else:
+            left = lr_sum
+            right = lr_sum
+            self._blend_factor = 0.0
+
+        # Resample to audio rate with adaptive rate control
+        nominal_output = int(round(len(left) * self._nominal_ratio))
+        adjusted_output = int(round(nominal_output * self._rate_adjust))
+        if adjusted_output > 0:
+            if stereo_allowed:
+                left = sp_signal.resample(left, adjusted_output)
+                right = sp_signal.resample(right, adjusted_output)
+            else:
+                mono = sp_signal.resample(left, adjusted_output)
+                left = mono
+                right = mono
+        else:
+            left = np.array([], dtype=np.float64)
+            right = np.array([], dtype=np.float64)
+
+        if profiling:
+            t0 = self._prof('resample', t0)
+
+        # De-emphasis
+        left, self.deem_state_l = sp_signal.lfilter(
+            self.deem_b, self.deem_a, left, zi=self.deem_state_l
+        )
+        right, self.deem_state_r = sp_signal.lfilter(
+            self.deem_b, self.deem_a, right, zi=self.deem_state_r
+        )
+
+        if profiling:
+            t0 = self._prof('deemphasis', t0)
+
+        # Scale for headroom
+        left = left * 0.65
+        right = right * 0.65
+
+        # Tone controls
+        if self.bass_boost_enabled:
+            left, self.bass_state_l = sp_signal.lfilter(
+                self.bass_b, self.bass_a, left, zi=self.bass_state_l
+            )
+            right, self.bass_state_r = sp_signal.lfilter(
+                self.bass_b, self.bass_a, right, zi=self.bass_state_r
+            )
+        if self.treble_boost_enabled:
+            left, self.treble_state_l = sp_signal.lfilter(
+                self.treble_b, self.treble_a, left, zi=self.treble_state_l
+            )
+            right, self.treble_state_r = sp_signal.lfilter(
+                self.treble_b, self.treble_a, right, zi=self.treble_state_r
+            )
+
+        if profiling:
+            t0 = self._prof('tone', t0)
+
+        # Peak amplitude tracking
+        peak = max(np.max(np.abs(left)), np.max(np.abs(right)))
+        self._peak_amplitude = max(0.95 * self._peak_amplitude, peak)
+
+        # Soft limiting + hard clip
+        left = _soft_clip(left, threshold=0.8)
+        right = _soft_clip(right, threshold=0.8)
+        left = np.clip(left, -1.0, 1.0)
+        right = np.clip(right, -1.0, 1.0)
+        left = left.astype(np.float32)
+        right = right.astype(np.float32)
+
+        if profiling:
+            self._prof('limiter', t0)
+            elapsed_total = (time.perf_counter() - t_total) * 1e6
+            self._profile['total'] = 0.9 * self._profile['total'] + 0.1 * elapsed_total
+
+        return np.column_stack((left, right))
+
+    def reset(self):
+        """Reset decoder state (call when changing frequency)."""
+        self.last_sample = complex(1, 0)
+        self._pilot_detected = False
+        self._pilot_level = 0.0
+        self._last_baseband = None
+
+        # Reset filter states
+        self.pilot_bpf_state = sp_signal.lfilter_zi(self.pilot_bpf, 1.0)
+        self.lr_sum_lpf_state = sp_signal.lfilter_zi(self.lr_sum_lpf, 1.0)
+        self.lr_diff_bpf_state = sp_signal.lfilter_zi(self.lr_diff_bpf, 1.0)
+        self.lr_diff_lpf_state = sp_signal.lfilter_zi(self.lr_diff_lpf, 1.0)
+        self.deem_state_l = sp_signal.lfilter_zi(self.deem_b, self.deem_a)
+        self.deem_state_r = sp_signal.lfilter_zi(self.deem_b, self.deem_a)
+        if self.noise_bpf is not None:
+            self.noise_bpf_state = sp_signal.lfilter_zi(self.noise_bpf, 1.0)
+
+        # Reset group delay compensation buffer
+        self._lr_sum_delay_buf = np.zeros(self._lr_sum_delay, dtype=np.float64)
+
+        # Reset SNR state
+        self._snr_db = 0.0
+        self._noise_power = 1e-10
+        self._peak_amplitude = 0.0
+        self._blend_factor = 1.0
+
+        # Reset tone control filter states
+        self.bass_state_l = sp_signal.lfilter_zi(self.bass_b, self.bass_a)
+        self.bass_state_r = sp_signal.lfilter_zi(self.bass_b, self.bass_a)
+        self.treble_state_l = sp_signal.lfilter_zi(self.treble_b, self.treble_a)
+        self.treble_state_r = sp_signal.lfilter_zi(self.treble_b, self.treble_a)
+
+        # Reset PLL state
+        self._pll_phase = 0.0
+        self._pll_integrator = 0.0
+        self._pll_pe_filtered = 0.0
+        self._pll_pe_avg = 1.0  # Start unlocked
+        self._pll_locked = False
