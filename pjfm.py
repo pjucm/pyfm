@@ -583,7 +583,7 @@ class FMRadio:
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
 
     def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None,
-                 rds_enabled=True, realtime=True, iq_sample_rate=None, use_pll=False):
+                 rds_enabled=True, realtime=True, iq_sample_rate=None, use_pll=True):
         """
         Initialize FM Radio.
 
@@ -856,6 +856,13 @@ class FMRadio:
             )
             self.stereo_decoder.bass_boost_enabled = self._initial_bass_boost
             self.stereo_decoder.treble_boost_enabled = self._initial_treble_boost
+            configured_resampler = getattr(self.stereo_decoder, 'resampler_mode', 'unknown')
+            runtime_resampler = getattr(self.stereo_decoder, '_resampler_runtime_mode', configured_resampler)
+            print(
+                "pjfm startup: "
+                f"decoder={type(self.stereo_decoder).__name__}, "
+                f"resampler={runtime_resampler} (configured={configured_resampler})"
+            )
 
             if not self.rds_forced_off:
                 self.rds_decoder = RDSDecoder(sample_rate=actual_rate)
@@ -2372,9 +2379,16 @@ def main():
     parser.add_argument(
         "--pll",
         action="store_true",
-        help="Use PLL-based stereo decoder instead of pilot-squaring"
+        dest="use_pll",
+        help="Use PLL-based stereo decoder (default)"
     )
-    parser.set_defaults(rds=True)
+    parser.add_argument(
+        "--squaring",
+        action="store_false",
+        dest="use_pll",
+        help="Use pilot-squaring stereo decoder instead of PLL"
+    )
+    parser.set_defaults(rds=True, use_pll=True)
 
     args = parser.parse_args()
 
@@ -2490,7 +2504,7 @@ def main():
     # Create radio instance
     radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=use_24bit,
                     preamp=preamp_setting, rds_enabled=args.rds, realtime=use_realtime,
-                    iq_sample_rate=iq_sample_rate, use_pll=args.pll)
+                    iq_sample_rate=iq_sample_rate, use_pll=args.use_pll)
     radio.rt_enabled = rt_enabled
 
     # Check for headless mode (for automated PI loop tuning)

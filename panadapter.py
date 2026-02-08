@@ -419,9 +419,11 @@ class WBFMStereoDemodulator:
 
     # Target sample rate for stereo decoder (matches pjfm default of 480 kHz)
     TARGET_RATE = 480000
+    DEFAULT_RESAMPLER_MODE = "firdecim"
 
     def __init__(self, input_sample_rate, audio_sample_rate=AUDIO_SAMPLE_RATE,
-                 stereo_decoder=DEFAULT_STEREO_DECODER):
+                 stereo_decoder=DEFAULT_STEREO_DECODER,
+                 resampler_mode=DEFAULT_RESAMPLER_MODE):
         self.input_sample_rate = input_sample_rate
         self.audio_sample_rate = audio_sample_rate
         self.tuned_offset = 0
@@ -430,6 +432,9 @@ class WBFMStereoDemodulator:
         self.stereo_decoder_name = str(stereo_decoder).strip().lower()
         if self.stereo_decoder_name not in VALID_STEREO_DECODERS:
             self.stereo_decoder_name = DEFAULT_STEREO_DECODER
+        self.resampler_mode = str(resampler_mode).strip().lower()
+        if self.resampler_mode not in ("interp", "firdecim", "auto"):
+            self.resampler_mode = self.DEFAULT_RESAMPLER_MODE
 
         # Calculate decimation factor to get close to TARGET_RATE
         # Use integer decimation for efficiency
@@ -461,7 +466,8 @@ class WBFMStereoDemodulator:
             iq_sample_rate=self.decimated_rate,
             audio_sample_rate=audio_sample_rate,
             deviation=WBFM_DEVIATION,
-            deemphasis=WBFM_DEEMPHASIS
+            deemphasis=WBFM_DEEMPHASIS,
+            resampler_mode=self.resampler_mode
         )
         # Disable tone boosts by default (no UI switches wired yet)
         self.stereo_decoder.bass_boost_enabled = False
@@ -510,6 +516,14 @@ class WBFMStereoDemodulator:
     @rate_adjust.setter
     def rate_adjust(self, value):
         self.stereo_decoder.rate_adjust = value
+
+    @property
+    def configured_resampler_mode(self):
+        return getattr(self.stereo_decoder, 'resampler_mode', self.resampler_mode)
+
+    @property
+    def active_resampler_mode(self):
+        return getattr(self.stereo_decoder, '_resampler_runtime_mode', self.configured_resampler_mode)
 
     def nominal_resample_bias_ppm(self, input_block_len):
         """Estimate deterministic output-rate bias from integer sample rounding."""
@@ -1977,6 +1991,12 @@ class MainWindow(QMainWindow):
             self.wbfm_demodulator.set_tuned_offset(self.tuned_freq - self.center_freq)
             self.wbfm_demodulator.reset()
             self.stereo_decoder = self.wbfm_demodulator.stereo_decoder_name
+            print(
+                "panadapter startup: "
+                f"decoder={type(self.wbfm_demodulator.stereo_decoder).__name__}, "
+                f"resampler={self.wbfm_demodulator.active_resampler_mode} "
+                f"(configured={self.wbfm_demodulator.configured_resampler_mode})"
+            )
 
             # Set active demodulator based on mode
             self.demodulator = self.nbfm_demodulator if self.current_mode == self.MODE_WEATHER else self.wbfm_demodulator
