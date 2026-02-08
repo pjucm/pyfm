@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test sample loss on channel change (simulates pjfm tune_up/tune_down)."""
-import sys
-sys.path.insert(0, '/home/philj/dev/pjfm')
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from icom_r8600 import IcomR8600
 import time

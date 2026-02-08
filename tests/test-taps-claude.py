@@ -17,8 +17,12 @@ Usage:
     python3 test-taps-claude.py --rate 960000      # Custom IQ rate
 """
 
+import os
 import sys
 import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
 import numpy as np
 from scipy import signal
 

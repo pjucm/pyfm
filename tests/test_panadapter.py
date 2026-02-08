@@ -33,7 +33,10 @@ Validation Targets (NBFM):
 
 import numpy as np
 from scipy import signal as scipy_signal
+import os
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 # Import panadapter directly.
 # Note: this test module depends on panadapter runtime deps (PyQt5/pyqtgraph/sounddevice).

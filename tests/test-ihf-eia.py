@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 from dataclasses import dataclass
 from typing import Optional
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 import numpy as np
 from scipy import signal

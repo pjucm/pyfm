@@ -5,11 +5,12 @@ Analyze I/Q spectrum to verify signal presence
 Check if the I/Q data contains actual FM signal or just noise.
 """
 
+import os
 import sys
 import time
 import numpy as np
 
-sys.path.insert(0, '/home/philj/dev/pjfm')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import icom_r8600 as r8600
 
 def main():

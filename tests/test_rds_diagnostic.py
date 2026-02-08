@@ -6,6 +6,11 @@ This test bypasses FM modulation to isolate RDS decoder issues.
 Tests the decoder at baseband to identify where performance degrades.
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
 import numpy as np
 from scipy import signal
 from datetime import date

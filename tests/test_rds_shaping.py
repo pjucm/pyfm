@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Test if pulse shaping filter is causing the issue."""
 
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
 import numpy as np
 from scipy import signal
 

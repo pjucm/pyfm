@@ -10,9 +10,12 @@ Usage:
     python test_civ.py --hw     # Include hardware integration tests
 """
 
+import os
 import sys
 import argparse
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 # Import CI-V protocol functions and constants
 from icom_r8600 import (

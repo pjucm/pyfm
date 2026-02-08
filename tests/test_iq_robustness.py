@@ -25,10 +25,13 @@ Tests:
 
 import argparse
 import numpy as np
+import os
 import time
 import sys
 import struct
 from collections import deque
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 # Import sync interval table and constants
 from icom_r8600 import SYNC_INTERVAL, SAMPLE_RATES, SAMPLE_RATES_24BIT

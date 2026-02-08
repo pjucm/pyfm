@@ -10,7 +10,7 @@ import sys
 import time
 
 # Add parent directory to path
-sys.path.insert(0, '/home/philj/dev/pjfm')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import icom_r8600 as r8600
 
 def main():

@@ -10,6 +10,11 @@ Tests alternative demodulation and timing recovery approaches:
 5. Different timing loop bandwidths
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
 import numpy as np
 from scipy import signal
 from datetime import date

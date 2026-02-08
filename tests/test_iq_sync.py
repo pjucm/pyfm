@@ -23,6 +23,8 @@ import os
 import sys
 import statistics
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
 # Import from icom_r8600
 from icom_r8600 import (
     ICOM_VID, R8600_PID_READY, R8600_PID_BOOTLOADER,

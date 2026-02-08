@@ -6,11 +6,12 @@ Tests whether preamp and attenuator settings affect I/Q output level.
 These are earlier in the signal chain than RF gain.
 """
 
+import os
 import sys
 import time
 import numpy as np
 
-sys.path.insert(0, '/home/philj/dev/pjfm')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import icom_r8600 as r8600
 
 def analyze_samples(samples):

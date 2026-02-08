@@ -13,6 +13,11 @@ frequencies. At 57 kHz, RDS sees ~9 dB more noise than the 19 kHz pilot.
 This test adds noise directly to the baseband to avoid this effect.
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
 import numpy as np
 from scipy import signal
 

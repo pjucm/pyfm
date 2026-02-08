@@ -7,11 +7,12 @@ why SNR might be low despite strong signals.
 """
 
 import argparse
+import os
 import sys
 import time
 import numpy as np
 
-sys.path.insert(0, '/home/philj/dev/pjfm')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import icom_r8600 as r8600
 
 
