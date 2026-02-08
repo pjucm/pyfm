@@ -1,0 +1,68 @@
+Summary of Work (Feb 3, 2026)
+=============================
+
+Goal
+----
+Investigate poor 24-bit I/Q capture results (sync/misalignment at higher rates) and improve robustness.
+
+Sources Reviewed
+----------------
+- IC-R8600 I/Q Output Reference Guide (~/dev/r8600start/IC-R8600_IQ_Ref_ENG_0.pdf)
+  - 24-bit sync pattern: 0x8000, 0x8001, 0x8002 (little-endian bytes: 00 80 01 80 02 80)
+  - Sync interval per sample rate:
+    3.84 MHz: 8192, 1.92 MHz: 4096, 960 kHz: 2048, 480 kHz: 1024, 240 kHz: 512
+  - Valid 24-bit range: -8387967 (0x800281) to +8387966 (0x7FFD7E)
+
+Code Changes
+------------
+1) icom_r8600.py
+- Reworked 24-bit parsing path to be vectorized (numpy) for throughput at high rates.
+- 24-bit sync handling now only accepts sync at the expected boundary. Early/false sync matches are ignored.
+- When due for sync, if expected sync is missing, parser resyncs by searching ahead for next sync.
+- DC offset removal + gain now applied for both 16-bit and 24-bit (unchanged behavior, but applied when IQ not empty).
+
+Files touched:
+- icom_r8600.py
+
+2) test_iq_robustness.py
+- Added additional diagnostics after sync tests:
+  - buffer_overflow_count
+  - fetch_slow_count
+  - sync_short_buf
+  - total_sample_loss
+- Reset these counters before each rate test and duration test.
+
+Files touched:
+- test_iq_robustness.py
+
+Rationale
+---------
+- High-rate 24-bit failures likely due to false sync hits + high CPU load in per-sample parsing.
+- Vectorized parsing reduces overhead and avoids false sync by only accepting sync at expected intervals.
+
+Tests Run
+---------
+- python3 test_iq_robustness.py --sim
+  Result: 6/6 PASS
+
+- python3 test_iq_robustness.py --hw --24bit --sync
+  Result: SKIP (No backend available)
+
+Next Steps (on hardware)
+------------------------
+1) Run:
+   python3 test_iq_robustness.py --hw --24bit --sync
+   If failures occur, capture the new diagnostics:
+   - Buffer overflows
+   - Fetch slow count
+   - Short sync buffers
+   - Sample loss events
+
+2) Optionally run long duration test:
+   python3 test_iq_robustness.py --hw --24bit --duration
+
+Notes
+-----
+- Existing alignment/initial sync logic remains the same; only parsing loop changed for 24-bit.
+- Expectation: fewer false sync detections and improved stability at 960 kHz+ in 24-bit.
+

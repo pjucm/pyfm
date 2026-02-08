@@ -1,0 +1,149 @@
+FM Demodulator & Stereo Decoder Analysis
+=========================================
+Date: 2026-01-28
+
+Overview
+--------
+Evaluated gpu.py and demodulator.py for potential SNR and demodulation
+quality improvements.
+
+
+GPU PIPELINE ANALYSIS
+=====================
+
+Current pipeline has 4 GPU round-trips per audio block:
+
+  #  Class              Operation                          Data direction
+  -- ---------------    --------------------------------   ---------------
+  1  GPUFMDemodulator   IQ → baseband (atan2 + diff)       CPU→GPU→CPU
+  2  GPUFIRBank         baseband → pilot, L+R, L-R         CPU→GPU→CPU
+  3  GPUFIRFilter       L-R demod → L-R filtered           CPU→GPU→CPU
+  4  GPUResampler       (left, right) → 48 kHz audio       CPU→GPU→CPU
+
+Fusion Analysis:
+- Rounds 1+2 could theoretically be fused (baseband stays on GPU)
+- Estimated savings: ~20 µs per 26 ms block = <0.1% improvement
+- NOT WORTH IT — adds complexity for negligible gain
+
+Rounds 3 and 4 cannot be fused due to CPU-side dependencies (PLL, stereo matrix).
+
+
+FM DEMODULATOR ANALYSIS
+=======================
+
+Current Implementation:
+- atan2-differentiate method (mathematically optimal for FM)
+- GPU: atan2(Q,I) then diff(phase) with ±2π unwrapping
+- CPU: angle(s[n] * conj(s[n-1])) — equivalent
+
+IF Filtering:
+- ALREADY DONE IN HARDWARE by SignalHound BB60D
+- bb60d.py line 225: bandwidth = actual_rate * 0.48 (~150 kHz at 312.5 kHz)
+- bbConfigureIQ() sets hardware digital filter
+- Additional software IF filter would be REDUNDANT
+
+Phase Unwrapping:
+- Current ±2π correction is adequate
+- Max FM phase change is ~1.5 rad/sample (75 kHz deviation at 312.5 kHz)
+- Well under π threshold — no issues
+
+Sample Rate:
+- 312.5 kHz provides clean margin over 256 kHz FM bandwidth
+- RDS at 57 kHz is within Nyquist
+
+CONCLUSION: FM demodulator is essentially optimal. No changes needed.
+
+Minor refinement possible:
+- DC blocking after demod (cosmetic, prevents thumps on tune)
+
+
+STEREO DECODER ANALYSIS
+=======================
+
+Pipeline:
+  baseband → pilot BPF (18.5-19.5 kHz) → PLL → 38 kHz carrier
+           ↓
+           → L+R LPF (15 kHz) → delay compensation ──────────────┐
+           ↓                                                     ↓
+           → L-R BPF (23-53 kHz) → ×carrier → L-R LPF (15 kHz) → matrix
+
+Filter Design:
+- Pilot BPF: 201 taps, Kaiser β=7.0 (~70 dB stopband), 1 kHz bandwidth
+- L+R LPF: 127 taps, Kaiser β=6.0 (~60 dB stopband), 15 kHz cutoff
+- L-R BPF: 201 taps, Kaiser β=7.0 (~70 dB stopband), 23-53 kHz
+- L-R LPF: 127 taps, Kaiser β=6.0 (~60 dB stopband), 15 kHz cutoff
+
+PLL:
+- 50 Hz loop bandwidth, critically damped (ζ=0.707)
+- Runs decimated at ~4 kHz for efficiency
+- Generates coherent 38 kHz via cos(2*phase)
+
+Group Delay Compensation:
+- L+R delayed by 100 samples to match L-R path
+- Correctly implemented at line 323
+
+Stereo Blend:
+- Linear blend between SNR 15-30 dB
+- Below 15 dB: full mono
+- Above 30 dB: full stereo
+
+Noise Measurement:
+- Measures in 75-95 kHz band (above stereo subcarrier, below RDS)
+- Scales to audio bandwidth for SNR calculation
+
+
+POTENTIAL IMPROVEMENTS (Stereo Decoder)
+=======================================
+
+1. GAIN CALIBRATION [Medium Impact, Low Effort]
+   Issue: L+R and L-R filter path gains not explicitly matched
+   Effect: Reduces stereo separation if gains differ
+   Fix: Measure actual filter DC gains and add correction factor
+   Location: demodulator.py, around line 591 (lr_diff_demod = ... * 2)
+
+2. PLL ACQUISITION SPEED [Low Impact, Low Effort]
+   Issue: 50 Hz loop bandwidth is slow to acquire (~100 ms)
+   Effect: Noticeable delay on initial tune or after dropout
+   Fix: Add fast-acquire mode with wider initial bandwidth,
+        then narrow once locked
+   Location: demodulator.py, PilotPLL class
+
+3. BLEND CURVE TUNING [Low Impact, Low Effort]
+   Issue: Linear blend may cause audible transitions
+   Effect: Stereo width changes noticeably in fringe areas
+   Fix: Try S-curve or hysteresis-based blending
+   Location: demodulator.py, lines 613-622
+
+4. FILTER DC GAIN NORMALIZATION [Low Impact, Low Effort]
+   Issue: FIR filters may not have exactly unity passband gain
+   Effect: Slight overall gain error, minor separation impact
+   Fix: Normalize filter coefficients: h = h / sum(h) for LPF
+   Location: demodulator.py, filter design section (lines 260-284)
+
+
+NOT RECOMMENDED
+===============
+
+- Software IF filter before FM demod (redundant with hardware)
+- Fusing GPU pipeline stages (negligible benefit)
+- PLL-based FM demodulation (marginal benefit, high complexity)
+- Multipath compensation (complex, limited benefit for stationary use)
+
+
+TESTING APPROACH
+================
+
+To verify stereo separation:
+1. Use stereo test tone (L-only or R-only signal)
+2. Measure crosstalk in opposite channel
+3. Should see >30 dB separation on good signal
+
+To verify gain matching:
+1. Print filter gains: sum(lr_sum_lpf), sum(lr_diff_lpf), etc.
+2. Measure L-R path total gain vs L+R path
+3. Adjust multiplier if ratio ≠ 1.0
+
+To profile PLL acquisition:
+1. Add timestamp when pilot first detected
+2. Add timestamp when PLL reports locked
+3. Measure delta across frequency changes

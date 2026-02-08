@@ -1,0 +1,5 @@
+Findings
+
+- Medium: Ring-buffer overflow drops newest audio instead of oldest, despite the comment saying “drop oldest.” In pyfm.py:511 you clamp samples to space but never advance read_pos, so stale audio stays and fresh audio is discarded. This can lock in extra latency and slow recovery when the producer outpaces playback.
+- Medium: Per-block signal.resample is not streaming-safe and can introduce block-edge artifacts and subtle pitch/phase wobble, especially as rate_adjust changes over time. See demodulator.py:420 and demodulator.py:723. A streaming polyphase SRC (or dedicated SRC library) avoids discontinuities.
+- Low/Medium: Pilot-derived 38 kHz carrier uses per-block max normalization + squaring, which can be noise-biased and unstable at low SNR/multipath. See demodulator.py:324. A pilot PLL or phasor-based regeneration yields a steadier carrier and better L-R decoding stability.

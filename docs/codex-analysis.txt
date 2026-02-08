@@ -1,0 +1,25 @@
+Priority Plan (Quality First, Then GPU Performance)
+
+Quality (highest impact first)
+1) Add RF/channel-select LPF + decimation before FM demod.
+   - Goal: reduce adjacent-channel interference, improve SNR, stabilize stereo blend.
+2) Add DC offset removal + IQ imbalance correction on IQ stream.
+   - Goal: reduce baseband distortion, improve pilot/RDS detection.
+3) Use PLL phase-error variance and/or pilot SNR to drive stereo blend and lock confidence.
+   - Goal: improve weak-signal stereo quality and avoid false stereo.
+4) Add audio high-pass (~20–30 Hz) after de-emphasis, before limiter.
+   - Goal: remove LF rumble/drift artifacts.
+5) Make de-emphasis configurable (75 us vs 50 us); optional for NBFM.
+   - Goal: regional correctness and better tonal balance.
+6) Soften limiter behavior (adaptive or slower AGC) to avoid over-squashing.
+   - Goal: preserve dynamics on strong stations while preventing clipping.
+
+GPU Performance (highest impact first)
+1) Keep IQ -> demod -> FIR bank -> L-R LPF -> resample on GPU; transfer only final audio.
+   - Goal: reduce host<->device copies and improve throughput.
+2) Increase IQ_BLOCK_SIZE if latency budget allows.
+   - Goal: amortize GPU kernel launch and transfer overhead.
+3) Regenerate or cache GPUResampler precompute for non-standard block sizes.
+   - Goal: avoid CPU fallback and keep GPU path hot.
+4) Reuse GPU buffers across stages to reduce allocations.
+   - Goal: lower overhead, improve stability.

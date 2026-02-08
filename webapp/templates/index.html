@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>pjfm - FM Radio Receiver</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>pjfm</h1>
+            <span class="subtitle">SignalHound BB60D FM Receiver</span>
+        </header>
+
+        <main>
+            <!-- Frequency Display -->
+            <section class="frequency-section">
+                <div class="frequency-display">
+                    <button class="tune-btn" id="tune-down" title="Tune Down (Left Arrow)">&lt;</button>
+                    <div class="frequency-value">
+                        <input type="text" id="frequency" value="89.9" title="Click to edit frequency">
+                        <span class="unit">MHz</span>
+                    </div>
+                    <button class="tune-btn" id="tune-up" title="Tune Up (Right Arrow)">&gt;</button>
+                </div>
+                <div class="band-indicator">
+                    <span class="band-label">88</span>
+                    <div class="band-bar">
+                        <div class="band-marker" id="band-marker"></div>
+                    </div>
+                    <span class="band-label">108</span>
+                </div>
+            </section>
+
+            <!-- Signal Display -->
+            <section class="signal-section">
+                <div class="info-row">
+                    <span class="label">Signal:</span>
+                    <span class="value" id="s-meter">S0</span>
+                    <span class="secondary" id="signal-dbm">(-140.0 dBm)</span>
+                </div>
+                <div class="s-meter-bar">
+                    <div class="s-meter-fill" id="s-meter-fill"></div>
+                    <div class="s-meter-s9-marker"></div>
+                </div>
+                <div class="s-meter-scale">
+                    <span>1</span><span>3</span><span>5</span><span>7</span><span>9</span><span>+20</span>
+                </div>
+
+                <div class="info-row">
+                    <span class="label">SNR:</span>
+                    <span class="value" id="snr">0.0 dB</span>
+                    <span class="secondary" id="snr-quality">(Very Poor)</span>
+                </div>
+            </section>
+
+            <!-- Audio Status -->
+            <section class="audio-section">
+                <div class="info-row">
+                    <span class="label">Audio:</span>
+                    <span class="value" id="audio-mode">Mono</span>
+                    <span class="secondary" id="audio-detail">(no pilot)</span>
+                </div>
+                <div class="info-row" id="squelch-row">
+                    <span class="label">Squelch:</span>
+                    <span class="value" id="squelch-status">ON @ -95 dBm</span>
+                    <span class="muted-indicator" id="muted-indicator" style="display: none;">[MUTED]</span>
+                </div>
+            </section>
+
+            <!-- RDS Information -->
+            <section class="rds-section">
+                <div class="info-row">
+                    <span class="label">Station:</span>
+                    <span class="value callsign" id="station-callsign"></span>
+                    <span class="secondary" id="station-pty"></span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Name:</span>
+                    <span class="value" id="station-name"></span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Text:</span>
+                    <span class="value radio-text" id="radio-text"></span>
+                </div>
+                <div class="info-row">
+                    <span class="label">RDS:</span>
+                    <span class="value" id="rds-status">OFF</span>
+                </div>
+            </section>
+
+            <!-- Volume Control -->
+            <section class="volume-section">
+                <div class="info-row">
+                    <span class="label">Volume:</span>
+                    <input type="range" id="volume-slider" min="0" max="100" value="100">
+                    <span class="value" id="volume-value">100%</span>
+                </div>
+            </section>
+
+            <!-- Spectrum Analyzer -->
+            <section class="spectrum-section">
+                <div class="spectrum-container">
+                    <canvas id="spectrum-canvas" width="400" height="120"></canvas>
+                </div>
+                <div class="spectrum-label">Spectrum</div>
+            </section>
+
+            <!-- Controls -->
+            <section class="controls-section">
+                <div class="control-group">
+                    <button class="control-btn" id="btn-squelch" title="Toggle Squelch (Q)">
+                        <span class="key">Q</span> Squelch
+                    </button>
+                    <button class="control-btn" id="btn-rds" title="Toggle RDS (R)">
+                        <span class="key">R</span> RDS
+                    </button>
+                    <button class="control-btn" id="btn-bass" title="Toggle Bass Boost (B)">
+                        <span class="key">B</span> Bass
+                    </button>
+                    <button class="control-btn" id="btn-treble" title="Toggle Treble Boost (T)">
+                        <span class="key">T</span> Treble
+                    </button>
+                </div>
+                <div class="audio-status">
+                    <button class="audio-btn" id="btn-audio" title="Click to start audio playback">
+                        Start Audio
+                    </button>
+                    <span class="audio-indicator" id="audio-indicator">Audio stopped</span>
+                </div>
+            </section>
+
+            <!-- Error Display -->
+            <div class="error-display" id="error-display" style="display: none;"></div>
+        </main>
+
+        <footer>
+            <span>Use arrow keys to tune. Up/Down for volume.</span>
+            <br>
+            <span class="copyright">Copyright (c) 2026 Phil Jensen &lt;philj@philandamy.org&gt;. All rights reserved.</span>
+        </footer>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="/static/opus-decoder.min.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

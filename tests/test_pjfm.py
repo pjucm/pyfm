@@ -314,6 +314,40 @@ def measure_thd_n(x, fundamental_freq, sample_rate, n_harmonics=5):
     return thd_n_db
 
 
+def design_a_weighting(fs):
+    """
+    Design an IEC 61672 A-weighting filter.
+
+    Analog prototype has 4 zeros at s=0 and poles at:
+        20.598997 Hz (×2), 107.65265 Hz, 737.86223 Hz, 12194.217 Hz (×2)
+
+    Returns:
+        SOS array for use with scipy.signal.sosfilt, normalized to 0 dB at 1 kHz
+    """
+    # Analog prototype zeros and poles (rad/s)
+    z = [0, 0, 0, 0]
+    p = [-2 * np.pi * 20.598997,
+         -2 * np.pi * 20.598997,
+         -2 * np.pi * 107.65265,
+         -2 * np.pi * 737.86223,
+         -2 * np.pi * 12194.217,
+         -2 * np.pi * 12194.217]
+    # Gain chosen so analog response = 0 dB at 1 kHz
+    k = (2 * np.pi * 12194.217) ** 2
+
+    # Bilinear transform to digital
+    zd, pd, kd = signal.bilinear_zpk(z, p, k, fs)
+
+    # Convert to second-order sections
+    sos = signal.zpk2sos(zd, pd, kd)
+
+    # Normalize to 0 dB at 1 kHz
+    w, h = signal.sosfreqz(sos, worN=[2 * np.pi * 1000 / fs])
+    sos[0, :3] /= np.abs(h[0])
+
+    return sos
+
+
 def find_step_crossing(x, threshold=0.5):
     """
     Find the sample index where signal crosses threshold.
@@ -1014,6 +1048,127 @@ def test_snr_with_noise():
     return all_passed
 
 
+def test_ihf_snr():
+    """
+    Test IHF/EIA-style audio-referenced SNR.
+
+    Standard hi-fi tuner specs use A-weighted, de-emphasized audio SNR rather
+    than pilot-referenced RF SNR.  De-emphasis + A-weighting adds ~10-15 dB
+    to the number by rolling off high-frequency noise.
+
+    Procedure:
+      1. Generate full-deviation 1 kHz stereo tone
+      2. FM modulate with AWGN at 40 dB RF SNR
+      3. Decode with de-emphasis enabled
+      4. A-weight the output, measure tone-to-residual ratio via FFT
+      5. Compare stereo and mono results
+
+    Uses 480 kHz IQ rate (production default) for best filter performance.
+
+    Pass thresholds: stereo > 35 dB, mono > 50 dB
+    """
+    print("\n" + "=" * 60)
+    print("TEST: IHF/EIA-Style SNR (A-weighted, de-emphasized)")
+    print("=" * 60)
+
+    iq_rate = 480000
+    audio_rate = 48000
+    duration = 1.0
+    test_freq = 1000
+    rf_snr_db = 40
+
+    rng = np.random.default_rng(42)
+
+    # Generate stereo 1 kHz tone at 0.5 amplitude (both channels)
+    n_samples = int(duration * iq_rate)
+    t = np.arange(n_samples) / iq_rate
+    tone = 0.5 * np.sin(2 * np.pi * test_freq * t)
+
+    multiplex = generate_fm_stereo_multiplex(tone, tone, iq_rate, subcarrier_phase='neg_cos')
+    iq_clean = fm_modulate(multiplex, iq_rate)
+
+    # Add AWGN at specified RF SNR
+    sig_power = np.mean(np.abs(iq_clean) ** 2)
+    noise_power = sig_power / (10 ** (rf_snr_db / 10))
+    noise = np.sqrt(noise_power / 2) * (
+        rng.standard_normal(n_samples) + 1j * rng.standard_normal(n_samples)
+    )
+    iq_noisy = iq_clean + noise.astype(np.complex64)
+
+    # Design A-weighting filter at audio rate
+    a_weight_sos = design_a_weighting(audio_rate)
+
+    def measure_ihf_snr(audio_channel):
+        """A-weight audio and measure tone-vs-residual SNR."""
+        weighted = signal.sosfilt(a_weight_sos, audio_channel)
+        n = len(weighted)
+        window = np.hanning(n)
+        x_w = weighted * window
+
+        fft_out = np.fft.rfft(x_w)
+        freqs = np.fft.rfftfreq(n, 1.0 / audio_rate)
+        power_spec = np.abs(fft_out) ** 2 / n
+
+        tone_mask = np.abs(freqs - test_freq) <= 50
+        tone_power = np.sum(power_spec[tone_mask])
+        residual_power = np.sum(power_spec[~tone_mask])
+
+        if residual_power <= 0:
+            return np.inf
+        return 10 * np.log10(tone_power / residual_power)
+
+    # --- Stereo test ---
+    decoder_stereo = FMStereoDecoder(
+        iq_sample_rate=iq_rate,
+        audio_sample_rate=audio_rate,
+        deviation=75000,
+        deemphasis=75e-6
+    )
+    decoder_stereo.bass_boost_enabled = False
+    decoder_stereo.treble_boost_enabled = False
+    decoder_stereo.stereo_blend_enabled = False
+
+    audio_stereo = demodulate_with_settling(decoder_stereo, iq_noisy)
+    skip = int(0.1 * audio_rate)
+    left_stereo = audio_stereo[skip:-skip, 0]
+
+    stereo_ihf = measure_ihf_snr(left_stereo)
+
+    # Pilot-referenced SNR for comparison
+    pilot_snr = decoder_stereo.snr_db if hasattr(decoder_stereo, 'snr_db') else 0.0
+
+    # --- Mono test ---
+    decoder_mono = FMStereoDecoder(
+        iq_sample_rate=iq_rate,
+        audio_sample_rate=audio_rate,
+        deviation=75000,
+        deemphasis=75e-6,
+        force_mono=True
+    )
+    decoder_mono.bass_boost_enabled = False
+    decoder_mono.treble_boost_enabled = False
+    decoder_mono.stereo_blend_enabled = False
+
+    audio_mono = demodulate_with_settling(decoder_mono, iq_noisy)
+    left_mono = audio_mono[skip:-skip, 0]
+
+    mono_ihf = measure_ihf_snr(left_mono)
+
+    print(f"  IQ rate:             {iq_rate/1000:.0f} kHz")
+    print(f"  RF SNR:              {rf_snr_db} dB")
+    print(f"  Pilot-referenced:    {pilot_snr:.1f} dB")
+    print(f"  IHF stereo SNR:      {stereo_ihf:.1f} dB  (target: >35 dB)")
+    print(f"  IHF mono SNR:        {mono_ihf:.1f} dB  (target: >50 dB)")
+    print(f"  Stereo-to-pilot gap: {stereo_ihf - pilot_snr:+.1f} dB  (de-emphasis + A-weight)")
+
+    stereo_pass = stereo_ihf > 35
+    mono_pass = mono_ihf > 50
+    passed = stereo_pass and mono_pass
+    print(f"  Result: {'PASS' if passed else 'FAIL'}")
+
+    return passed
+
+
 # =============================================================================
 # Main Test Runner
 # =============================================================================
@@ -1037,6 +1192,7 @@ def run_all_tests():
         ("Group Delay Alignment", test_group_delay_alignment),
         ("Frequency Response", test_frequency_response),
         ("SNR with Noise", test_snr_with_noise),
+        ("IHF/EIA SNR", test_ihf_snr),
     ]
 
     results = []
