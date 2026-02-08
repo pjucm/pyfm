@@ -71,6 +71,7 @@ except ImportError as e:
     r8600_get_api_version = None
 
 from demodulator import FMStereoDecoder, NBFMDecoder
+from pll_stereo_decoder import PLLStereoDecoder
 from rds_decoder import RDSDecoder, pi_to_callsign
 
 
@@ -565,6 +566,11 @@ class FMRadio:
     IQ_LOSS_MUTE_BLOCKS = 1
     IQ_LOSS_FLUSH_THRESHOLD = 3
     IQ_LOSS_FLUSH_COOLDOWN_S = 0.5
+    STEREO_LPF_TAPS_DEFAULT = 255
+    STEREO_LPF_BETA_DEFAULT = 6.0
+    STEREO_RESAMPLER_MODE_DEFAULT = "firdecim"
+    STEREO_RESAMPLER_TAPS_DEFAULT = 127
+    STEREO_RESAMPLER_BETA_DEFAULT = 8.0
 
     # Signal level calibration offset (dB)
     # IQ samples need calibration to match true power in dBm.
@@ -577,7 +583,7 @@ class FMRadio:
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
 
     def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None,
-                 rds_enabled=True, realtime=True, iq_sample_rate=None):
+                 rds_enabled=True, realtime=True, iq_sample_rate=None, use_pll=False):
         """
         Initialize FM Radio.
 
@@ -592,6 +598,7 @@ class FMRadio:
         """
         self.use_icom = use_icom
         self.use_24bit = use_24bit
+        self.use_pll = use_pll
         self.use_realtime = realtime  # For config save
         self._preamp_setting = preamp  # None = don't touch, True = on, False = off
 
@@ -668,6 +675,13 @@ class FMRadio:
         # Force mono mode (skip stereo decoding even when pilot detected)
         self.force_mono = False
 
+        # Stereo decoder DSP tuning
+        self.stereo_lpf_taps = self.STEREO_LPF_TAPS_DEFAULT
+        self.stereo_lpf_beta = self.STEREO_LPF_BETA_DEFAULT
+        self.stereo_resampler_mode = self.STEREO_RESAMPLER_MODE_DEFAULT
+        self.stereo_resampler_taps = self.STEREO_RESAMPLER_TAPS_DEFAULT
+        self.stereo_resampler_beta = self.STEREO_RESAMPLER_BETA_DEFAULT
+
         # Weather radio mode (NBFM for NWS)
         self.weather_mode = False
         self.nbfm_decoder = None
@@ -718,6 +732,40 @@ class FMRadio:
                 except ValueError:
                     pass
 
+            # Stereo decoder configuration
+            if config.has_option('radio', 'stereo_lpf_taps'):
+                try:
+                    taps = int(config.get('radio', 'stereo_lpf_taps'))
+                    if taps >= 3 and (taps % 2) == 1:
+                        self.stereo_lpf_taps = taps
+                except ValueError:
+                    pass
+            if config.has_option('radio', 'stereo_lpf_beta'):
+                try:
+                    beta = float(config.get('radio', 'stereo_lpf_beta'))
+                    if beta > 0:
+                        self.stereo_lpf_beta = beta
+                except ValueError:
+                    pass
+            if config.has_option('radio', 'stereo_resampler_mode'):
+                mode = config.get('radio', 'stereo_resampler_mode').strip().lower()
+                if mode in ('interp', 'firdecim', 'auto'):
+                    self.stereo_resampler_mode = mode
+            if config.has_option('radio', 'stereo_resampler_taps'):
+                try:
+                    taps = int(config.get('radio', 'stereo_resampler_taps'))
+                    if taps >= 3 and (taps % 2) == 1:
+                        self.stereo_resampler_taps = taps
+                except ValueError:
+                    pass
+            if config.has_option('radio', 'stereo_resampler_beta'):
+                try:
+                    beta = float(config.get('radio', 'stereo_resampler_beta'))
+                    if beta > 0:
+                        self.stereo_resampler_beta = beta
+                except ValueError:
+                    pass
+
             # Load RDS force-off toggle
             if config.has_option('radio', 'rds_force_off'):
                 try:
@@ -740,6 +788,11 @@ class FMRadio:
             'realtime': str(self.use_realtime).lower(),
             'iq_sample_rate': str(self.iq_sample_rate),
             'squelch_threshold': f'{self.squelch_threshold:.1f}',
+            'stereo_lpf_taps': str(self.stereo_lpf_taps),
+            'stereo_lpf_beta': f'{self.stereo_lpf_beta:.2f}',
+            'stereo_resampler_mode': self.stereo_resampler_mode,
+            'stereo_resampler_taps': str(self.stereo_resampler_taps),
+            'stereo_resampler_beta': f'{self.stereo_resampler_beta:.2f}',
             'rds_force_off': str(self.rds_forced_off).lower(),
         }
 
@@ -788,12 +841,18 @@ class FMRadio:
             #    self.device.set_preamp(self._preamp_setting)
 
             # Create decoders
-            self.stereo_decoder = FMStereoDecoder(
+            DecoderClass = PLLStereoDecoder if self.use_pll else FMStereoDecoder
+            self.stereo_decoder = DecoderClass(
                 iq_sample_rate=actual_rate,
                 audio_sample_rate=self.AUDIO_SAMPLE_RATE,
                 deviation=75000,
                 deemphasis=75e-6,
-                force_mono=self.force_mono
+                force_mono=self.force_mono,
+                stereo_lpf_taps=self.stereo_lpf_taps,
+                stereo_lpf_beta=self.stereo_lpf_beta,
+                resampler_mode=self.stereo_resampler_mode,
+                resampler_taps=self.stereo_resampler_taps,
+                resampler_beta=self.stereo_resampler_beta,
             )
             self.stereo_decoder.bass_boost_enabled = self._initial_bass_boost
             self.stereo_decoder.treble_boost_enabled = self._initial_treble_boost
@@ -1536,7 +1595,8 @@ def build_display(radio, width=80):
     if radio.weather_mode:
         table.add_row("Mode:", f"{rt_prefix}NBFM Weather Radio (5 kHz dev){bit_depth_suffix}")
     else:
-        table.add_row("Mode:", f"{rt_prefix}Wideband FM Stereo (75 kHz dev){bit_depth_suffix}")
+        decoder_suffix = " [PLL]" if radio.use_pll else ""
+        table.add_row("Mode:", f"{rt_prefix}Wideband FM Stereo (75 kHz dev){bit_depth_suffix}{decoder_suffix}")
 
     # Volume row
     vol_pct = int(radio.volume * 100)
@@ -2309,6 +2369,11 @@ def main():
         dest="rds",
         help="Disable RDS decoding (auto-enables when pilot tone detected)"
     )
+    parser.add_argument(
+        "--pll",
+        action="store_true",
+        help="Use PLL-based stereo decoder instead of pilot-squaring"
+    )
     parser.set_defaults(rds=True)
 
     args = parser.parse_args()
@@ -2425,7 +2490,7 @@ def main():
     # Create radio instance
     radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=use_24bit,
                     preamp=preamp_setting, rds_enabled=args.rds, realtime=use_realtime,
-                    iq_sample_rate=iq_sample_rate)
+                    iq_sample_rate=iq_sample_rate, use_pll=args.pll)
     radio.rt_enabled = rt_enabled
 
     # Check for headless mode (for automated PI loop tuning)

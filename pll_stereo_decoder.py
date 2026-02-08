@@ -15,7 +15,13 @@ import time
 import numpy as np
 from scipy import signal as sp_signal
 
-from demodulator import _soft_clip
+from demodulator import (
+    _soft_clip,
+    _validate_odd_taps,
+    _normalize_resampler_mode,
+    _StreamingLinearResampler,
+    _StreamingFIRDecimator,
+)
 
 
 class PLLStereoDecoder:
@@ -27,11 +33,19 @@ class PLLStereoDecoder:
     """
 
     def __init__(self, iq_sample_rate=250000, audio_sample_rate=48000,
-                 deviation=75000, deemphasis=75e-6, force_mono=False):
+                 deviation=75000, deemphasis=75e-6, force_mono=False,
+                 stereo_lpf_taps=127, stereo_lpf_beta=6.0,
+                 resampler_mode="interp", resampler_taps=127,
+                 resampler_beta=8.0):
         self.iq_sample_rate = iq_sample_rate
         self.audio_sample_rate = audio_sample_rate
         self.deviation = deviation
         self.force_mono = force_mono
+        self.stereo_lpf_taps = _validate_odd_taps(stereo_lpf_taps, "stereo_lpf_taps")
+        self.stereo_lpf_beta = float(stereo_lpf_beta)
+        self.resampler_mode = _normalize_resampler_mode(resampler_mode)
+        self.resampler_taps = _validate_odd_taps(resampler_taps, "resampler_taps")
+        self.resampler_beta = float(resampler_beta)
 
         # Pilot detection state
         self._pilot_detected = False
@@ -44,6 +58,12 @@ class PLLStereoDecoder:
         # Adaptive rate control
         self._rate_adjust = 1.0
         self._nominal_ratio = audio_sample_rate / iq_sample_rate
+        self._interp_resampler = _StreamingLinearResampler()
+        self._post_decim_resampler = _StreamingLinearResampler()
+        self._fir_decim_l = None
+        self._fir_decim_r = None
+        self._fir_decimation = 1
+        self._resampler_runtime_mode = "interp"
 
         # Design filters (all at IQ sample rate)
         nyq = iq_sample_rate / 2
@@ -57,7 +77,9 @@ class PLLStereoDecoder:
 
         # L+R lowpass filter (15 kHz)
         lr_sum_cutoff = 15000 / nyq
-        self.lr_sum_lpf = sp_signal.firwin(127, lr_sum_cutoff, window=('kaiser', 6.0))
+        self.lr_sum_lpf = sp_signal.firwin(
+            self.stereo_lpf_taps, lr_sum_cutoff, window=('kaiser', self.stereo_lpf_beta)
+        )
         self.lr_sum_lpf_state = sp_signal.lfilter_zi(self.lr_sum_lpf, 1.0)
 
         # L-R bandpass filter (20-56 kHz)
@@ -68,7 +90,9 @@ class PLLStereoDecoder:
         self.lr_diff_bpf_state = sp_signal.lfilter_zi(self.lr_diff_bpf, 1.0)
 
         # L-R lowpass filter after demodulation (15 kHz)
-        self.lr_diff_lpf = sp_signal.firwin(127, lr_sum_cutoff, window=('kaiser', 6.0))
+        self.lr_diff_lpf = sp_signal.firwin(
+            self.stereo_lpf_taps, lr_sum_cutoff, window=('kaiser', self.stereo_lpf_beta)
+        )
         self.lr_diff_lpf_state = sp_signal.lfilter_zi(self.lr_diff_lpf, 1.0)
 
         # De-emphasis filter (at output audio rate)
@@ -181,6 +205,7 @@ class PLLStereoDecoder:
             'limiter': 0.0,
             'total': 0.0,
         }
+        self._configure_resampler()
 
     def _design_low_shelf(self, fc, gain_db, fs):
         """Design low shelf biquad filter coefficients (Audio EQ Cookbook)."""
@@ -403,6 +428,62 @@ class PLLStereoDecoder:
 
         return carrier_38k
 
+    def _configure_resampler(self):
+        """Initialize the configured resampler path."""
+        ratio_in_out = self.iq_sample_rate / self.audio_sample_rate
+        decim = int(round(ratio_in_out))
+        integer_ratio = abs(ratio_in_out - decim) < 1e-9 and decim >= 2
+
+        use_fir = (
+            self.resampler_mode == "firdecim"
+            or (self.resampler_mode == "auto" and integer_ratio)
+        )
+        if use_fir and integer_ratio:
+            self._fir_decimation = decim
+            self._fir_decim_l = _StreamingFIRDecimator(
+                decim, taps=self.resampler_taps, beta=self.resampler_beta
+            )
+            self._fir_decim_r = _StreamingFIRDecimator(
+                decim, taps=self.resampler_taps, beta=self.resampler_beta
+            )
+            self._resampler_runtime_mode = "firdecim"
+        else:
+            self._fir_decimation = 1
+            self._fir_decim_l = None
+            self._fir_decim_r = None
+            self._resampler_runtime_mode = "interp"
+
+    def _resample_channels(self, left, right, stereo_allowed):
+        """Resample decoded channels using configured mode."""
+        ratio_eff = self._nominal_ratio * self._rate_adjust
+
+        if self._resampler_runtime_mode == "firdecim":
+            # Always advance both decimator states to keep channels time-aligned
+            # when stereo gating toggles dynamically.
+            left = self._fir_decim_l.process(left)
+            right = self._fir_decim_r.process(right)
+            if not stereo_allowed:
+                right = left
+
+            ratio_post = ratio_eff * self._fir_decimation
+            if ratio_post > 0:
+                if stereo_allowed:
+                    left, right = self._post_decim_resampler.process(ratio_post, left, right)
+                else:
+                    (left,) = self._post_decim_resampler.process(ratio_post, left)
+                    right = left
+            else:
+                left = np.array([], dtype=np.float64)
+                right = left
+            return left, right
+
+        if stereo_allowed:
+            left, right = self._interp_resampler.process(ratio_eff, left, right)
+        else:
+            (left,) = self._interp_resampler.process(ratio_eff, left)
+            right = left
+        return left, right
+
     def demodulate(self, iq_samples):
         """
         Demodulate FM stereo signal from IQ samples.
@@ -531,19 +612,7 @@ class PLLStereoDecoder:
             self._blend_factor = 0.0
 
         # Resample to audio rate with adaptive rate control
-        nominal_output = int(round(len(left) * self._nominal_ratio))
-        adjusted_output = int(round(nominal_output * self._rate_adjust))
-        if adjusted_output > 0:
-            if stereo_allowed:
-                left = sp_signal.resample(left, adjusted_output)
-                right = sp_signal.resample(right, adjusted_output)
-            else:
-                mono = sp_signal.resample(left, adjusted_output)
-                left = mono
-                right = mono
-        else:
-            left = np.array([], dtype=np.float64)
-            right = np.array([], dtype=np.float64)
+        left, right = self._resample_channels(left, right, stereo_allowed)
 
         if profiling:
             t0 = self._prof('resample', t0)
@@ -620,6 +689,14 @@ class PLLStereoDecoder:
 
         # Reset group delay compensation buffer
         self._lr_sum_delay_buf = np.zeros(self._lr_sum_delay, dtype=np.float64)
+
+        # Reset resampler state
+        self._interp_resampler.reset()
+        self._post_decim_resampler.reset()
+        if self._fir_decim_l is not None:
+            self._fir_decim_l.reset()
+        if self._fir_decim_r is not None:
+            self._fir_decim_r.reset()
 
         # Reset SNR state
         self._snr_db = 0.0

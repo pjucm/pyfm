@@ -11,6 +11,91 @@ import numpy as np
 from scipy import signal
 
 
+def _validate_odd_taps(value, name, minimum=3):
+    """Return validated odd FIR tap count."""
+    taps = int(value)
+    if taps < minimum or (taps % 2) == 0:
+        raise ValueError(f"{name} must be an odd integer >= {minimum}, got {value}")
+    return taps
+
+
+def _normalize_resampler_mode(value):
+    """Normalize resampler mode string."""
+    mode = str(value).strip().lower()
+    if mode not in {"interp", "firdecim", "auto"}:
+        raise ValueError(f"Unknown resampler_mode '{value}' (expected interp|firdecim|auto)")
+    return mode
+
+
+class _StreamingLinearResampler:
+    """
+    Phase-continuous streaming linear resampler.
+
+    Keeps one scalar phase in input-sample units and computes output count from
+    that phase + ratio each block, avoiding per-block rounding bias.
+    """
+
+    def __init__(self):
+        self.phase = 0.0
+
+    def reset(self):
+        self.phase = 0.0
+
+    def process(self, ratio, *channels):
+        if not channels:
+            return tuple()
+        n_in = len(channels[0])
+        if n_in <= 0 or ratio <= 0:
+            empty = np.array([], dtype=np.float64)
+            return tuple(empty for _ in channels)
+        if any(len(ch) != n_in for ch in channels):
+            raise ValueError("All channels must have equal length")
+
+        step = 1.0 / ratio
+        phase = float(self.phase)
+        if phase < 0.0 or phase >= n_in:
+            phase = phase % n_in
+
+        # Largest k such that phase + k*step < n_in.
+        n_out = int(np.floor((n_in - 1e-12 - phase) / step)) + 1
+        if n_out <= 0:
+            self.phase = phase - n_in
+            empty = np.array([], dtype=np.float64)
+            return tuple(empty for _ in channels)
+
+        positions = phase + step * np.arange(n_out, dtype=np.float64)
+        self.phase = positions[-1] + step - n_in
+        idx = np.arange(n_in, dtype=np.float64)
+        return tuple(np.interp(positions, idx, ch) for ch in channels)
+
+
+class _StreamingFIRDecimator:
+    """Stateful FIR decimator (lfilter + phased downsample)."""
+
+    def __init__(self, decimation, taps=127, beta=8.0):
+        self.decimation = int(decimation)
+        if self.decimation < 2:
+            raise ValueError(f"decimation must be >=2, got {decimation}")
+        self.taps = _validate_odd_taps(taps, "resampler_taps")
+        self.beta = float(beta)
+        cutoff = 0.45 / self.decimation
+        self.h = signal.firwin(self.taps, cutoff, window=("kaiser", self.beta))
+        self.zi = np.zeros(len(self.h) - 1, dtype=np.float64)
+        self.phase = 0
+
+    def reset(self):
+        self.zi.fill(0.0)
+        self.phase = 0
+
+    def process(self, x):
+        if len(x) == 0:
+            return np.array([], dtype=np.float64)
+        y, self.zi = signal.lfilter(self.h, [1.0], x, zi=self.zi)
+        out = y[self.phase::self.decimation]
+        self.phase = (self.phase - len(y)) % self.decimation
+        return out
+
+
 def _soft_clip(x, threshold=0.8):
     """
     Threshold-based soft clipper with tanh rolloff.
@@ -49,7 +134,10 @@ class FMStereoDecoder:
     """
 
     def __init__(self, iq_sample_rate=250000, audio_sample_rate=48000,
-                 deviation=75000, deemphasis=75e-6, force_mono=False):
+                 deviation=75000, deemphasis=75e-6, force_mono=False,
+                 stereo_lpf_taps=127, stereo_lpf_beta=6.0,
+                 resampler_mode="interp", resampler_taps=127,
+                 resampler_beta=8.0):
         """
         Initialize FM stereo decoder.
 
@@ -59,11 +147,21 @@ class FMStereoDecoder:
             deviation: FM deviation in Hz (75 kHz for broadcast FM)
             deemphasis: De-emphasis time constant in seconds
             force_mono: If True, always output mono (skip stereo decoding)
+            stereo_lpf_taps: Tap count for 15 kHz L+R and L-R LPFs
+            stereo_lpf_beta: Kaiser beta for 15 kHz L+R and L-R LPFs
+            resampler_mode: 'interp', 'firdecim', or 'auto'
+            resampler_taps: Tap count for FIR decimator path
+            resampler_beta: Kaiser beta for FIR decimator path
         """
         self.iq_sample_rate = iq_sample_rate
         self.audio_sample_rate = audio_sample_rate
         self.deviation = deviation
         self.force_mono = force_mono
+        self.stereo_lpf_taps = _validate_odd_taps(stereo_lpf_taps, "stereo_lpf_taps")
+        self.stereo_lpf_beta = float(stereo_lpf_beta)
+        self.resampler_mode = _normalize_resampler_mode(resampler_mode)
+        self.resampler_taps = _validate_odd_taps(resampler_taps, "resampler_taps")
+        self.resampler_beta = float(resampler_beta)
 
         # Pilot detection state
         self._pilot_detected = False
@@ -77,6 +175,12 @@ class FMStereoDecoder:
         # 1.0 = nominal, >1.0 = produce more samples (buffer low), <1.0 = fewer (buffer high)
         self._rate_adjust = 1.0
         self._nominal_ratio = audio_sample_rate / iq_sample_rate
+        self._interp_resampler = _StreamingLinearResampler()
+        self._post_decim_resampler = _StreamingLinearResampler()
+        self._fir_decim_l = None
+        self._fir_decim_r = None
+        self._fir_decimation = 1
+        self._resampler_runtime_mode = "interp"
 
         # Design filters (all at IQ sample rate)
         nyq = iq_sample_rate / 2
@@ -90,7 +194,9 @@ class FMStereoDecoder:
 
         # L+R lowpass filter (15 kHz) — Kaiser beta=6.0 (~60 dB stopband)
         lr_sum_cutoff = 15000 / nyq
-        self.lr_sum_lpf = signal.firwin(127, lr_sum_cutoff, window=('kaiser', 6.0))
+        self.lr_sum_lpf = signal.firwin(
+            self.stereo_lpf_taps, lr_sum_cutoff, window=('kaiser', self.stereo_lpf_beta)
+        )
         self.lr_sum_lpf_state = signal.lfilter_zi(self.lr_sum_lpf, 1.0)
 
         # L-R bandpass filter (23-53 kHz) — Kaiser beta=7.0 (~70 dB stopband)
@@ -101,7 +207,9 @@ class FMStereoDecoder:
         self.lr_diff_bpf_state = signal.lfilter_zi(self.lr_diff_bpf, 1.0)
 
         # L-R lowpass filter after demodulation (15 kHz) — Kaiser beta=6.0 (~60 dB stopband)
-        self.lr_diff_lpf = signal.firwin(127, lr_sum_cutoff, window=('kaiser', 6.0))
+        self.lr_diff_lpf = signal.firwin(
+            self.stereo_lpf_taps, lr_sum_cutoff, window=('kaiser', self.stereo_lpf_beta)
+        )
         self.lr_diff_lpf_state = signal.lfilter_zi(self.lr_diff_lpf, 1.0)
 
         # De-emphasis filter (at output audio rate)
@@ -182,6 +290,7 @@ class FMStereoDecoder:
             'limiter': 0.0,
             'total': 0.0,
         }
+        self._configure_resampler()
 
     def _design_low_shelf(self, fc, gain_db, fs):
         """Design low shelf biquad filter coefficients (Audio EQ Cookbook)."""
@@ -300,6 +409,62 @@ class FMStereoDecoder:
         elapsed = (time.perf_counter() - t0) * 1e6
         self._profile[key] = 0.9 * self._profile[key] + 0.1 * elapsed
         return time.perf_counter()
+
+    def _configure_resampler(self):
+        """Initialize the configured resampler path."""
+        ratio_in_out = self.iq_sample_rate / self.audio_sample_rate
+        decim = int(round(ratio_in_out))
+        integer_ratio = abs(ratio_in_out - decim) < 1e-9 and decim >= 2
+
+        use_fir = (
+            self.resampler_mode == "firdecim"
+            or (self.resampler_mode == "auto" and integer_ratio)
+        )
+        if use_fir and integer_ratio:
+            self._fir_decimation = decim
+            self._fir_decim_l = _StreamingFIRDecimator(
+                decim, taps=self.resampler_taps, beta=self.resampler_beta
+            )
+            self._fir_decim_r = _StreamingFIRDecimator(
+                decim, taps=self.resampler_taps, beta=self.resampler_beta
+            )
+            self._resampler_runtime_mode = "firdecim"
+        else:
+            self._fir_decimation = 1
+            self._fir_decim_l = None
+            self._fir_decim_r = None
+            self._resampler_runtime_mode = "interp"
+
+    def _resample_channels(self, left, right, stereo_allowed):
+        """Resample decoded channels using configured mode."""
+        ratio_eff = self._nominal_ratio * self._rate_adjust
+
+        if self._resampler_runtime_mode == "firdecim":
+            # Always advance both decimator states to keep channels time-aligned
+            # when stereo gating toggles dynamically.
+            left = self._fir_decim_l.process(left)
+            right = self._fir_decim_r.process(right)
+            if not stereo_allowed:
+                right = left
+
+            ratio_post = ratio_eff * self._fir_decimation
+            if ratio_post > 0:
+                if stereo_allowed:
+                    left, right = self._post_decim_resampler.process(ratio_post, left, right)
+                else:
+                    (left,) = self._post_decim_resampler.process(ratio_post, left)
+                    right = left
+            else:
+                left = np.array([], dtype=np.float64)
+                right = left
+            return left, right
+
+        if stereo_allowed:
+            left, right = self._interp_resampler.process(ratio_eff, left, right)
+        else:
+            (left,) = self._interp_resampler.process(ratio_eff, left)
+            right = left
+        return left, right
 
     def demodulate(self, iq_samples):
         """
@@ -445,20 +610,7 @@ class FMStereoDecoder:
             self._blend_factor = 0.0  # Track that we're in mono
 
         # Resample to audio rate with adaptive rate control
-        # Adjusts output length to compensate for clock drift between IQ source and audio card
-        nominal_output = int(round(len(left) * self._nominal_ratio))
-        adjusted_output = int(round(nominal_output * self._rate_adjust))
-        if adjusted_output > 0:
-            if stereo_allowed:
-                left = signal.resample(left, adjusted_output)
-                right = signal.resample(right, adjusted_output)
-            else:
-                mono = signal.resample(left, adjusted_output)
-                left = mono
-                right = mono
-        else:
-            left = np.array([], dtype=np.float64)
-            right = np.array([], dtype=np.float64)
+        left, right = self._resample_channels(left, right, stereo_allowed)
 
         if profiling:
             t0 = self._prof('resample', t0)
@@ -541,6 +693,14 @@ class FMStereoDecoder:
         # Reset group delay compensation buffer
         self._lr_sum_delay_buf = np.zeros(self._lr_sum_delay, dtype=np.float64)
 
+        # Reset resampler state
+        self._interp_resampler.reset()
+        self._post_decim_resampler.reset()
+        if self._fir_decim_l is not None:
+            self._fir_decim_l.reset()
+        if self._fir_decim_r is not None:
+            self._fir_decim_r.reset()
+
         # Reset SNR state
         self._snr_db = 0.0
         self._noise_power = 1e-10
@@ -585,6 +745,7 @@ class NBFMDecoder:
         # Adaptive rate control (same as FMStereoDecoder)
         self._rate_adjust = 1.0
         self._nominal_ratio = audio_sample_rate / iq_sample_rate
+        self._audio_resampler = _StreamingLinearResampler()
 
         # Design filters (all at IQ sample rate)
         nyq = iq_sample_rate / 2
@@ -768,13 +929,8 @@ class NBFMDecoder:
             self._snr_db = 10 * np.log10(self._signal_power / self._noise_power)
 
         # Resample to audio rate with adaptive rate control
-        # Adjusts output length to compensate for clock drift
-        nominal_output = int(round(len(audio) * self._nominal_ratio))
-        adjusted_output = int(round(nominal_output * self._rate_adjust))
-        if adjusted_output > 0:
-            audio = signal.resample(audio, adjusted_output)
-        else:
-            audio = np.array([], dtype=np.float64)
+        ratio_eff = self._nominal_ratio * self._rate_adjust
+        (audio,) = self._audio_resampler.process(ratio_eff, audio)
 
         # Scale down to provide headroom (0.4 matches panadapter's conservative gain)
         audio = audio * 0.4
@@ -808,6 +964,7 @@ class NBFMDecoder:
         self._signal_power = 0.0
         self._noise_power = 1e-10
         self._peak_amplitude = 0.0
+        self._audio_resampler.reset()
 
         # Reset filter states
         self.channel_lpf_state = signal.lfilter_zi(self.channel_lpf, 1.0)
