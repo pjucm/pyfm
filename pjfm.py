@@ -686,6 +686,12 @@ class FMRadio:
     STEREO_BLEND_LOW_DB_DEFAULT = 5.0
     STEREO_BLEND_HIGH_DB_DEFAULT = 25.0
     RDS_AUTO_SNR_MIN_DB = 5.0
+    RATE_ADJ_MIN = 0.99
+    RATE_ADJ_MAX = 1.01
+    # Weather/NBFM audio is more sensitive to audible pitch warble, so keep
+    # adaptive rate correction much tighter than wideband FM stereo.
+    NBFM_RATE_ADJ_MIN = 0.999
+    NBFM_RATE_ADJ_MAX = 1.001
     FM_FIRST_CHANNEL_HZ = 88_100_000
     FM_LAST_CHANNEL_HZ = 107_900_000
     FM_STEP_HZ = 200_000
@@ -1264,12 +1270,12 @@ class FMRadio:
                                             min(self._rate_integrator_max, self._rate_integrator))
                 i_term = self._rate_integrator
                 rate_adj = 1.0 - (p_term + i_term)
-                rate_adj = max(0.99, min(1.01, rate_adj))  # clamp to ±1%
+                applied_rate_adj = self._clamp_rate_adjust(rate_adj, self.weather_mode)
 
                 if self.weather_mode:
-                    self.nbfm_decoder.rate_adjust = rate_adj
+                    self.nbfm_decoder.rate_adjust = applied_rate_adj
                 else:
-                    self.stereo_decoder.rate_adjust = rate_adj
+                    self.stereo_decoder.rate_adjust = applied_rate_adj
 
                 # Log rate control stats
                 # In detailed mode: every block for first 15s, then every 10 blocks
@@ -1293,7 +1299,7 @@ class FMRadio:
                 if should_log:
                     p_ppm = p_term * 1e6
                     i_ppm = i_term * 1e6
-                    adj_ppm = (rate_adj - 1.0) * 1e6
+                    adj_ppm = (applied_rate_adj - 1.0) * 1e6
                     self._rate_log_file.write(f"{elapsed:.3f},{buf_level:.1f},{buf_target:.0f},{self._filtered_error:.1f},{p_ppm:.1f},{i_ppm:.1f},{adj_ppm:.1f},{self._rate_integrator:.8f},{buf_error_raw:.1f},{self._filtered_error:.1f}\n")
                     self._rate_log_file.flush()
 
@@ -1427,6 +1433,13 @@ class FMRadio:
             return float(last)
         prev_idx = (freq_i - first - 1) // step
         return float(first + prev_idx * step)
+
+    @classmethod
+    def _clamp_rate_adjust(cls, rate_adj, weather_mode):
+        """Clamp adaptive resample ratio for the current mode."""
+        if weather_mode:
+            return max(cls.NBFM_RATE_ADJ_MIN, min(cls.NBFM_RATE_ADJ_MAX, rate_adj))
+        return max(cls.RATE_ADJ_MIN, min(cls.RATE_ADJ_MAX, rate_adj))
 
     def tune_up(self):
         """Tune up by 200 kHz (FM) or 25 kHz (Weather)."""

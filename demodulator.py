@@ -787,9 +787,9 @@ class NBFMDecoder:
         nyq = iq_sample_rate / 2
 
         # Channel filter BEFORE FM demodulation (critical for noise rejection)
-        # NBFM channel is ±7.5 kHz; filter reduces noise bandwidth going into discriminator
+        # NBFM channel is ±12.5 kHz; filter reduces noise bandwidth going into discriminator
         # This prevents high-frequency noise spikes from causing phase jumps
-        channel_cutoff = 7500 / nyq
+        channel_cutoff = 12500 / nyq
         self.channel_lpf = signal.firwin(101, channel_cutoff, window='hamming')
         self.channel_lpf_state = signal.lfilter_zi(self.channel_lpf, 1.0)
 
@@ -804,7 +804,7 @@ class NBFMDecoder:
         self._noise_power = 1e-10
 
         # Design noise measurement bandpass filter (4-6 kHz)
-        # Must be WITHIN the 7.5 kHz channel filter passband (otherwise we measure
+        # Must be WITHIN the 12.5 kHz channel filter passband (otherwise we measure
         # attenuated noise and get falsely high SNR), but above audio content (3 kHz).
         # FM demod noise PSD increases as f², so measuring at 5 kHz vs 1.5 kHz
         # audio center requires correction factor of (5/1.5)² ≈ 11x.
