@@ -24,7 +24,8 @@ Controls:
     r: Toggle RDS decoder (FM mode only)
     b: Toggle bass boost
     t: Toggle treble boost
-    a: Toggle spectrum analyzer
+    a: Toggle AF spectrum analyzer
+    s: Toggle RF spectrum analyzer
     Q: Toggle squelch
     d: Toggle RDS diagnostics (press twice to dump to /tmp/rds_diag.txt)
     B: Toggle debug stats display
@@ -382,6 +383,114 @@ class SpectrumAnalyzer:
         self.buffer_pos = 0
 
 
+class RFSpectrumAnalyzer(SpectrumAnalyzer):
+    """
+    RF baseband spectrum analyzer for IQ samples.
+
+    Uses the same bar/peak rendering style as the AF spectrum analyzer,
+    but maps color to three shades of white.
+    """
+
+    # Narrower/lower dB window for better visibility of weaker RF content.
+    RF_MIN_DB = -120.0
+    RF_MAX_DB = -60.0
+    # Trim FFT edges where front-end anti-alias filtering usually leaves little energy.
+    RF_EDGE_TRIM_RATIO = 0.08
+
+    def __init__(self, sample_rate=480000, fft_size=2048):
+        super().__init__(sample_rate=sample_rate, fft_size=fft_size)
+
+        # RF scope uses linear bands across the usable complex FFT width.
+        edge_trim = int(self.fft_size * self.RF_EDGE_TRIM_RATIO)
+        band_start = max(0, edge_trim)
+        band_end = min(self.fft_size, self.fft_size - edge_trim)
+        if band_end - band_start < self.NUM_BANDS:
+            band_start, band_end = 0, self.fft_size
+        self.band_bins = np.round(
+            np.linspace(band_start, band_end, self.NUM_BANDS + 1)
+        ).astype(int)
+        self.band_bins[0] = band_start
+        self.band_bins[-1] = band_end
+
+        # Complex IQ input buffer.
+        self.audio_buffer = np.zeros(fft_size, dtype=np.complex64)
+
+    def update(self, iq_samples):
+        """Update RF spectrum from complex IQ samples."""
+        if iq_samples is None:
+            return
+
+        iq_samples = np.asarray(iq_samples).reshape(-1)
+        samples_to_add = len(iq_samples)
+        if samples_to_add == 0:
+            return
+
+        if self.buffer_pos + samples_to_add <= self.fft_size:
+            self.audio_buffer[self.buffer_pos:self.buffer_pos + samples_to_add] = iq_samples
+            self.buffer_pos += samples_to_add
+        else:
+            if samples_to_add >= self.fft_size:
+                self.audio_buffer[:] = iq_samples[-self.fft_size:]
+                self.buffer_pos = self.fft_size
+            else:
+                shift = samples_to_add
+                self.audio_buffer[:-shift] = self.audio_buffer[shift:]
+                self.audio_buffer[-shift:] = iq_samples
+                self.buffer_pos = self.fft_size
+
+        if self.buffer_pos >= self.fft_size:
+            self._compute_spectrum()
+            self.buffer_pos = self.fft_size // 2  # 50% overlap
+
+    def _compute_spectrum(self):
+        """Compute complex FFT and update RF band levels."""
+        windowed = self.audio_buffer * self.window
+        fft_result = np.fft.fftshift(np.fft.fft(windowed))
+        magnitude = np.abs(fft_result) / self.fft_size
+
+        new_levels = np.zeros(self.NUM_BANDS)
+        for i in range(self.NUM_BANDS):
+            start_bin = self.band_bins[i]
+            end_bin = self.band_bins[i + 1]
+            if end_bin > start_bin:
+                band_power = np.mean(magnitude[start_bin:end_bin] ** 2)
+                if band_power > 1e-15:
+                    db = 10 * np.log10(band_power)
+                    new_levels[i] = np.clip(
+                        (db - self.RF_MIN_DB) / (self.RF_MAX_DB - self.RF_MIN_DB),
+                        0,
+                        1,
+                    )
+
+        for i in range(self.NUM_BANDS):
+            if new_levels[i] > self.levels[i]:
+                self.levels[i] += (new_levels[i] - self.levels[i]) * self.attack
+            else:
+                self.levels[i] += (new_levels[i] - self.levels[i]) * self.decay
+
+            if self.levels[i] > self.peaks[i]:
+                self.peaks[i] = self.levels[i]
+            else:
+                self.peaks[i] = max(0, self.peaks[i] - self.peak_decay)
+
+    def _get_color(self, row_from_bottom, total_height):
+        """Get white-only color scale for RF scope."""
+        position = row_from_bottom / total_height
+        if position < 0.33:
+            return "#6f6f6f"
+        elif position < 0.66:
+            return "#bfbfbf"
+        else:
+            return "#ffffff"
+
+    def reset(self):
+        """Reset RF analyzer state."""
+        self.levels = np.zeros(self.NUM_BANDS)
+        self.peaks = np.zeros(self.NUM_BANDS)
+        self.audio_buffer = np.zeros(self.fft_size, dtype=np.complex64)
+        self.buffer_pos = 0
+
+
 class AudioPlayer:
     """Manages audio playback via sounddevice with ring buffer. Supports mono and stereo."""
 
@@ -571,6 +680,10 @@ class FMRadio:
     STEREO_RESAMPLER_MODE_DEFAULT = "firdecim"
     STEREO_RESAMPLER_TAPS_DEFAULT = 127
     STEREO_RESAMPLER_BETA_DEFAULT = 8.0
+    # Blend curve defaults (linear in decoder): 15 dB -> 50% blend.
+    STEREO_BLEND_LOW_DB_DEFAULT = 5.0
+    STEREO_BLEND_HIGH_DB_DEFAULT = 25.0
+    RDS_AUTO_SNR_MIN_DB = 10.0
 
     # Signal level calibration offset (dB)
     # IQ samples need calibration to match true power in dBm.
@@ -583,7 +696,7 @@ class FMRadio:
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
 
     def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None,
-                 rds_enabled=True, realtime=True, iq_sample_rate=None, use_pll=True):
+                 rds_enabled=True, realtime=True, iq_sample_rate=None, use_pll=None):
         """
         Initialize FM Radio.
 
@@ -595,10 +708,11 @@ class FMRadio:
             use_24bit: If True, use 24-bit I/Q samples (IC-R8600 only)
             preamp: None (don't touch), True (force on), or False (force off)
             iq_sample_rate: Requested IQ sample rate in Hz (optional)
+            use_pll: True=PLL, False=squaring, None=from config (default PLL)
         """
         self.use_icom = use_icom
         self.use_24bit = use_24bit
-        self.use_pll = use_pll
+        self.use_pll = None if use_pll is None else bool(use_pll)
         self.use_realtime = realtime  # For config save
         self._preamp_setting = preamp  # None = don't touch, True = on, False = off
 
@@ -643,6 +757,12 @@ class FMRadio:
         )
         self.spectrum_enabled = False
         self.spectrum_box_enabled = True  # Show box around spectrum (not exposed in UI yet)
+        self.rf_spectrum_analyzer = RFSpectrumAnalyzer(
+            sample_rate=self.iq_sample_rate,
+            fft_size=2048
+        )
+        self.rf_spectrum_enabled = False
+        self.rf_spectrum_box_enabled = True
 
         # Squelch
         self.squelch_enabled = True
@@ -681,6 +801,8 @@ class FMRadio:
         self.stereo_resampler_mode = self.STEREO_RESAMPLER_MODE_DEFAULT
         self.stereo_resampler_taps = self.STEREO_RESAMPLER_TAPS_DEFAULT
         self.stereo_resampler_beta = self.STEREO_RESAMPLER_BETA_DEFAULT
+        self.stereo_blend_low_db = self.STEREO_BLEND_LOW_DB_DEFAULT
+        self.stereo_blend_high_db = self.STEREO_BLEND_HIGH_DB_DEFAULT
 
         # Weather radio mode (NBFM for NWS)
         self.weather_mode = False
@@ -691,6 +813,8 @@ class FMRadio:
 
         # Load saved config (presets and last frequency)
         self._load_config()
+        if self.use_pll is None:
+            self.use_pll = True
         if self.rds_forced_off:
             self.auto_mode_enabled = False
             self.rds_enabled = False
@@ -724,6 +848,11 @@ class FMRadio:
             # Load audio settings
             if config.has_option('audio', 'force_mono'):
                 self.force_mono = config.getboolean('audio', 'force_mono')
+            if self.use_pll is None and config.has_option('radio', 'use_pll'):
+                try:
+                    self.use_pll = config.getboolean('radio', 'use_pll')
+                except ValueError:
+                    pass
 
             # Load squelch settings
             if config.has_option('radio', 'squelch_threshold'):
@@ -765,6 +894,19 @@ class FMRadio:
                         self.stereo_resampler_beta = beta
                 except ValueError:
                     pass
+            if config.has_option('radio', 'stereo_blend_low_db'):
+                try:
+                    self.stereo_blend_low_db = float(config.get('radio', 'stereo_blend_low_db'))
+                except ValueError:
+                    pass
+            if config.has_option('radio', 'stereo_blend_high_db'):
+                try:
+                    self.stereo_blend_high_db = float(config.get('radio', 'stereo_blend_high_db'))
+                except ValueError:
+                    pass
+            if self.stereo_blend_high_db <= self.stereo_blend_low_db:
+                self.stereo_blend_low_db = self.STEREO_BLEND_LOW_DB_DEFAULT
+                self.stereo_blend_high_db = self.STEREO_BLEND_HIGH_DB_DEFAULT
 
             # Load RDS force-off toggle
             if config.has_option('radio', 'rds_force_off'):
@@ -786,6 +928,7 @@ class FMRadio:
             'device': 'icom' if self.use_icom else 'bb60d',
             'use_24bit': str(self.use_24bit).lower(),
             'realtime': str(self.use_realtime).lower(),
+            'use_pll': str(self.use_pll).lower(),
             'iq_sample_rate': str(self.iq_sample_rate),
             'squelch_threshold': f'{self.squelch_threshold:.1f}',
             'stereo_lpf_taps': str(self.stereo_lpf_taps),
@@ -793,6 +936,8 @@ class FMRadio:
             'stereo_resampler_mode': self.stereo_resampler_mode,
             'stereo_resampler_taps': str(self.stereo_resampler_taps),
             'stereo_resampler_beta': f'{self.stereo_resampler_beta:.2f}',
+            'stereo_blend_low_db': f'{self.stereo_blend_low_db:.1f}',
+            'stereo_blend_high_db': f'{self.stereo_blend_high_db:.1f}',
             'rds_force_off': str(self.rds_forced_off).lower(),
         }
 
@@ -854,6 +999,8 @@ class FMRadio:
                 resampler_taps=self.stereo_resampler_taps,
                 resampler_beta=self.stereo_resampler_beta,
             )
+            self.stereo_decoder.stereo_blend_low = self.stereo_blend_low_db
+            self.stereo_decoder.stereo_blend_high = self.stereo_blend_high_db
             self.stereo_decoder.bass_boost_enabled = self._initial_bass_boost
             self.stereo_decoder.treble_boost_enabled = self._initial_treble_boost
             configured_resampler = getattr(self.stereo_decoder, 'resampler_mode', 'unknown')
@@ -861,7 +1008,8 @@ class FMRadio:
             print(
                 "pjfm startup: "
                 f"decoder={type(self.stereo_decoder).__name__}, "
-                f"resampler={runtime_resampler} (configured={configured_resampler})"
+                f"resampler={runtime_resampler} (configured={configured_resampler}), "
+                f"blend={self.stereo_blend_low_db:.1f}-{self.stereo_blend_high_db:.1f}dB"
             )
 
             if not self.rds_forced_off:
@@ -1149,7 +1297,9 @@ class FMRadio:
                         not self.rds_forced_off and
                         self.auto_mode_enabled and
                         self.stereo_decoder):
-                    snr_ok = self.stereo_decoder.snr_db >= self.stereo_decoder.stereo_blend_low
+                    # Keep RDS enable threshold conservative even if blend is tuned lower.
+                    snr_enable_min = max(self.RDS_AUTO_SNR_MIN_DB, self.stereo_decoder.stereo_blend_low)
+                    snr_ok = self.stereo_decoder.snr_db >= snr_enable_min
                     pilot_present = (self.stereo_decoder.pilot_detected and
                                      dbm >= self.squelch_threshold and
                                      snr_ok)
@@ -1180,7 +1330,11 @@ class FMRadio:
                     audio = np.zeros_like(audio)
                     self._iq_loss_mute_remaining -= 1
 
-                # Update spectrum analyzer
+                # Update RF spectrum analyzer from baseband IQ
+                if self.rf_spectrum_enabled:
+                    self.rf_spectrum_analyzer.update(iq)
+
+                # Update AF spectrum analyzer from demodulated audio
                 if self.spectrum_enabled:
                     self.spectrum_analyzer.update(audio)
 
@@ -1348,6 +1502,12 @@ class FMRadio:
         self.spectrum_enabled = not self.spectrum_enabled
         if not self.spectrum_enabled:
             self.spectrum_analyzer.reset()
+
+    def toggle_rf_spectrum(self):
+        """Toggle RF spectrum analyzer on/off."""
+        self.rf_spectrum_enabled = not self.rf_spectrum_enabled
+        if not self.rf_spectrum_enabled:
+            self.rf_spectrum_analyzer.reset()
 
     def toggle_squelch(self):
         """Toggle squelch on/off."""
@@ -1704,7 +1864,7 @@ def build_display(radio, width=80):
         elif blend <= 0.01:
             stereo_text.append("Mono", style="yellow")
         else:
-            stereo_text.append("Stereo (blend)", style="yellow bold")
+            stereo_text.append(f"Stereo ({blend:.0%})", style="yellow bold")
     table.add_row("Audio:", stereo_text)
 
     # RDS data display (FM mode only - hidden in weather mode or when forced off)
@@ -1747,12 +1907,19 @@ def build_display(radio, width=80):
     table.add_row("", "")  # Spacer
 
     # Spectrum analyzer status
-    spectrum_text = Text()
+    af_spectrum_text = Text()
     if radio.spectrum_enabled:
-        spectrum_text.append("ON", style="green bold")
+        af_spectrum_text.append("ON", style="green bold")
     else:
-        spectrum_text.append("OFF", style="dim")
-    table.add_row("Spectrum:", spectrum_text)
+        af_spectrum_text.append("OFF", style="dim")
+    table.add_row("AF Spectrum:", af_spectrum_text)
+
+    rf_spectrum_text = Text()
+    if radio.rf_spectrum_enabled:
+        rf_spectrum_text.append("ON", style="green bold")
+    else:
+        rf_spectrum_text.append("OFF", style="dim")
+    table.add_row("RF Spectrum:", rf_spectrum_text)
 
     # Squelch status
     squelch_text = Text()
@@ -2043,7 +2210,9 @@ def build_display(radio, width=80):
     controls.append("t ", style="cyan bold")
     controls.append("Treble  ", style="dim")
     controls.append("a ", style="cyan bold")
-    controls.append("Spect  ", style="dim")
+    controls.append("AF Spect  ", style="dim")
+    controls.append("s ", style="cyan bold")
+    controls.append("RF Spect  ", style="dim")
     controls.append("Q ", style="cyan bold")
     controls.append("Squelch  ", style="dim")
     controls.append("q ", style="cyan bold")
@@ -2087,25 +2256,44 @@ def build_display(radio, width=80):
     content = Table.grid(expand=True)
     content.add_row(Align.center(table))
 
-    # Spectrum analyzer display (fixed 2-char wide bars, centered)
+    # Spectrum analyzer displays (fixed 2-char wide bars, centered)
+    if radio.rf_spectrum_enabled:
+        rf_spectrum_rows = radio.rf_spectrum_analyzer.render(height=6)
+        rf_spectrum_table = Table(show_header=False, box=None, padding=0, expand=False)
+        rf_spectrum_table.add_column("RF Spectrum")
+        for row in rf_spectrum_rows:
+            rf_spectrum_table.add_row(row)
+        content.add_row(Text(""))  # Spacer
+        if radio.rf_spectrum_box_enabled:
+            rf_spectrum_panel = Panel(
+                rf_spectrum_table,
+                subtitle="[white]RF Spectrum[/]",
+                box=box.ROUNDED,
+                border_style="white",
+                padding=(0, 1),
+            )
+            content.add_row(Align.center(rf_spectrum_panel))
+        else:
+            content.add_row(Align.center(rf_spectrum_table))
+
     if radio.spectrum_enabled:
-        spectrum_rows = radio.spectrum_analyzer.render(height=6)
-        spectrum_table = Table(show_header=False, box=None, padding=0, expand=False)
-        spectrum_table.add_column("Spectrum")
-        for row in spectrum_rows:
-            spectrum_table.add_row(row)
+        af_spectrum_rows = radio.spectrum_analyzer.render(height=6)
+        af_spectrum_table = Table(show_header=False, box=None, padding=0, expand=False)
+        af_spectrum_table.add_column("AF Spectrum")
+        for row in af_spectrum_rows:
+            af_spectrum_table.add_row(row)
         content.add_row(Text(""))  # Spacer
         if radio.spectrum_box_enabled:
-            spectrum_panel = Panel(
-                spectrum_table,
-                subtitle="[dim]Spectrum[/]",
+            af_spectrum_panel = Panel(
+                af_spectrum_table,
+                subtitle="[dim]AF Spectrum[/]",
                 box=box.ROUNDED,
                 border_style="dim",
                 padding=(0, 1),
             )
-            content.add_row(Align.center(spectrum_panel))
+            content.add_row(Align.center(af_spectrum_panel))
         else:
-            content.add_row(Align.center(spectrum_table))
+            content.add_row(Align.center(af_spectrum_table))
 
     content.add_row(Align.center(controls))
     content.add_row(Align.center(presets))
@@ -2247,8 +2435,12 @@ def run_rich_ui(radio):
                         # Unknown escape - skip the ESC
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] in ('a', 'A'):
-                        # Toggle spectrum analyzer
+                        # Toggle AF spectrum analyzer
                         radio.toggle_spectrum()
+                        input_buffer = input_buffer[1:]
+                    elif input_buffer[0] in ('s', 'S'):
+                        # Toggle RF spectrum analyzer
+                        radio.toggle_rf_spectrum()
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] in ('w', 'W'):
                         # Toggle weather mode
@@ -2380,7 +2572,7 @@ def main():
         "--pll",
         action="store_true",
         dest="use_pll",
-        help="Use PLL-based stereo decoder (default)"
+        help="Use PLL-based stereo decoder"
     )
     parser.add_argument(
         "--squaring",
@@ -2388,7 +2580,7 @@ def main():
         dest="use_pll",
         help="Use pilot-squaring stereo decoder instead of PLL"
     )
-    parser.set_defaults(rds=True, use_pll=True)
+    parser.set_defaults(rds=True, use_pll=None)
 
     args = parser.parse_args()
 

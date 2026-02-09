@@ -54,6 +54,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from demodulator import FMStereoDecoder
+from pll_stereo_decoder import PLLStereoDecoder
 
 
 # =============================================================================
@@ -266,6 +267,31 @@ def measure_snr(x, signal_freq, sample_rate, signal_bw=100):
 
     snr_db = 10 * np.log10(signal_power / noise_power)
     return snr_db
+
+
+def measure_ihf_tone_snr(x, signal_freq, sample_rate, a_weight_sos, signal_bw=100):
+    """
+    Measure IHF/EIA-style tone SNR on audio output.
+
+    Applies A-weighting and then computes tone power vs residual FFT power.
+    """
+    weighted = signal.sosfilt(a_weight_sos, x)
+    n = len(weighted)
+    window = np.hanning(n)
+    x_windowed = weighted * window
+
+    fft = np.fft.rfft(x_windowed)
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    power_spectrum = np.abs(fft) ** 2 / n
+
+    signal_mask = np.abs(freqs - signal_freq) <= signal_bw / 2
+    signal_power = np.sum(power_spectrum[signal_mask])
+    noise_power = np.sum(power_spectrum[~signal_mask])
+
+    if noise_power <= 0:
+        return np.inf
+
+    return 10 * np.log10((signal_power + 1e-20) / (noise_power + 1e-20))
 
 
 def measure_thd_n(x, fundamental_freq, sample_rate, n_harmonics=5):
@@ -992,61 +1018,166 @@ def test_snr_with_noise():
     Verifies graceful degradation.
     """
     print("\n" + "=" * 60)
-    print("TEST: SNR with Noisy Input")
+    print("TEST: IHF/EIA SNR with Noisy Input (PLL + FMSQ, firdecim)")
     print("=" * 60)
 
-    iq_rate = 250000
+    iq_rate = 480000
     audio_rate = 48000
-    duration = 0.5
+    duration = 1.0
 
-    input_snr_levels = [40, 30, 20, 10]
+    input_snr_levels = [40, 30, 25, 20, 15, 10]
     test_freq = 1000
+    a_weight_sos = design_a_weighting(audio_rate)
 
-    print(f"  {'Input SNR':>12s}  {'Output SNR':>12s}  {'Pilot':>8s}  {'Blend':>8s}")
-    print(f"  {'--------':>12s}  {'----------':>12s}  {'-----':>8s}  {'-----':>8s}")
+    # Force this test to exercise the exact path requested.
+    resampler_mode = "firdecim"
+    resampler_taps = 127
+    resampler_beta = 8.0
+
+    decoder_paths = [
+        ("FMStereoDecoder", FMStereoDecoder),
+        ("PLLStereoDecoder", PLLStereoDecoder),
+    ]
+
+    print(f"  IQ rate: {iq_rate/1000:.0f} kHz, metric: IHF/EIA (A-weighted, de-emphasized)")
+    print(f"  Decoder resampler: mode={resampler_mode}, taps={resampler_taps}, beta={resampler_beta:.1f}")
 
     all_passed = True
 
-    for input_snr in input_snr_levels:
-        n_samples = int(duration * iq_rate)
-        t = np.arange(n_samples) / iq_rate
-        left = 0.5 * np.sin(2 * np.pi * test_freq * t)
-        right = 0.5 * np.sin(2 * np.pi * test_freq * t)
+    n_samples = int(duration * iq_rate)
+    t = np.arange(n_samples) / iq_rate
+    tone = 0.5 * np.sin(2 * np.pi * test_freq * t)
 
-        multiplex = generate_fm_stereo_multiplex(left, right, iq_rate, subcarrier_phase='neg_cos')
-        iq_clean = fm_modulate(multiplex, iq_rate)
+    # Companion stimuli:
+    # - dual-mono: IHF SNR curve behavior
+    # - left-only: stereo separation behavior
+    multiplex_mono = generate_fm_stereo_multiplex(tone, tone, iq_rate, subcarrier_phase='neg_cos')
+    iq_clean_mono = fm_modulate(multiplex_mono, iq_rate)
+    signal_power_mono = np.mean(np.abs(iq_clean_mono) ** 2)
 
-        # Add noise to I/Q
-        signal_power = np.mean(np.abs(iq_clean) ** 2)
-        noise_power = signal_power / (10 ** (input_snr / 10))
-        noise = np.sqrt(noise_power / 2) * (np.random.randn(n_samples) + 1j * np.random.randn(n_samples))
-        iq_noisy = iq_clean + noise.astype(np.complex64)
+    right_silent = np.zeros_like(tone)
+    multiplex_sep = generate_fm_stereo_multiplex(tone, right_silent, iq_rate, subcarrier_phase='neg_cos')
+    iq_clean_sep = fm_modulate(multiplex_sep, iq_rate)
+    signal_power_sep = np.mean(np.abs(iq_clean_sep) ** 2)
 
-        decoder = FMStereoDecoder(
-            iq_sample_rate=iq_rate,
-            audio_sample_rate=audio_rate,
-            deviation=75000,
-            deemphasis=1e-9
-        )
-        decoder.bass_boost_enabled = False
-        decoder.treble_boost_enabled = False
-        decoder.stereo_blend_enabled = True
+    for path_idx, (path_name, decoder_class) in enumerate(decoder_paths):
+        print(f"\n  Path: {path_name}")
+        print(f"    {'Input SNR':>12s}  {'IHF SNR':>10s}  {'Sep':>8s}  {'Pilot':>8s}  {'Blend':>8s}  {'Resampler':>10s}")
+        print(f"    {'--------':>12s}  {'-------':>10s}  {'---':>8s}  {'-----':>8s}  {'-----':>8s}  {'---------':>10s}")
 
-        audio = demodulate_with_settling(decoder, iq_noisy)
+        ihf_by_level = []
+        blend_by_level = []
 
-        pilot_detected = decoder.pilot_detected
-        blend_factor = decoder.stereo_blend_factor
+        for level_idx, input_snr in enumerate(input_snr_levels):
+            # Deterministic per-row noise for reproducible CI output.
+            rng = np.random.default_rng(20260208 + path_idx * 100 + level_idx)
+            noise_power = signal_power_mono / (10 ** (input_snr / 10))
+            noise = np.sqrt(noise_power / 2) * (
+                rng.standard_normal(n_samples) + 1j * rng.standard_normal(n_samples)
+            )
+            iq_noisy = iq_clean_mono + noise.astype(np.complex64)
 
-        skip = int(0.1 * audio_rate)
-        left_out = audio[skip:-skip, 0]
-        output_snr = measure_snr(left_out, test_freq, audio_rate)
+            decoder = decoder_class(
+                iq_sample_rate=iq_rate,
+                audio_sample_rate=audio_rate,
+                deviation=75000,
+                deemphasis=75e-6,
+                resampler_mode=resampler_mode,
+                resampler_taps=resampler_taps,
+                resampler_beta=resampler_beta,
+            )
+            decoder.bass_boost_enabled = False
+            decoder.treble_boost_enabled = False
+            decoder.stereo_blend_enabled = True
 
-        print(f"  {input_snr:10d} dB  {output_snr:10.1f} dB  {'Yes' if pilot_detected else 'No':>8s}  {blend_factor:8.2f}")
+            audio = demodulate_with_settling(decoder, iq_noisy)
+            pilot_detected = decoder.pilot_detected
+            blend_factor = decoder.stereo_blend_factor
+            runtime_resampler = getattr(decoder, "_resampler_runtime_mode", decoder.resampler_mode)
 
-        if input_snr >= 40 and output_snr < 30:
+            skip = int(0.1 * audio_rate)
+            left_out = audio[skip:-skip, 0]
+            output_snr = measure_ihf_tone_snr(
+                left_out,
+                test_freq,
+                audio_rate,
+                a_weight_sos=a_weight_sos,
+                signal_bw=100,
+            )
+
+            # Left-only companion run for stereo separation at this RF SNR.
+            rng_sep = np.random.default_rng(20260208 + path_idx * 100 + level_idx + 10_000)
+            noise_power_sep = signal_power_sep / (10 ** (input_snr / 10))
+            noise_sep = np.sqrt(noise_power_sep / 2) * (
+                rng_sep.standard_normal(n_samples) + 1j * rng_sep.standard_normal(n_samples)
+            )
+            iq_noisy_sep = iq_clean_sep + noise_sep.astype(np.complex64)
+
+            decoder_sep = decoder_class(
+                iq_sample_rate=iq_rate,
+                audio_sample_rate=audio_rate,
+                deviation=75000,
+                deemphasis=75e-6,
+                resampler_mode=resampler_mode,
+                resampler_taps=resampler_taps,
+                resampler_beta=resampler_beta,
+            )
+            decoder_sep.bass_boost_enabled = False
+            decoder_sep.treble_boost_enabled = False
+            decoder_sep.stereo_blend_enabled = True
+
+            audio_sep = demodulate_with_settling(decoder_sep, iq_noisy_sep)
+            left_sep = audio_sep[skip:-skip, 0]
+            right_sep = audio_sep[skip:-skip, 1]
+            sep_left_power = goertzel_power(left_sep, test_freq, audio_rate)
+            sep_right_power = goertzel_power(right_sep, test_freq, audio_rate)
+            separation_db = 10 * np.log10((sep_left_power + 1e-20) / (sep_right_power + 1e-20))
+            runtime_resampler_sep = getattr(decoder_sep, "_resampler_runtime_mode", decoder_sep.resampler_mode)
+
+            print(
+                f"    {input_snr:10d} dB  {output_snr:8.1f} dB  {separation_db:6.1f} dB  "
+                f"{'Yes' if pilot_detected else 'No':>8s}  {blend_factor:8.2f}  {runtime_resampler:>10s}"
+            )
+
+            ihf_by_level.append(output_snr)
+            blend_by_level.append(blend_factor)
+
+            if not pilot_detected:
+                all_passed = False
+            if runtime_resampler != "firdecim":
+                all_passed = False
+            if runtime_resampler_sep != "firdecim":
+                all_passed = False
+
+        # Graceful degradation checks:
+        # Pre-blend region should decline with RF SNR.
+        if not (ihf_by_level[0] > ihf_by_level[1] > ihf_by_level[2] > ihf_by_level[3]):
             all_passed = False
+        # As blend engages (15 dB), quality should not cliff; it may flatten/recover.
+        if ihf_by_level[4] < ihf_by_level[3] - 2.0:
+            all_passed = False
+        # Adjacent low-SNR bumps should be limited. Allow a larger final bump
+        # when blend has collapsed near mono (can substantially reduce stereo
+        # noise on very weak signals).
+        if ihf_by_level[4] > ihf_by_level[3] + 2.0:
+            all_passed = False
+        if ihf_by_level[5] > ihf_by_level[4] + 6.0:
+            all_passed = False
+        # Very low RF SNR should trigger blend-to-mono behavior.
+        if blend_by_level[-1] > 0.20:
+            all_passed = False
+        # At high RF SNR we should remain mostly stereo.
+        if blend_by_level[0] < 0.50:
+            all_passed = False
+        # Blend handoff should be clearly underway by 20 dB.
+        if blend_by_level[3] > 0.75:
+            all_passed = False
+        # Blend factor should not increase as RF SNR worsens (allow tiny jitter).
+        for prev_blend, curr_blend in zip(blend_by_level, blend_by_level[1:]):
+            if curr_blend > prev_blend + 0.03:
+                all_passed = False
 
-    print(f"\n  Result: {'PASS' if all_passed else 'FAIL'} (graceful degradation)")
+    print(f"\n  Result: {'PASS' if all_passed else 'FAIL'} (IHF metric + firdecim path verified)")
 
     return all_passed
 
@@ -1101,25 +1232,6 @@ def test_ihf_snr():
     # Design A-weighting filter at audio rate
     a_weight_sos = design_a_weighting(audio_rate)
 
-    def measure_ihf_snr(audio_channel):
-        """A-weight audio and measure tone-vs-residual SNR."""
-        weighted = signal.sosfilt(a_weight_sos, audio_channel)
-        n = len(weighted)
-        window = np.hanning(n)
-        x_w = weighted * window
-
-        fft_out = np.fft.rfft(x_w)
-        freqs = np.fft.rfftfreq(n, 1.0 / audio_rate)
-        power_spec = np.abs(fft_out) ** 2 / n
-
-        tone_mask = np.abs(freqs - test_freq) <= 50
-        tone_power = np.sum(power_spec[tone_mask])
-        residual_power = np.sum(power_spec[~tone_mask])
-
-        if residual_power <= 0:
-            return np.inf
-        return 10 * np.log10(tone_power / residual_power)
-
     # --- Stereo test ---
     decoder_stereo = FMStereoDecoder(
         iq_sample_rate=iq_rate,
@@ -1135,7 +1247,7 @@ def test_ihf_snr():
     skip = int(0.1 * audio_rate)
     left_stereo = audio_stereo[skip:-skip, 0]
 
-    stereo_ihf = measure_ihf_snr(left_stereo)
+    stereo_ihf = measure_ihf_tone_snr(left_stereo, test_freq, audio_rate, a_weight_sos, signal_bw=100)
 
     # Pilot-referenced SNR for comparison
     pilot_snr = decoder_stereo.snr_db if hasattr(decoder_stereo, 'snr_db') else 0.0
@@ -1155,7 +1267,7 @@ def test_ihf_snr():
     audio_mono = demodulate_with_settling(decoder_mono, iq_noisy)
     left_mono = audio_mono[skip:-skip, 0]
 
-    mono_ihf = measure_ihf_snr(left_mono)
+    mono_ihf = measure_ihf_tone_snr(left_mono, test_freq, audio_rate, a_weight_sos, signal_bw=100)
 
     print(f"  IQ rate:             {iq_rate/1000:.0f} kHz")
     print(f"  RF SNR:              {rf_snr_db} dB")

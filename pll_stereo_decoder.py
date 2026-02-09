@@ -21,6 +21,7 @@ from demodulator import (
     _normalize_resampler_mode,
     _StreamingLinearResampler,
     _StreamingFIRDecimator,
+    _ema_alpha_from_tau,
 )
 
 
@@ -120,6 +121,9 @@ class PLLStereoDecoder:
         self._snr_db = 0.0
         self._noise_power = 1e-10
         self.pilot_bandwidth = 1000
+        # Time constants (seconds) for block-size-invariant state smoothing.
+        self._pilot_level_tau_s = 0.16
+        self._noise_power_tau_s = 0.16
 
         # Peak amplitude tracking
         self._peak_amplitude = 0.0
@@ -140,8 +144,11 @@ class PLLStereoDecoder:
         # Stereo blend settings
         self.stereo_blend_enabled = True
         self.stereo_blend_low = 10.0
-        self.stereo_blend_high = 20.0
+        # Slightly higher upper threshold keeps low-SNR operation closer to
+        # mono, improving the IHF/separation balance around ~15 dB RF SNR.
+        self.stereo_blend_high = 35.0
         self._blend_factor = 1.0
+        self._blend_tau_s = 0.12
 
         # L-R path gain calibration (helps recover separation lost to small
         # fixed gain mismatch between L+R and L-R decode paths).
@@ -524,7 +531,12 @@ class PLLStereoDecoder:
 
         # Measure pilot level for SNR (still needed even with PLL lock detection)
         pilot_power = np.sqrt(np.mean(pilot ** 2))
-        self._pilot_level = 0.9 * self._pilot_level + 0.1 * pilot_power
+        # Smooth pilot level with a continuous-time constant so behavior is
+        # consistent across different input block sizes.
+        pilot_alpha = _ema_alpha_from_tau(
+            self._pilot_level_tau_s, len(baseband), self.iq_sample_rate
+        )
+        self._pilot_level += pilot_alpha * (pilot_power - self._pilot_level)
 
         if profiling:
             t0 = self._prof('pilot_bpf', t0)
@@ -543,15 +555,20 @@ class PLLStereoDecoder:
             noise_power = np.mean(noise_filtered ** 2)
             pilot_pwr = self._pilot_level ** 2
             noise_in_pilot_bw = noise_power * (self.pilot_bandwidth / self.noise_bandwidth)
-            self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_in_pilot_bw, 1e-12)
+            noise_alpha = _ema_alpha_from_tau(
+                self._noise_power_tau_s, len(baseband), self.iq_sample_rate
+            )
+            noise_target = max(noise_in_pilot_bw, 1e-12)
+            self._noise_power += noise_alpha * (noise_target - self._noise_power)
             if self._noise_power > 0 and pilot_pwr > 0:
                 self._snr_db = 10 * np.log10(pilot_pwr / self._noise_power)
 
         if profiling:
             t0 = self._prof('noise_bpf', t0)
 
-        # Use PLL lock state for stereo gating
-        stereo_allowed = self._pll_locked and not self.force_mono and self._snr_db >= self.stereo_blend_low
+        # Use PLL lock for stereo gating; SNR blend handles mono transition
+        # continuously to avoid threshold-induced steps.
+        stereo_allowed = self._pll_locked and not self.force_mono
 
         # Extract L+R (mono, 0-15 kHz)
         lr_sum, self.lr_sum_lpf_state = sp_signal.lfilter(
@@ -600,7 +617,10 @@ class PLLStereoDecoder:
             if self.stereo_blend_enabled:
                 target_blend = (self._snr_db - self.stereo_blend_low) / (self.stereo_blend_high - self.stereo_blend_low)
                 target_blend = max(0.0, min(1.0, target_blend))
-                self._blend_factor = 0.95 * self._blend_factor + 0.05 * target_blend
+                blend_alpha = _ema_alpha_from_tau(
+                    self._blend_tau_s, len(baseband), self.iq_sample_rate
+                )
+                self._blend_factor += blend_alpha * (target_blend - self._blend_factor)
                 left = self._blend_factor * left_stereo + (1.0 - self._blend_factor) * lr_sum
                 right = self._blend_factor * right_stereo + (1.0 - self._blend_factor) * lr_sum
             else:

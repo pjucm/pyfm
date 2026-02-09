@@ -11,6 +11,26 @@ import numpy as np
 from scipy import signal
 
 
+def _ema_alpha_from_tau(tau_s, samples, sample_rate_hz):
+    """
+    Convert a continuous-time EMA time constant to a block update alpha.
+
+    Using this keeps smoothing behavior stable even if demodulate() is called
+    with different block sizes.
+    """
+    n = int(samples)
+    if n <= 0:
+        return 1.0
+    tau = float(tau_s)
+    if tau <= 0.0:
+        return 1.0
+    fs = float(sample_rate_hz)
+    if fs <= 0.0:
+        return 1.0
+    alpha = 1.0 - np.exp(-n / (tau * fs))
+    return float(max(0.0, min(1.0, alpha)))
+
+
 def _validate_odd_taps(value, name, minimum=3):
     """Return validated odd FIR tap count."""
     taps = int(value)
@@ -227,7 +247,7 @@ class FMStereoDecoder:
         # - Below 0.8 of Nyquist for good filter performance at all sample rates
         # At 480 kHz (R8600): 100-110 kHz is 0.42-0.46 of Nyquist (240 kHz) - good
         # Narrower band avoids residual energy from stereo/RDS harmonics below 100 kHz
-        noise_low_hz = 90000
+        noise_low_hz = 95000
         noise_high_hz = 100000
         noise_low = noise_low_hz / nyq
         noise_high = min(noise_high_hz / nyq, 0.90)
@@ -244,6 +264,9 @@ class FMStereoDecoder:
         self._snr_db = 0.0
         self._noise_power = 1e-10
         self.pilot_bandwidth = 1000  # Hz (18.5-19.5 kHz BPF)
+        # Time constants (seconds) for block-size-invariant state smoothing.
+        self._pilot_level_tau_s = 0.16
+        self._noise_power_tau_s = 0.16
 
         # Peak amplitude tracking (for clipping detection)
         self._peak_amplitude = 0.0
@@ -269,11 +292,12 @@ class FMStereoDecoder:
         # Stereo blend settings (blend to mono when SNR is low)
         # Thresholds based on pilot SNR measurement:
         # - 10 dB: weak signal, use mono to reduce noise
-        # - 20 dB: good signal, full stereo separation
+        # - 30 dB: good signal, full stereo separation
         self.stereo_blend_enabled = True
-        self.stereo_blend_low = 10.0     # Below this SNR: full mono
-        self.stereo_blend_high = 20.0   # Above this SNR: full stereo
+        self.stereo_blend_low = 6.0      # Below this SNR: full mono
+        self.stereo_blend_high = 18.0   # Above this SNR: full stereo
         self._blend_factor = 1.0        # Current blend (0=mono, 1=stereo)
+        self._blend_tau_s = 0.12
 
         # Per-stage profiling (EMA-smoothed, microseconds)
         self.profile_enabled = False
@@ -506,8 +530,12 @@ class FMStereoDecoder:
 
         # Measure pilot level for detection
         pilot_power = np.sqrt(np.mean(pilot ** 2))
-        # Smooth the pilot level measurement
-        self._pilot_level = 0.9 * self._pilot_level + 0.1 * pilot_power
+        # Smooth pilot level with a continuous-time constant so behavior is
+        # consistent across different input block sizes.
+        pilot_alpha = _ema_alpha_from_tau(
+            self._pilot_level_tau_s, len(baseband), self.iq_sample_rate
+        )
+        self._pilot_level += pilot_alpha * (pilot_power - self._pilot_level)
         pilot_present = self._pilot_level > self.pilot_threshold
         self._pilot_detected = pilot_present
 
@@ -530,8 +558,12 @@ class FMStereoDecoder:
             # Pilot BPF: 1 kHz, Noise BPF: 10 kHz
             noise_in_pilot_bw = noise_power * (self.pilot_bandwidth / self.noise_bandwidth)
 
-            # Smooth the noise measurement
-            self._noise_power = 0.9 * self._noise_power + 0.1 * max(noise_in_pilot_bw, 1e-12)
+            # Smooth noise estimate with the same block-size-invariant model.
+            noise_alpha = _ema_alpha_from_tau(
+                self._noise_power_tau_s, len(baseband), self.iq_sample_rate
+            )
+            noise_target = max(noise_in_pilot_bw, 1e-12)
+            self._noise_power += noise_alpha * (noise_target - self._noise_power)
 
             # Calculate SNR in dB (pilot power vs noise in same bandwidth)
             if self._noise_power > 0 and pilot_power > 0:
@@ -540,9 +572,9 @@ class FMStereoDecoder:
         if profiling:
             t0 = self._prof('noise_bpf', t0)
 
-        # Gate stereo decode on pilot presence and SNR to avoid expensive
-        # L-R processing when the signal is too weak to be useful.
-        stereo_allowed = pilot_present and not self.force_mono and self._snr_db >= self.stereo_blend_low
+        # Gate stereo decode on pilot presence only; SNR-based blend handles
+        # the mono transition continuously to avoid threshold-induced steps.
+        stereo_allowed = pilot_present and not self.force_mono
 
         # Extract L+R (mono, 0-15 kHz)
         lr_sum, self.lr_sum_lpf_state = signal.lfilter(
@@ -594,8 +626,12 @@ class FMStereoDecoder:
                 # Calculate blend factor from SNR (smoothed for stability)
                 target_blend = (self._snr_db - self.stereo_blend_low) / (self.stereo_blend_high - self.stereo_blend_low)
                 target_blend = max(0.0, min(1.0, target_blend))
-                # Smooth blend factor to avoid sudden changes
-                self._blend_factor = 0.95 * self._blend_factor + 0.05 * target_blend
+                # Smooth blend with a time-constant so behavior is independent
+                # of demodulate() block sizing.
+                blend_alpha = _ema_alpha_from_tau(
+                    self._blend_tau_s, len(baseband), self.iq_sample_rate
+                )
+                self._blend_factor += blend_alpha * (target_blend - self._blend_factor)
 
                 # Blend: 0 = mono (lr_sum), 1 = full stereo
                 left = self._blend_factor * left_stereo + (1.0 - self._blend_factor) * lr_sum
