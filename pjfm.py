@@ -1901,14 +1901,16 @@ def build_display(radio, width=80):
         rt_text = Text(rt_display, style="green")
         table.add_row("Text:", rt_text)
 
-        # Clock time line
-        ct_text = Text(clock_time, style="magenta") if clock_time else Text()
-        table.add_row("Time:", ct_text)
+        # Clock time line (only show when populated)
+        if clock_time:
+            ct_text = Text(clock_time, style="magenta")
+            table.add_row("Time:", ct_text)
 
-        # RT+ line (Title/Artist/Album extracted from RadioText Plus tags)
-        rtplus_display = f"Title: {rtplus_title}  Artist: {rtplus_artist}  Album: {rtplus_album}"
-        rtplus_text = Text(rtplus_display, style="green")
-        table.add_row("RT+:", rtplus_text)
+        # RT+ line (only show when at least one field is populated)
+        if rtplus_title or rtplus_artist or rtplus_album:
+            rtplus_display = f"Title: {rtplus_title}  Artist: {rtplus_artist}  Album: {rtplus_album}"
+            rtplus_text = Text(rtplus_display, style="green")
+            table.add_row("RT+:", rtplus_text)
     else:
         rds_snapshot = {}  # For RDS status section below
 
