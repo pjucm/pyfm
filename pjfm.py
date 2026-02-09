@@ -1916,20 +1916,22 @@ def build_display(radio, width=80):
 
     table.add_row("", "")  # Spacer
 
-    # Spectrum analyzer status
-    af_spectrum_text = Text()
+    # Spectrum analyzer status (consolidated AF/RF line)
+    spectrum_text = Text()
+    spectrum_text.append("AF:", style="")
+    spectrum_text.append(" ", style="")
     if radio.spectrum_enabled:
-        af_spectrum_text.append("ON", style="green bold")
+        spectrum_text.append("ON", style="green bold")
     else:
-        af_spectrum_text.append("OFF", style="dim")
-    table.add_row("AF Spectrum:", af_spectrum_text)
-
-    rf_spectrum_text = Text()
+        spectrum_text.append("OFF", style="dim")
+    spectrum_text.append("  ", style="")
+    spectrum_text.append("RF:", style="")
+    spectrum_text.append(" ", style="")
     if radio.rf_spectrum_enabled:
-        rf_spectrum_text.append("ON", style="green bold")
+        spectrum_text.append("ON", style="green bold")
     else:
-        rf_spectrum_text.append("OFF", style="dim")
-    table.add_row("RF Spectrum:", rf_spectrum_text)
+        spectrum_text.append("OFF", style="dim")
+    table.add_row("Spectrum:", spectrum_text)
 
     # Squelch status
     squelch_text = Text()
