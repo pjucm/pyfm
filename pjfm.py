@@ -684,6 +684,9 @@ class FMRadio:
     STEREO_BLEND_LOW_DB_DEFAULT = 5.0
     STEREO_BLEND_HIGH_DB_DEFAULT = 25.0
     RDS_AUTO_SNR_MIN_DB = 5.0
+    FM_FIRST_CHANNEL_HZ = 88_100_000
+    FM_LAST_CHANNEL_HZ = 107_900_000
+    FM_STEP_HZ = 200_000
 
     # Signal level calibration offset (dB)
     # IQ samples need calibration to match true power in dBm.
@@ -1378,6 +1381,34 @@ class FMRadio:
         """Get last measured signal strength in dBm."""
         return self.signal_dbm  # No lock needed for single float read
 
+    @classmethod
+    def _step_fm_channel(cls, freq_hz, direction):
+        """
+        Step to the next/previous FM channel on the NA 200 kHz grid.
+
+        Channel grid is 88.1-107.9 MHz in 200 kHz increments.
+        `direction` > 0 steps up, < 0 steps down with wrap-around.
+        """
+        freq_i = int(round(freq_hz))
+        first = cls.FM_FIRST_CHANNEL_HZ
+        last = cls.FM_LAST_CHANNEL_HZ
+        step = cls.FM_STEP_HZ
+
+        if direction > 0:
+            if freq_i < first:
+                return float(first)
+            if freq_i >= last:
+                return float(first)
+            idx = (freq_i - first) // step
+            return float(first + (idx + 1) * step)
+
+        if freq_i <= first:
+            return float(last)
+        if freq_i > last:
+            return float(last)
+        prev_idx = (freq_i - first - 1) // step
+        return float(first + prev_idx * step)
+
     def tune_up(self):
         """Tune up by 200 kHz (FM) or 25 kHz (Weather)."""
         self.is_tuning = True
@@ -1391,8 +1422,9 @@ class FMRadio:
             self.device.flush_iq()
             self.nbfm_decoder.reset()
         else:
-            # FM broadcast: 200 kHz steps (North American standard)
-            self.device.tune_up()
+            # FM broadcast: step on NA channel grid (88.1-107.9 MHz)
+            new_freq = self._step_fm_channel(self.device.frequency, direction=1)
+            self.device.set_frequency(new_freq)
             self.device.flush_iq()
             self.stereo_decoder.reset()
             if self.rds_decoder:
@@ -1417,8 +1449,9 @@ class FMRadio:
             self.device.flush_iq()
             self.nbfm_decoder.reset()
         else:
-            # FM broadcast: 200 kHz steps (North American standard)
-            self.device.tune_down()
+            # FM broadcast: step on NA channel grid (88.1-107.9 MHz)
+            new_freq = self._step_fm_channel(self.device.frequency, direction=-1)
+            self.device.set_frequency(new_freq)
             self.device.flush_iq()
             self.stereo_decoder.reset()
             if self.rds_decoder:
