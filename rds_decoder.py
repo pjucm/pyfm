@@ -11,7 +11,7 @@ Signal processing chain:
 - Differential decoding (RDS uses differential encoding)
 - Symbol timing recovery via Gardner TED
 - Syndrome-based block synchronization
-- Standard group decoding (PS, PTY, PI, RT)
+- Standard group decoding (PS, PTY, PI, RT, CT, RT+)
 """
 
 import numpy as np
@@ -36,6 +36,12 @@ OFFSET_WORDS = {
     'Cp': 0x350,  # C' used in type B groups
     'D':  0x1B4,
 }
+
+# RT+ Open Data Application
+RTPLUS_AID = 0x4BD7
+RTPLUS_CONTENT_TITLE = 1
+RTPLUS_CONTENT_ALBUM = 2
+RTPLUS_CONTENT_ARTIST = 4
 
 # Error correction lookup table: maps error syndromes to (error_mask, burst_length)
 # Built by computing syndromes for all burst errors up to 5 bits at all positions
@@ -332,6 +338,14 @@ class RDSDecoder:
         self._rt_chars = [' '] * 64
         self._rt_flag = 0
         self._ct_time = None  # (hour, minute, utc_offset_half_hours) or None
+
+        # RT+ (RadioText Plus)
+        self._rtplus_group_code = None  # 5-bit group code from Group 3A ODA announcement
+        self._rtplus_item_toggle = None
+        self._rtplus_item_running = None
+        self._rtplus_title = None
+        self._rtplus_artist = None
+        self._rtplus_album = None
 
         # Statistics
         self.groups_received = 0
@@ -1040,13 +1054,19 @@ class RDSDecoder:
         # Track group type distribution
         gt_key = f"{group_type}{'A' if version == 0 else 'B'}"
         self.group_type_counts[gt_key] = self.group_type_counts.get(gt_key, 0) + 1
+        group_code = (group_type << 1) | version
 
         if group_type == 0:
             self._decode_group_0(block_b, block_c, block_d, version)
         elif group_type == 2:
             self._decode_group_2(block_b, block_c, block_d, version)
+        elif group_type == 3 and version == 0:
+            self._decode_group_3a(block_b, block_c, block_d)
         elif group_type == 4 and version == 0:
             self._decode_group_4a(block_b, block_c, block_d)
+
+        if self._rtplus_group_code is not None and group_code == self._rtplus_group_code:
+            self._decode_rtplus_group(block_b, block_c, block_d)
 
     def _decode_group_0(self, block_b, block_c, block_d, version):
         """Decode Group 0A/0B: Program Service name."""
@@ -1084,6 +1104,7 @@ class RDSDecoder:
         if text_flag != self._rt_flag:
             self._rt_flag = text_flag
             self._rt_chars = [' '] * 64
+            self._clear_rtplus_items()
 
         if version == 0:
             pos = segment * 4
@@ -1107,6 +1128,79 @@ class RDSDecoder:
                 self._rt_chars[pos] = chr(char1)
             if pos + 1 < 64 and 0x20 <= char2 <= 0x7E:
                 self._rt_chars[pos + 1] = chr(char2)
+
+    def _decode_group_3a(self, block_b, block_c, block_d):
+        """Decode Group 3A ODA announcements (used for RT+ AID mapping)."""
+        app_group_code = block_b & 0x1F
+        aid = block_d & 0xFFFF
+
+        if aid == RTPLUS_AID:
+            self._rtplus_group_code = app_group_code
+        elif self._rtplus_group_code == app_group_code:
+            # Another ODA claimed this group code, so RT+ mapping is no longer valid.
+            self._rtplus_group_code = None
+            self._clear_rtplus_items()
+
+    def _decode_rtplus_group(self, block_b, block_c, block_d):
+        """Decode an RT+ ODA application group."""
+        item_toggle = (block_b >> 4) & 0x01
+        item_running = (block_b >> 3) & 0x01
+
+        if self._rtplus_item_toggle is not None and item_toggle != self._rtplus_item_toggle:
+            # RT+ item toggle indicates metadata changed; drop stale extracted fields.
+            self._clear_rtplus_items()
+
+        self._rtplus_item_toggle = item_toggle
+        self._rtplus_item_running = item_running
+
+        content_type_1 = ((block_b & 0x07) << 3) | ((block_c >> 13) & 0x07)
+        start_1 = (block_c >> 7) & 0x3F
+        length_1 = (block_c >> 1) & 0x3F
+        content_type_2 = ((block_c & 0x01) << 5) | ((block_d >> 11) & 0x1F)
+        start_2 = (block_d >> 5) & 0x3F
+        length_2 = block_d & 0x1F
+
+        self._apply_rtplus_tag(content_type_1, start_1, length_1)
+        self._apply_rtplus_tag(content_type_2, start_2, length_2)
+
+    def _apply_rtplus_tag(self, content_type, start_marker, length_marker):
+        """Apply one RT+ content tag to the current RadioText buffer."""
+        if content_type not in (
+            RTPLUS_CONTENT_TITLE,
+            RTPLUS_CONTENT_ARTIST,
+            RTPLUS_CONTENT_ALBUM,
+        ):
+            return
+
+        text = ''.join(self._rt_chars)
+        if not text.strip():
+            return
+
+        # RT+ length markers encode "additional characters", so value is marker + 1.
+        length = int(length_marker) + 1
+        start = int(start_marker)
+        end = start + length
+        if start < 0 or end > len(text):
+            return
+
+        value = text[start:end].strip()
+        if not value:
+            return
+
+        if content_type == RTPLUS_CONTENT_TITLE:
+            self._rtplus_title = value
+        elif content_type == RTPLUS_CONTENT_ARTIST:
+            self._rtplus_artist = value
+        elif content_type == RTPLUS_CONTENT_ALBUM:
+            self._rtplus_album = value
+
+    def _clear_rtplus_items(self):
+        """Clear parsed RT+ content items."""
+        self._rtplus_item_toggle = None
+        self._rtplus_item_running = None
+        self._rtplus_title = None
+        self._rtplus_artist = None
+        self._rtplus_album = None
 
     def _decode_group_4a(self, block_b, block_c, block_d):
         """
@@ -1157,6 +1251,10 @@ class RDSDecoder:
             'pty_code': self._pty,
             'radio_text': self.radio_text,
             'clock_time': self.clock_time,
+            'rtplus_title': self.rtplus_title,
+            'rtplus_artist': self.rtplus_artist,
+            'rtplus_album': self.rtplus_album,
+            'rtplus_item_running': self._rtplus_item_running,
             'synced': self.synced and self.sync_confidence >= 3,
             'groups_received': self.groups_received,
             'blocks_received': self.blocks_received,
@@ -1218,6 +1316,21 @@ class RDSDecoder:
             offset_str = f"{offset_hours}:{abs(offset_half):02d}"
         return f"{hour:02d}:{minute:02d} UTC{offset_str}"
 
+    @property
+    def rtplus_title(self):
+        """Get RT+ title tag (ITEM.TITLE) if available."""
+        return self._rtplus_title
+
+    @property
+    def rtplus_artist(self):
+        """Get RT+ artist tag (ITEM.ARTIST) if available."""
+        return self._rtplus_artist
+
+    @property
+    def rtplus_album(self):
+        """Get RT+ album tag (ITEM.ALBUM) if available."""
+        return self._rtplus_album
+
     def reset(self):
         """Reset decoder state."""
         # Filter states
@@ -1262,6 +1375,12 @@ class RDSDecoder:
         self._rt_chars = [' '] * 64
         self._rt_flag = 0
         self._ct_time = None
+        self._rtplus_group_code = None
+        self._rtplus_item_toggle = None
+        self._rtplus_item_running = None
+        self._rtplus_title = None
+        self._rtplus_artist = None
+        self._rtplus_album = None
 
         # Statistics
         self.groups_received = 0

@@ -111,6 +111,37 @@ def _encode_group_4a(pi_code, pty, mjd, hour, minute, offset_half_hours):
     return _group_to_bits(block_a, block_b, block_c, block_d)
 
 
+def _encode_group_3a_rtplus_announcement(pi_code, pty, app_group_type, app_version):
+    """Encode Group 3A announcing RT+ ODA AID (0x4BD7)."""
+    app_group_code = ((app_group_type & 0x0F) << 1) | (app_version & 0x01)
+    block_a = pi_code
+    block_b = (3 << 12) | (0 << 11) | (pty << 5) | app_group_code
+    block_c = 0x0000
+    block_d = 0x4BD7
+    return block_a, block_b, block_c, block_d
+
+
+def _encode_rtplus_group(pi_code, pty, group_type, item_toggle, item_running,
+                         ct1, start1, length1_marker, ct2, start2, length2_marker):
+    """Encode an RT+ ODA group payload for a given A-group type (e.g., 11A)."""
+    payload = (
+        ((item_toggle & 0x01) << 36) |
+        ((item_running & 0x01) << 35) |
+        ((ct1 & 0x3F) << 29) |
+        ((start1 & 0x3F) << 23) |
+        ((length1_marker & 0x3F) << 17) |
+        ((ct2 & 0x3F) << 11) |
+        ((start2 & 0x3F) << 5) |
+        (length2_marker & 0x1F)
+    )
+
+    block_a = pi_code
+    block_b = (group_type << 12) | (0 << 11) | (pty << 5) | ((payload >> 32) & 0x1F)
+    block_c = (payload >> 16) & 0xFFFF
+    block_d = payload & 0xFFFF
+    return block_a, block_b, block_c, block_d
+
+
 def _build_bitstream(pi_code, pty, ps_name, radio_text, ct_hour, ct_minute,
                      ct_offset_half_hours, ct_mjd, repeats=2):
     """Build a full RDS bitstream with repeated groups for reliable sync."""
@@ -346,6 +377,114 @@ def test_rds_decode_noncoherent_no_pilot_smoke():
     assert result['blocks_expected'] > 0
     assert result['block_rate'] > 0.30
     assert result['synced'] is False or result['pi_hex'] in ('', expected['pi_hex'])
+
+
+def test_rtplus_extracts_title_artist_album():
+    decoder = RDSDecoder(sample_rate=250000)
+    pi_code = 0x54A8
+    pty = 1
+
+    decoder._rt_chars = list("My Song - The Artist - The Album".ljust(64))
+
+    # Announce RT+ on group 11A.
+    decoder.group_blocks = list(_encode_group_3a_rtplus_announcement(
+        pi_code=pi_code,
+        pty=pty,
+        app_group_type=11,
+        app_version=0,
+    ))
+    decoder._decode_group()
+
+    # First RT+ payload: title + artist.
+    decoder.group_blocks = list(_encode_rtplus_group(
+        pi_code=pi_code,
+        pty=pty,
+        group_type=11,
+        item_toggle=0,
+        item_running=1,
+        ct1=1,   # ITEM.TITLE
+        start1=0,
+        length1_marker=6,   # "My Song" (7 chars)
+        ct2=4,   # ITEM.ARTIST
+        start2=10,
+        length2_marker=9,   # "The Artist" (10 chars)
+    ))
+    decoder._decode_group()
+
+    # Second payload: album only, keep prior title/artist.
+    decoder.group_blocks = list(_encode_rtplus_group(
+        pi_code=pi_code,
+        pty=pty,
+        group_type=11,
+        item_toggle=0,
+        item_running=1,
+        ct1=2,   # ITEM.ALBUM
+        start1=23,
+        length1_marker=8,   # "The Album" (9 chars)
+        ct2=0,   # Dummy
+        start2=0,
+        length2_marker=0,
+    ))
+    decoder._decode_group()
+
+    result = decoder._get_result()
+    assert result['rtplus_title'] == "My Song"
+    assert result['rtplus_artist'] == "The Artist"
+    assert result['rtplus_album'] == "The Album"
+    assert result['rtplus_item_running'] == 1
+
+
+def test_rtplus_item_toggle_clears_stale_items():
+    decoder = RDSDecoder(sample_rate=250000)
+    pi_code = 0x54A8
+    pty = 1
+
+    decoder.group_blocks = list(_encode_group_3a_rtplus_announcement(
+        pi_code=pi_code,
+        pty=pty,
+        app_group_type=11,
+        app_version=0,
+    ))
+    decoder._decode_group()
+
+    decoder._rt_chars = list("Old Title - Old Artist".ljust(64))
+    decoder.group_blocks = list(_encode_rtplus_group(
+        pi_code=pi_code,
+        pty=pty,
+        group_type=11,
+        item_toggle=0,
+        item_running=1,
+        ct1=1,
+        start1=0,
+        length1_marker=8,   # "Old Title"
+        ct2=4,
+        start2=12,
+        length2_marker=9,   # "Old Artist"
+    ))
+    decoder._decode_group()
+    assert decoder.rtplus_title == "Old Title"
+    assert decoder.rtplus_artist == "Old Artist"
+
+    # New item_toggle should clear stale title before parsing new tags.
+    decoder._rt_chars = list("New Artist".ljust(64))
+    decoder.group_blocks = list(_encode_rtplus_group(
+        pi_code=pi_code,
+        pty=pty,
+        group_type=11,
+        item_toggle=1,
+        item_running=1,
+        ct1=4,
+        start1=0,
+        length1_marker=9,   # "New Artist"
+        ct2=0,
+        start2=0,
+        length2_marker=0,
+    ))
+    decoder._decode_group()
+
+    result = decoder._get_result()
+    assert result['rtplus_title'] is None
+    assert result['rtplus_artist'] == "New Artist"
 
 
 def run_rf_snr_sweep(sample_rate=250000, snr_values=None, trials=5,

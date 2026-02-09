@@ -1875,6 +1875,9 @@ def build_display(radio, width=80):
         pi_hex = rds_snapshot.get('pi_hex') if radio.rds_enabled else None
         radio_text_val = rds_snapshot.get('radio_text', '') if radio.rds_enabled else ''
         clock_time = rds_snapshot.get('clock_time', '') if radio.rds_enabled else ''
+        rtplus_title = (rds_snapshot.get('rtplus_title') or '') if radio.rds_enabled else ''
+        rtplus_artist = (rds_snapshot.get('rtplus_artist') or '') if radio.rds_enabled else ''
+        rtplus_album = (rds_snapshot.get('rtplus_album') or '') if radio.rds_enabled else ''
 
         # Station line: Callsign [Genre]
         callsign = pi_to_callsign(pi_hex) if pi_hex else None
@@ -1901,6 +1904,11 @@ def build_display(radio, width=80):
         # Clock time line
         ct_text = Text(clock_time, style="magenta") if clock_time else Text()
         table.add_row("Time:", ct_text)
+
+        # RT+ line (Title/Artist/Album extracted from RadioText Plus tags)
+        rtplus_display = f"Title: {rtplus_title}  Artist: {rtplus_artist}  Album: {rtplus_album}"
+        rtplus_text = Text(rtplus_display, style="green")
+        table.add_row("RT+:", rtplus_text)
     else:
         rds_snapshot = {}  # For RDS status section below
 
