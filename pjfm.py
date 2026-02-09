@@ -683,7 +683,7 @@ class FMRadio:
     # Blend curve defaults (linear in decoder): 15 dB -> 50% blend.
     STEREO_BLEND_LOW_DB_DEFAULT = 5.0
     STEREO_BLEND_HIGH_DB_DEFAULT = 25.0
-    RDS_AUTO_SNR_MIN_DB = 10.0
+    RDS_AUTO_SNR_MIN_DB = 5.0
 
     # Signal level calibration offset (dB)
     # IQ samples need calibration to match true power in dBm.
