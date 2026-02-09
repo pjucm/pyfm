@@ -22,6 +22,7 @@ Controls:
     Shift+1-5 (!@#$%): Set preset to current frequency (FM mode)
     w: Toggle Weather radio mode (NBFM for NWS)
     r: Toggle RDS decoder (FM mode only)
+    R: Start/stop Opus recording (128 kbps stereo)
     b: Toggle bass boost
     t: Toggle treble boost
     a: Toggle AF spectrum analyzer
@@ -74,6 +75,7 @@ except ImportError as e:
 from demodulator import FMStereoDecoder, NBFMDecoder
 from pll_stereo_decoder import PLLStereoDecoder
 from rds_decoder import RDSDecoder, pi_to_callsign
+from opus import OpusRecorder, build_recording_status_text
 
 
 def enable_realtime_mode():
@@ -737,6 +739,11 @@ class FMRadio:
             channels=2,
             latency=0.05  # 50ms driver latency; rate control handles drift
         )
+        self.recorder = OpusRecorder(
+            sample_rate=self.AUDIO_SAMPLE_RATE,
+            channels=2,
+            bitrate_kbps=128,
+        )
 
         # Stereo FM decoder (handles both stereo and mono signals)
         self.stereo_decoder = None
@@ -1057,6 +1064,11 @@ class FMRadio:
         if hasattr(self, '_rate_log_file') and self._rate_log_file:
             self._rate_log_file.close()
             self._rate_log_file = None
+        if self.recorder and self.recorder.is_recording:
+            try:
+                self.recorder.stop()
+            except Exception:
+                pass
         self.audio_player.stop()
         self.device.close()
 
@@ -1333,6 +1345,13 @@ class FMRadio:
                     audio = np.zeros_like(audio)
                     self._iq_loss_mute_remaining -= 1
 
+                # Write post-squelch audio to recorder (when enabled)
+                if self.recorder and self.recorder.is_recording:
+                    try:
+                        self.recorder.write(audio)
+                    except Exception as rec_exc:
+                        self.error_message = str(rec_exc)
+
                 # Update RF spectrum analyzer from baseband IQ
                 if self.rf_spectrum_enabled:
                     self.rf_spectrum_analyzer.update(iq)
@@ -1554,6 +1573,18 @@ class FMRadio:
         if self.rds_decoder:
             self.rds_decoder.reset()
         self.rds_data = {}
+
+    def toggle_recording(self):
+        """Toggle Opus recording on/off."""
+        if not self.recorder:
+            return None
+        try:
+            if self.recorder.is_recording:
+                return self.recorder.stop()
+            return self.recorder.start()
+        except Exception as exc:
+            self.error_message = str(exc)
+            return None
 
     def toggle_profile(self):
         """Toggle demodulator profiling on/off."""
@@ -1899,6 +1930,13 @@ def build_display(radio, width=80):
         else:
             stereo_text.append(f"Stereo ({blend:.0%})", style="yellow bold")
     table.add_row("Audio:", stereo_text)
+    if radio.recorder and radio.recorder.is_recording:
+        rec_text = build_recording_status_text(
+            is_recording=True,
+            elapsed_seconds=radio.recorder.elapsed_seconds,
+            output_path=radio.recorder.output_path,
+        )
+        table.add_row("Record:", rec_text)
 
     # RDS data display (FM mode only - hidden in weather mode or when forced off)
     if not radio.weather_mode and not radio.rds_forced_off:
@@ -2250,6 +2288,8 @@ def build_display(radio, width=80):
     if not radio.weather_mode:
         controls.append("r ", style="cyan bold")
         controls.append("RDS  ", style="dim")
+    controls.append("R ", style="cyan bold")
+    controls.append("Record  ", style="dim")
     controls.append("b ", style="cyan bold")
     controls.append("Bass  ", style="dim")
     controls.append("t ", style="cyan bold")
@@ -2491,10 +2531,14 @@ def run_rich_ui(radio):
                         # Toggle weather mode
                         radio.toggle_weather_mode()
                         input_buffer = input_buffer[1:]
-                    elif input_buffer[0] in ('r', 'R'):
+                    elif input_buffer[0] == 'r':
                         # Toggle RDS decoder (FM mode only)
                         if not radio.weather_mode:
                             radio.toggle_rds()
+                        input_buffer = input_buffer[1:]
+                    elif input_buffer[0] == 'R':
+                        # Toggle Opus recording
+                        radio.toggle_recording()
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] in ('b', 'B'):
                         # Toggle bass boost
