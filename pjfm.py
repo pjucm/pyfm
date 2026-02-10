@@ -1319,11 +1319,16 @@ class FMRadio:
                         self.auto_mode_enabled and
                         self.stereo_decoder):
                     # Keep RDS enable threshold conservative even if blend is tuned lower.
-                    snr_enable_min = max(self.RDS_AUTO_SNR_MIN_DB, self.stereo_decoder.stereo_blend_low)
-                    snr_ok = self.stereo_decoder.snr_db >= snr_enable_min
+                    quality_enable_min = max(
+                        self.RDS_AUTO_SNR_MIN_DB, self.stereo_decoder.stereo_blend_low
+                    )
+                    quality_db = getattr(
+                        self.stereo_decoder, "stereo_quality_db", self.stereo_decoder.snr_db
+                    )
+                    quality_ok = quality_db >= quality_enable_min
                     pilot_present = (self.stereo_decoder.pilot_detected and
                                      dbm >= self.squelch_threshold and
-                                     snr_ok)
+                                     quality_ok)
                     if pilot_present and not self.rds_enabled:
                         self.rds_enabled = True
                         # Reset decoder to clear any stale filter/timing state

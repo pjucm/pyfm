@@ -124,6 +124,17 @@ class PLLStereoDecoder:
         # Time constants (seconds) for block-size-invariant state smoothing.
         self._pilot_level_tau_s = 0.16
         self._noise_power_tau_s = 0.16
+        # Composite stereo quality metric used for blend/RDS gating.
+        # This falls back to pilot/PLL-derived quality when the legacy
+        # high-band (90-100 kHz) noise estimator is unavailable.
+        self._stereo_quality_db = -20.0
+        # Keep this faster than blend smoothing so stereo width does not spend
+        # a long time near mono after lock on clean signals.
+        self._stereo_quality_tau_s = 0.05
+        self._quality_phase_penalty_db = 20.0
+        self._quality_coherence_penalty_db = 12.0
+        self._quality_coherence_low = 0.30
+        self._quality_coherence_high = 0.70
 
         # Peak amplitude tracking
         self._peak_amplitude = 0.0
@@ -159,7 +170,10 @@ class PLLStereoDecoder:
 
         # --- PLL state ---
         # Second-order Type 2 PLL for 19 kHz pilot tracking
-        # Natural frequency Bn=30 Hz, damping ζ=0.707
+        # Adaptive loop bandwidth with fixed damping.
+        # - Acquisition: wide loop for fast pull-in
+        # - Tracking: nominal low-noise loop
+        # - Precision: narrow loop when quality is very high
         # Kp and Ki derived from standard PLL design equations:
         #   ωn = 2π·Bn / (ζ + 1/(4ζ)) ≈ 2π·30 / 1.4142 ≈ 133.3 rad/s
         #   Kp = 2·ζ·ωn / fs
@@ -168,10 +182,19 @@ class PLLStereoDecoder:
         self._pll_phase = 0.0           # NCO phase accumulator
         self._pll_integrator = 0.0      # Loop filter integrator
 
-        # PLL loop gains (Bn=30 Hz, ζ=0.707, fs=iq_sample_rate)
-        omega_n = 2 * np.pi * 30 / (0.707 + 1 / (4 * 0.707))  # ~133.3 rad/s
-        self._pll_Kp = 2 * 0.707 * omega_n / iq_sample_rate
-        self._pll_Ki = (omega_n ** 2) / (iq_sample_rate ** 2)
+        # PLL loop gains (adaptive Bn, fixed ζ, fs=iq_sample_rate)
+        self._pll_zeta = 0.707
+        self._pll_bw_acquire_hz = 100.0
+        self._pll_bw_track_hz = 30.0
+        # Precision mode narrows the loop under high quality for extra pilot
+        # noise rejection while keeping tracking behavior stable.
+        self._pll_bw_precision_hz = 20.0
+        self._pll_precision_enter_quality_db = 34.0
+        self._pll_precision_exit_quality_db = 26.0
+        self._pll_loop_bandwidth_hz = 0.0
+        self._pll_Kp = 0.0
+        self._pll_Ki = 0.0
+        self._set_pll_loop_bandwidth(self._pll_bw_acquire_hz)
 
         # Phase error IIR lowpass to remove 2×pilot (38 kHz) component.
         # Without this, the 38 kHz term in the PE biases the integrator and
@@ -195,6 +218,17 @@ class PLLStereoDecoder:
         self._pll_iq_alpha = 2 * np.pi * 300 / (iq_sample_rate + 2 * np.pi * 300)
         self._pll_i_lp = 0.0
         self._pll_q_lp = 0.0
+        self._pll_iq_mag = 0.0
+
+        # Additional lock gates based on pilot I/Q envelope and normalized phase.
+        # These prevent false-lock when phase-error energy is low but pilot energy
+        # is absent or too weak to support reliable stereo decoding.
+        self._pll_iq_lock_threshold = 0.003
+        self._pll_iq_unlock_threshold = 0.0015
+        self._pll_coherence_lock_threshold = 0.50
+        self._pll_coherence_unlock_threshold = 0.35
+        self._pll_phase_lock_threshold_deg = 30.0
+        self._pll_phase_unlock_threshold_deg = 45.0
 
         # Per-stage profiling
         self.profile_enabled = False
@@ -275,6 +309,11 @@ class PLLStereoDecoder:
         return self._snr_db
 
     @property
+    def stereo_quality_db(self):
+        """Return composite stereo quality metric in dB used for blending."""
+        return self._stereo_quality_db
+
+    @property
     def peak_amplitude(self):
         """Return peak amplitude (before limiting). >1.0 means limiter is active."""
         return self._peak_amplitude
@@ -346,11 +385,45 @@ class PLLStereoDecoder:
         """Return PLL frequency offset from nominal 19 kHz in Hz."""
         return self._pll_integrator * self.iq_sample_rate / (2 * np.pi)
 
+    @property
+    def pll_loop_bandwidth_hz(self):
+        """Return current adaptive PLL loop bandwidth in Hz."""
+        return self._pll_loop_bandwidth_hz
+
     def _prof(self, key, t0):
         """Record EMA-smoothed stage timing in microseconds."""
         elapsed = (time.perf_counter() - t0) * 1e6
         self._profile[key] = 0.9 * self._profile[key] + 0.1 * elapsed
         return time.perf_counter()
+
+    def _set_pll_loop_bandwidth(self, bandwidth_hz):
+        """Set PLL loop bandwidth and recompute loop gains."""
+        bn_hz = float(max(1.0, bandwidth_hz))
+        zeta = self._pll_zeta
+        omega_n = 2 * np.pi * bn_hz / (zeta + 1 / (4 * zeta))
+        self._pll_Kp = 2 * zeta * omega_n / self.iq_sample_rate
+        self._pll_Ki = (omega_n ** 2) / (self.iq_sample_rate ** 2)
+        self._pll_loop_bandwidth_hz = bn_hz
+
+    def _update_pll_loop_bandwidth(self):
+        """Adapt loop bandwidth based on lock state and stereo quality."""
+        if not self._pll_locked:
+            desired = self._pll_bw_acquire_hz
+        else:
+            in_precision = self._pll_loop_bandwidth_hz <= (self._pll_bw_precision_hz + 1e-9)
+            if in_precision:
+                precision_ok = self._stereo_quality_db >= self._pll_precision_exit_quality_db
+            else:
+                precision_ok = self._stereo_quality_db >= self._pll_precision_enter_quality_db
+            desired = self._pll_bw_precision_hz if precision_ok else self._pll_bw_track_hz
+
+        if abs(desired - self._pll_loop_bandwidth_hz) > 1e-9:
+            narrowing = desired < self._pll_loop_bandwidth_hz
+            self._set_pll_loop_bandwidth(desired)
+            if narrowing:
+                # Avoid carrying a wide-loop integrator bias into narrow-loop
+                # tracking, which can manifest as residual phase offset.
+                self._pll_integrator = 0.0
 
     def _pll_process(self, pilot_filtered):
         """
@@ -424,13 +497,24 @@ class PLLStereoDecoder:
         self._pll_pe_avg = pe_avg
         self._pll_i_lp = i_lp
         self._pll_q_lp = q_lp
+        iq_mag = np.sqrt(i_lp * i_lp + q_lp * q_lp)
+        self._pll_iq_mag = iq_mag
+
+        pe_lock_ok = pe_avg < self._pll_lock_threshold
+        pe_unlock = pe_avg > self._pll_unlock_threshold
+        iq_lock_ok = iq_mag > self._pll_iq_lock_threshold
+        iq_unlock = iq_mag < self._pll_iq_unlock_threshold
+        pilot_level = max(float(self._pilot_level), 1e-12)
+        coherence = np.clip(iq_mag / pilot_level, 0.0, 2.0)
+        coherence_lock_ok = coherence > self._pll_coherence_lock_threshold
+        coherence_unlock = coherence < self._pll_coherence_unlock_threshold
 
         # Lock detection with hysteresis
         if self._pll_locked:
-            if pe_avg > self._pll_unlock_threshold:
+            if pe_unlock or iq_unlock or coherence_unlock:
                 self._pll_locked = False
         else:
-            if pe_avg < self._pll_lock_threshold:
+            if pe_lock_ok and iq_lock_ok and coherence_lock_ok:
                 self._pll_locked = True
 
         return carrier_38k
@@ -566,6 +650,49 @@ class PLLStereoDecoder:
         if profiling:
             t0 = self._prof('noise_bpf', t0)
 
+        # Composite stereo quality metric:
+        # - Pilot envelope relative to lock floor
+        # - PLL phase quality (normalized residual)
+        # - Coherence between pilot RMS and PLL I/Q envelope
+        # - Legacy pilot-vs-highband-noise SNR (when available)
+        iq_mag = max(float(self._pll_iq_mag), 1e-12)
+        pilot_level = max(float(self._pilot_level), 1e-12)
+        pilot_floor = max(float(self._pll_iq_unlock_threshold) * 0.1, 1e-12)
+        pilot_metric_db = 20.0 * np.log10(iq_mag / pilot_floor)
+
+        phase_deg = float(self.pll_phase_error_deg)
+        phase_span = max(
+            float(self._pll_phase_unlock_threshold_deg - self._pll_phase_lock_threshold_deg),
+            1e-9,
+        )
+        phase_score = np.clip(
+            (self._pll_phase_unlock_threshold_deg - phase_deg) / phase_span,
+            0.0,
+            1.0,
+        )
+        phase_penalty_db = (phase_score - 1.0) * self._quality_phase_penalty_db
+
+        coherence = np.clip(iq_mag / pilot_level, 0.0, 2.0)
+        coherence_span = max(self._quality_coherence_high - self._quality_coherence_low, 1e-9)
+        coherence_score = np.clip(
+            (coherence - self._quality_coherence_low) / coherence_span,
+            0.0,
+            1.0,
+        )
+        coherence_penalty_db = (coherence_score - 1.0) * self._quality_coherence_penalty_db
+
+        quality_proxy_db = pilot_metric_db + phase_penalty_db + coherence_penalty_db
+        if self.noise_bpf is not None:
+            quality_target_db = min(self._snr_db, quality_proxy_db)
+        else:
+            quality_target_db = quality_proxy_db
+        quality_target_db = float(np.clip(quality_target_db, -20.0, 60.0))
+        quality_alpha = _ema_alpha_from_tau(
+            self._stereo_quality_tau_s, len(baseband), self.iq_sample_rate
+        )
+        self._stereo_quality_db += quality_alpha * (quality_target_db - self._stereo_quality_db)
+        self._update_pll_loop_bandwidth()
+
         # Use PLL lock for stereo gating; SNR blend handles mono transition
         # continuously to avoid threshold-induced steps.
         stereo_allowed = self._pll_locked and not self.force_mono
@@ -613,9 +740,12 @@ class PLLStereoDecoder:
             left_stereo = lr_sum + lr_diff
             right_stereo = lr_sum - lr_diff
 
-            # Stereo blend based on SNR
+            # Stereo blend based on composite stereo quality
             if self.stereo_blend_enabled:
-                target_blend = (self._snr_db - self.stereo_blend_low) / (self.stereo_blend_high - self.stereo_blend_low)
+                target_blend = (
+                    (self._stereo_quality_db - self.stereo_blend_low)
+                    / (self.stereo_blend_high - self.stereo_blend_low)
+                )
                 target_blend = max(0.0, min(1.0, target_blend))
                 blend_alpha = _ema_alpha_from_tau(
                     self._blend_tau_s, len(baseband), self.iq_sample_rate
@@ -721,6 +851,7 @@ class PLLStereoDecoder:
         # Reset SNR state
         self._snr_db = 0.0
         self._noise_power = 1e-10
+        self._stereo_quality_db = -20.0
         self._peak_amplitude = 0.0
         self._blend_factor = 1.0
 
@@ -738,3 +869,5 @@ class PLLStereoDecoder:
         self._pll_locked = False
         self._pll_i_lp = 0.0
         self._pll_q_lp = 0.0
+        self._pll_iq_mag = 0.0
+        self._set_pll_loop_bandwidth(self._pll_bw_acquire_hz)
