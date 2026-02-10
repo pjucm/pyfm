@@ -25,6 +25,105 @@ from demodulator import (
 )
 
 
+try:
+    from numba import njit
+except Exception:  # pragma: no cover - optional dependency
+    njit = None
+
+
+def _pll_process_kernel_python(
+    pilot_filtered,
+    phase,
+    integrator,
+    pe_filt,
+    pe_avg,
+    omega0,
+    kp,
+    ki,
+    pe_alpha,
+    iq_alpha,
+    lock_alpha,
+    i_lp,
+    q_lp,
+):
+    """Reference PLL inner loop (Python)."""
+    n = len(pilot_filtered)
+    carrier_38k = np.empty(n, dtype=np.float64)
+    two_pi = 2.0 * np.pi
+
+    for i in range(n):
+        cos_phase = np.cos(phase)
+        sin_phase = np.sin(phase)
+
+        # Use current phase for this sample's carrier output.
+        # Emitting after phase advance introduces an ~1-sample lead at 38 kHz,
+        # which directly degrades stereo separation.
+        carrier_38k[i] = 2.0 * cos_phase * cos_phase - 1.0
+
+        # Phase detector: multiply input by -sin(phase) of NCO
+        pe = pilot_filtered[i] * (-sin_phase)
+
+        # IIR lowpass to remove 2×pilot (38 kHz) from PE
+        pe_filt = pe_filt + pe_alpha * (pe - pe_filt)
+
+        # Low-pass pilot I/Q for normalized phase metric.
+        i_mix = pilot_filtered[i] * cos_phase
+        q_mix = pe
+        i_lp = i_lp + iq_alpha * (i_mix - i_lp)
+        q_lp = q_lp + iq_alpha * (q_mix - q_lp)
+
+        # PI loop filter
+        integrator += ki * pe_filt
+        correction = kp * pe_filt + integrator
+
+        # NCO: advance phase
+        phase += omega0 + correction
+        # Wrap to [0, 2π)
+        phase = phase % two_pi
+
+        # Lock detector: EMA of squared filtered phase error
+        pe_avg = pe_avg + lock_alpha * (pe_filt * pe_filt - pe_avg)
+
+    return carrier_38k, phase, integrator, pe_filt, pe_avg, i_lp, q_lp
+
+
+_pll_process_kernel_numba = None
+if njit is not None:  # pragma: no branch - one-time configuration
+    _pll_process_kernel_numba = njit(cache=True)(_pll_process_kernel_python)
+
+
+_NUMBA_PLL_KERNEL_READY = None
+
+
+def _numba_pll_kernel_available():
+    """Return True when Numba kernel can compile and run."""
+    global _NUMBA_PLL_KERNEL_READY
+    if _pll_process_kernel_numba is None:
+        return False
+    if _NUMBA_PLL_KERNEL_READY is None:
+        try:
+            pilot = np.zeros(1, dtype=np.float64)
+            _pll_process_kernel_numba(
+                pilot,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            _NUMBA_PLL_KERNEL_READY = True
+        except Exception:
+            _NUMBA_PLL_KERNEL_READY = False
+    return _NUMBA_PLL_KERNEL_READY
+
+
 class PLLStereoDecoder:
     """
     FM Stereo decoder using PLL-based carrier recovery.
@@ -37,7 +136,7 @@ class PLLStereoDecoder:
                  deviation=75000, deemphasis=75e-6, force_mono=False,
                  stereo_lpf_taps=127, stereo_lpf_beta=6.0,
                  resampler_mode="interp", resampler_taps=127,
-                 resampler_beta=8.0):
+                 resampler_beta=8.0, pll_kernel_mode="auto"):
         self.iq_sample_rate = iq_sample_rate
         self.audio_sample_rate = audio_sample_rate
         self.deviation = deviation
@@ -47,6 +146,23 @@ class PLLStereoDecoder:
         self.resampler_mode = _normalize_resampler_mode(resampler_mode)
         self.resampler_taps = _validate_odd_taps(resampler_taps, "resampler_taps")
         self.resampler_beta = float(resampler_beta)
+
+        mode = str(pll_kernel_mode).strip().lower()
+        if mode not in {"auto", "python", "numba"}:
+            raise ValueError("pll_kernel_mode must be one of: auto, python, numba")
+        if mode == "python":
+            backend = "python"
+        elif mode == "numba":
+            if not _numba_pll_kernel_available():
+                raise ValueError("pll_kernel_mode='numba' requested but Numba is unavailable")
+            backend = "numba"
+        else:
+            backend = "numba" if _numba_pll_kernel_available() else "python"
+        self._pll_kernel_mode = mode
+        self._pll_backend = backend
+        self._pll_kernel = (
+            _pll_process_kernel_numba if backend == "numba" else _pll_process_kernel_python
+        )
 
         # Pilot detection state
         self._pilot_detected = False
@@ -354,6 +470,11 @@ class PLLStereoDecoder:
         return self._pll_locked
 
     @property
+    def pll_backend(self):
+        """Return active PLL loop backend ("python" or "numba")."""
+        return self._pll_backend
+
+    @property
     def pll_phase_error_rms(self):
         """Return legacy detector-metric phase error in degrees."""
         return np.degrees(np.sqrt(max(self._pll_pe_avg, 0.0)))
@@ -439,9 +560,6 @@ class PLLStereoDecoder:
         Returns:
             carrier_38k: 38 kHz carrier signal (numpy array)
         """
-        n = len(pilot_filtered)
-        carrier_38k = np.empty(n, dtype=np.float64)
-
         # Local copies for speed in the tight loop
         phase = self._pll_phase
         integrator = self._pll_integrator
@@ -455,40 +573,22 @@ class PLLStereoDecoder:
         lock_alpha = self._pll_lock_alpha
         i_lp = self._pll_i_lp
         q_lp = self._pll_q_lp
-        TWO_PI = 2 * np.pi
-
-        for i in range(n):
-            cos_phase = np.cos(phase)
-            sin_phase = np.sin(phase)
-
-            # Use current phase for this sample's carrier output.
-            # Emitting after phase advance introduces an ~1-sample lead at 38 kHz,
-            # which directly degrades stereo separation.
-            carrier_38k[i] = 2 * cos_phase * cos_phase - 1.0
-
-            # Phase detector: multiply input by -sin(phase) of NCO
-            pe = pilot_filtered[i] * (-sin_phase)
-
-            # IIR lowpass to remove 2×pilot (38 kHz) from PE
-            pe_filt = pe_filt + pe_alpha * (pe - pe_filt)
-
-            # Low-pass pilot I/Q for normalized phase metric.
-            i_mix = pilot_filtered[i] * cos_phase
-            q_mix = pe
-            i_lp = i_lp + iq_alpha * (i_mix - i_lp)
-            q_lp = q_lp + iq_alpha * (q_mix - q_lp)
-
-            # PI loop filter
-            integrator += Ki * pe_filt
-            correction = Kp * pe_filt + integrator
-
-            # NCO: advance phase
-            phase += omega0 + correction
-            # Wrap to [0, 2π)
-            phase = phase % TWO_PI
-
-            # Lock detector: EMA of squared filtered phase error
-            pe_avg = pe_avg + lock_alpha * (pe_filt * pe_filt - pe_avg)
+        pilot_filtered = np.asarray(pilot_filtered, dtype=np.float64)
+        carrier_38k, phase, integrator, pe_filt, pe_avg, i_lp, q_lp = self._pll_kernel(
+            pilot_filtered,
+            phase,
+            integrator,
+            pe_filt,
+            pe_avg,
+            omega0,
+            Kp,
+            Ki,
+            pe_alpha,
+            iq_alpha,
+            lock_alpha,
+            i_lp,
+            q_lp,
+        )
 
         # Store state back
         self._pll_phase = phase

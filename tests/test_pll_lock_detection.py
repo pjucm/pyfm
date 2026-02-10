@@ -221,3 +221,80 @@ def test_pll_bandwidth_returns_to_acquisition_when_pilot_lost():
     assert decoder.pll_loop_bandwidth_hz >= 80.0, (
         f"Expected acquisition bandwidth after unlock, got {decoder.pll_loop_bandwidth_hz:.1f} Hz"
     )
+
+
+def _audio_tone_snr_db(x, tone_hz=1_000.0, sample_rate=48_000):
+    """Estimate tone-vs-residual SNR via FFT."""
+    n = len(x)
+    if n <= 0:
+        return -120.0
+    w = np.hanning(n)
+    spec = np.fft.rfft(x * w)
+    power = (np.abs(spec) ** 2) / n
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    tone_mask = np.abs(freqs - tone_hz) <= 50.0
+    tone_power = np.sum(power[tone_mask])
+    residual_power = np.sum(power[~tone_mask])
+    return 10.0 * np.log10((tone_power + 1e-20) / (residual_power + 1e-20))
+
+
+def test_pll_backend_auto_matches_python_for_snr_and_separation():
+    """
+    Fast PLL backend must preserve decode quality metrics vs Python reference.
+
+    The backend may be Python (fallback) or Numba (when installed), but output
+    quality should stay effectively unchanged.
+    """
+    iq = _generate_left_only_stereo_iq(iq_sample_rate=480_000, duration_s=1.0)
+
+    dec_py = PLLStereoDecoder(
+        iq_sample_rate=480_000,
+        audio_sample_rate=48_000,
+        pll_kernel_mode="python",
+    )
+    dec_auto = PLLStereoDecoder(
+        iq_sample_rate=480_000,
+        audio_sample_rate=48_000,
+        pll_kernel_mode="auto",
+    )
+    for dec in (dec_py, dec_auto):
+        dec.stereo_blend_enabled = False
+        dec.bass_boost_enabled = False
+        dec.treble_boost_enabled = False
+
+    out_py = []
+    out_auto = []
+    for idx in range(0, len(iq), 2_048):
+        block = iq[idx:idx + 2_048]
+        out_py.append(dec_py.demodulate(block))
+        out_auto.append(dec_auto.demodulate(block))
+    audio_py = np.vstack(out_py)
+    audio_auto = np.vstack(out_auto)
+
+    assert dec_py.pll_backend == "python"
+    assert dec_auto.pll_backend in {"python", "numba"}
+    assert dec_py.pilot_detected == dec_auto.pilot_detected
+
+    skip = int(0.10 * 48_000)
+    left_py = audio_py[skip:, 0]
+    right_py = audio_py[skip:, 1]
+    left_auto = audio_auto[skip:, 0]
+    right_auto = audio_auto[skip:, 1]
+
+    sep_py = 10.0 * np.log10(
+        (_goertzel_power(left_py, 1_000.0, 48_000) + 1e-20)
+        / (_goertzel_power(right_py, 1_000.0, 48_000) + 1e-20)
+    )
+    sep_auto = 10.0 * np.log10(
+        (_goertzel_power(left_auto, 1_000.0, 48_000) + 1e-20)
+        / (_goertzel_power(right_auto, 1_000.0, 48_000) + 1e-20)
+    )
+    snr_py = _audio_tone_snr_db(left_py, tone_hz=1_000.0, sample_rate=48_000)
+    snr_auto = _audio_tone_snr_db(left_auto, tone_hz=1_000.0, sample_rate=48_000)
+
+    assert abs(sep_auto - sep_py) <= 0.5, (
+        f"Separation drift too large: python={sep_py:.2f} dB auto={sep_auto:.2f} dB"
+    )
+    assert abs(snr_auto - snr_py) <= 0.5, (
+        f"SNR drift too large: python={snr_py:.2f} dB auto={snr_auto:.2f} dB"
+    )
