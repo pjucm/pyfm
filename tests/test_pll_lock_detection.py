@@ -15,7 +15,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from pll_stereo_decoder import PLLStereoDecoder
+from pll_stereo_decoder import PLLStereoDecoder, prewarm_numba_pll_kernel
 
 
 def _generate_fm_iq(
@@ -298,3 +298,10 @@ def test_pll_backend_auto_matches_python_for_snr_and_separation():
     assert abs(snr_auto - snr_py) <= 0.5, (
         f"SNR drift too large: python={snr_py:.2f} dB auto={snr_auto:.2f} dB"
     )
+
+
+def test_pll_default_backend_prefers_numba_when_available():
+    """Default decoder should prefer Numba backend when available."""
+    decoder = PLLStereoDecoder(iq_sample_rate=480_000, audio_sample_rate=48_000)
+    expected = "numba" if prewarm_numba_pll_kernel() else "python"
+    assert decoder.pll_backend == expected

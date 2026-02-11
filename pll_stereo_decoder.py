@@ -124,6 +124,16 @@ def _numba_pll_kernel_available():
     return _NUMBA_PLL_KERNEL_READY
 
 
+def prewarm_numba_pll_kernel():
+    """
+    Eagerly compile/check the optional Numba PLL kernel.
+
+    Call this before real-time streaming to avoid first-use JIT latency inside
+    time-critical audio/IQ paths.
+    """
+    return _numba_pll_kernel_available()
+
+
 class PLLStereoDecoder:
     """
     FM Stereo decoder using PLL-based carrier recovery.

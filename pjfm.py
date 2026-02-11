@@ -73,7 +73,7 @@ except ImportError as e:
     r8600_get_api_version = None
 
 from demodulator import FMStereoDecoder, NBFMDecoder
-from pll_stereo_decoder import PLLStereoDecoder
+from pll_stereo_decoder import PLLStereoDecoder, prewarm_numba_pll_kernel
 from rds_decoder import RDSDecoder, pi_to_callsign
 from opus import OpusRecorder, build_recording_status_text
 
@@ -522,6 +522,13 @@ class AudioPlayer:
 
         # Adaptive rate control: target buffer level for rate adjustment
         self._target_level_ms = 100
+        # Use a lower initial prefill than the steady-state target to avoid
+        # startup overfill when early decode blocks arrive in a burst.
+        try:
+            prefill_ms = float(os.environ.get("PYFM_AUDIO_PREFILL_MS", "50"))
+        except ValueError:
+            prefill_ms = 50.0
+        self._prefill_level_ms = max(0.0, min(self._target_level_ms, prefill_ms))
         self.overflow_samples = 0
 
     def _audio_callback(self, outdata, frames, time_info, status):
@@ -558,8 +565,8 @@ class AudioPlayer:
         """Start audio playback stream."""
         self.running = True
         self.overflow_samples = 0
-        # Pre-fill buffer to target level (accounts for first block adding more)
-        prefill = int(self.sample_rate * self._target_level_ms / 1000)
+        # Pre-fill below target for startup headroom.
+        prefill = int(self.sample_rate * self._prefill_level_ms / 1000)
         self.write_pos = prefill
         self.read_pos = 0
 
@@ -583,7 +590,7 @@ class AudioPlayer:
     def reset(self):
         """Reset buffer to prefilled state (call after tuning)."""
         with self.buffer_lock:
-            prefill = int(self.sample_rate * self._target_level_ms / 1000)
+            prefill = int(self.sample_rate * self._prefill_level_ms / 1000)
             self.buffer[:] = 0  # Clear to silence
             self.write_pos = prefill
             self.read_pos = 0
@@ -677,11 +684,15 @@ class FMRadio:
     IQ_LOSS_MUTE_BLOCKS = 1
     IQ_LOSS_FLUSH_THRESHOLD = 3
     IQ_LOSS_FLUSH_COOLDOWN_S = 0.5
+    IQ_STARTUP_FLUSH_GRACE_S = 2.0
+    STARTUP_PREFILL_LOG_SECONDS_DEFAULT = 5.0
+    STARTUP_PREFILL_LOG_PATH_DEFAULT = "off"
     STEREO_LPF_TAPS_DEFAULT = 255
     STEREO_LPF_BETA_DEFAULT = 6.0
     STEREO_RESAMPLER_MODE_DEFAULT = "firdecim"
     STEREO_RESAMPLER_TAPS_DEFAULT = 127
     STEREO_RESAMPLER_BETA_DEFAULT = 8.0
+    PLL_KERNEL_MODE_DEFAULT = "auto"
     # Blend curve defaults (linear in decoder): 15 dB -> 50% blend.
     STEREO_BLEND_LOW_DB_DEFAULT = 5.0
     STEREO_BLEND_HIGH_DB_DEFAULT = 25.0
@@ -800,6 +811,34 @@ class FMRadio:
         self._iq_running = False
         self._iq_queue_drops = 0
         self._last_iq_queue_drops = 0
+        self._stream_start_time = 0.0
+        self._pll_kernel_mode_from_env = "PJFM_PLL_KERNEL_MODE" in os.environ
+        self.pll_kernel_mode = self._normalize_pll_kernel_mode(
+            os.environ.get("PJFM_PLL_KERNEL_MODE", self.PLL_KERNEL_MODE_DEFAULT)
+        )
+        self._pll_numba_prewarmed = False
+        startup_log_path = os.environ.get(
+            "PYFM_STARTUP_PREFILL_LOG",
+            self.STARTUP_PREFILL_LOG_PATH_DEFAULT,
+        ).strip()
+        startup_log_path_lc = startup_log_path.lower()
+        self._startup_prefill_log_enabled = startup_log_path_lc not in {
+            "", "0", "off", "false", "none"
+        }
+        self._startup_prefill_log_path = startup_log_path
+        try:
+            self._startup_prefill_log_seconds = max(
+                0.0,
+                float(os.environ.get(
+                    "PYFM_STARTUP_PREFILL_SECONDS",
+                    str(self.STARTUP_PREFILL_LOG_SECONDS_DEFAULT),
+                )),
+            )
+        except ValueError:
+            self._startup_prefill_log_seconds = self.STARTUP_PREFILL_LOG_SECONDS_DEFAULT
+        self._startup_prefill_log_file = None
+        self._startup_prefill_log_start_s = 0.0
+        self._startup_prefill_last_overflow_samples = 0
 
         # Frequency presets (1-5), initialized to None
         self.presets = [None, None, None, None, None]
@@ -920,6 +959,11 @@ class FMRadio:
                     self.stereo_blend_high_db = float(config.get('radio', 'stereo_blend_high_db'))
                 except ValueError:
                     pass
+            if (not self._pll_kernel_mode_from_env and
+                    config.has_option('radio', 'pll_kernel_mode')):
+                self.pll_kernel_mode = self._normalize_pll_kernel_mode(
+                    config.get('radio', 'pll_kernel_mode')
+                )
             if self.stereo_blend_high_db <= self.stereo_blend_low_db:
                 self.stereo_blend_low_db = self.STEREO_BLEND_LOW_DB_DEFAULT
                 self.stereo_blend_high_db = self.STEREO_BLEND_HIGH_DB_DEFAULT
@@ -954,6 +998,7 @@ class FMRadio:
             'stereo_resampler_beta': f'{self.stereo_resampler_beta:.2f}',
             'stereo_blend_low_db': f'{self.stereo_blend_low_db:.1f}',
             'stereo_blend_high_db': f'{self.stereo_blend_high_db:.1f}',
+            'pll_kernel_mode': self.pll_kernel_mode,
             'rds_force_off': str(self.rds_forced_off).lower(),
         }
 
@@ -988,9 +1033,28 @@ class FMRadio:
         try:
             self.device.open()
 
+            # Warm Numba PLL kernel before stream start so first-use JIT latency
+            # cannot stall active IQ capture.
+            requested_pll_mode = self.pll_kernel_mode
+            effective_pll_mode = requested_pll_mode
+            self._pll_numba_prewarmed = False
+            if self.use_pll and requested_pll_mode in {"auto", "numba"}:
+                t0 = time.perf_counter()
+                self._pll_numba_prewarmed = prewarm_numba_pll_kernel()
+                warm_ms = (time.perf_counter() - t0) * 1000.0
+                if requested_pll_mode == "numba" and not self._pll_numba_prewarmed:
+                    print(
+                        "pjfm startup: requested pll_kernel_mode=numba unavailable; "
+                        "falling back to python"
+                    )
+                    effective_pll_mode = "python"
+                elif self._pll_numba_prewarmed:
+                    print(f"pjfm startup: numba PLL kernel prewarmed in {warm_ms:.1f} ms")
+
             # Start IQ streaming to get actual sample rate
             self.device.configure_iq_streaming(self.device.frequency, self.iq_sample_rate)
             actual_rate = self.device.iq_sample_rate
+            self._stream_start_time = time.perf_counter()
             self._last_total_sample_loss = getattr(self.device, 'total_sample_loss', 0)
             self._iq_loss_events = 0
             self._iq_loss_mute_remaining = 0
@@ -1003,7 +1067,7 @@ class FMRadio:
 
             # Create decoders
             DecoderClass = PLLStereoDecoder if self.use_pll else FMStereoDecoder
-            self.stereo_decoder = DecoderClass(
+            decoder_kwargs = dict(
                 iq_sample_rate=actual_rate,
                 audio_sample_rate=self.AUDIO_SAMPLE_RATE,
                 deviation=75000,
@@ -1015,15 +1079,23 @@ class FMRadio:
                 resampler_taps=self.stereo_resampler_taps,
                 resampler_beta=self.stereo_resampler_beta,
             )
+            if self.use_pll:
+                decoder_kwargs['pll_kernel_mode'] = effective_pll_mode
+            self.stereo_decoder = DecoderClass(**decoder_kwargs)
             self.stereo_decoder.stereo_blend_low = self.stereo_blend_low_db
             self.stereo_decoder.stereo_blend_high = self.stereo_blend_high_db
             self.stereo_decoder.bass_boost_enabled = self._initial_bass_boost
             self.stereo_decoder.treble_boost_enabled = self._initial_treble_boost
             configured_resampler = getattr(self.stereo_decoder, 'resampler_mode', 'unknown')
             runtime_resampler = getattr(self.stereo_decoder, '_resampler_runtime_mode', configured_resampler)
+            pll_info = ""
+            if self.use_pll:
+                pll_backend = getattr(self.stereo_decoder, 'pll_backend', 'n/a')
+                pll_info = f"pll_mode={effective_pll_mode}, pll_backend={pll_backend}, "
             print(
                 "pjfm startup: "
                 f"decoder={type(self.stereo_decoder).__name__}, "
+                f"{pll_info}"
                 f"resampler={runtime_resampler} (configured={configured_resampler}), "
                 f"blend={self.stereo_blend_low_db:.1f}-{self.stereo_blend_high_db:.1f}dB"
             )
@@ -1045,6 +1117,10 @@ class FMRadio:
             self._iq_thread.start()
 
             self.audio_player.start()
+            self._startup_prefill_log_start_s = time.perf_counter()
+            self._startup_prefill_last_overflow_samples = int(self.audio_player.overflow_samples)
+            self._open_startup_prefill_log()
+            self._log_startup_prefill(applied_rate_adj=1.0, loss_now=False, stage="start")
             self.running = True
 
             # Start audio processing thread (also handles RDS inline)
@@ -1060,6 +1136,7 @@ class FMRadio:
         self.running = False
         if self.audio_thread:
             self.audio_thread.join(timeout=1.0)
+        self._close_startup_prefill_log()
         if self._iq_thread:
             self._iq_running = False
             with self._iq_cond:
@@ -1082,6 +1159,90 @@ class FMRadio:
         with self._iq_cond:
             self._iq_queue.clear()
             self._iq_cond.notify_all()
+
+    def _close_startup_prefill_log(self):
+        """Close startup prefill log file if open."""
+        if self._startup_prefill_log_file:
+            try:
+                self._startup_prefill_log_file.close()
+            except Exception:
+                pass
+            self._startup_prefill_log_file = None
+
+    def _open_startup_prefill_log(self):
+        """Open startup prefill instrumentation log and write CSV header."""
+        if (not self._startup_prefill_log_enabled or
+                self._startup_prefill_log_seconds <= 0.0):
+            self._close_startup_prefill_log()
+            return
+        self._close_startup_prefill_log()
+        try:
+            self._startup_prefill_log_file = open(self._startup_prefill_log_path, "w")
+        except OSError as exc:
+            self._startup_prefill_log_file = None
+            print(
+                f"pjfm startup: failed to open prefill log "
+                f"{self._startup_prefill_log_path}: {exc}"
+            )
+            return
+        self._startup_prefill_log_file.write(
+            "# pjfm startup prefill log\n"
+            f"# window_s={self._startup_prefill_log_seconds:.3f}, "
+            f"target_ms={self.audio_player._target_level_ms:.1f}, "
+            f"prefill_ms={self.audio_player._prefill_level_ms:.1f}, "
+            f"iq_block={self.IQ_BLOCK_SIZE}\n"
+        )
+        self._startup_prefill_log_file.write(
+            "elapsed_s,stage,buffer_ms,target_ms,fill_pct,rate_ppm,"
+            "drop_ms_total,drop_ms_delta,iq_queue_len,iq_queue_drops,"
+            "iq_loss_events,recent_sample_loss,fetch_last_ms,fetch_slowest_ms,"
+            "loss_now\n"
+        )
+        self._startup_prefill_log_file.flush()
+
+    def _log_startup_prefill(self, applied_rate_adj, loss_now, stage="loop"):
+        """
+        Write one startup prefill telemetry sample.
+
+        Captures early buffer dynamics to diagnose startup overflow/drop events.
+        """
+        log_file = self._startup_prefill_log_file
+        if log_file is None or self._startup_prefill_log_start_s <= 0.0:
+            return
+
+        elapsed_s = time.perf_counter() - self._startup_prefill_log_start_s
+        if elapsed_s > self._startup_prefill_log_seconds:
+            self._close_startup_prefill_log()
+            return
+
+        level_ms = self.audio_player.buffer_level_ms
+        target_ms = float(self.audio_player._target_level_ms)
+        capacity_ms = self.audio_player.buffer_capacity_ms
+        fill_pct = (level_ms / capacity_ms * 100.0) if capacity_ms > 0 else 0.0
+        rate_ppm = (float(applied_rate_adj) - 1.0) * 1e6
+
+        overflow_samples = int(self.audio_player.overflow_samples)
+        overflow_delta = max(0, overflow_samples - self._startup_prefill_last_overflow_samples)
+        self._startup_prefill_last_overflow_samples = overflow_samples
+        drop_ms_total = overflow_samples / float(self.audio_player.sample_rate) * 1000.0
+        drop_ms_delta = overflow_delta / float(self.audio_player.sample_rate) * 1000.0
+
+        with self._iq_cond:
+            iq_queue_len = len(self._iq_queue)
+        iq_queue_drops = int(self._iq_queue_drops)
+        iq_loss_events = int(self._iq_loss_events)
+        recent_sample_loss = int(getattr(self.device, "recent_sample_loss", 0))
+        fetch_last_ms = float(getattr(self.device, "_fetch_last_ms", 0.0))
+        fetch_slowest_ms = float(getattr(self.device, "_fetch_slowest_ms", 0.0))
+
+        log_file.write(
+            f"{elapsed_s:.4f},{stage},{level_ms:.2f},{target_ms:.2f},{fill_pct:.2f},"
+            f"{rate_ppm:+.1f},{drop_ms_total:.2f},{drop_ms_delta:.2f},"
+            f"{iq_queue_len},{iq_queue_drops},{iq_loss_events},"
+            f"{recent_sample_loss},{fetch_last_ms:.2f},{fetch_slowest_ms:.2f},"
+            f"{1 if loss_now else 0}\n"
+        )
+        log_file.flush()
 
     def _should_abort_iq_fetch(self):
         return self.is_tuning or not self._iq_running
@@ -1158,8 +1319,11 @@ class FMRadio:
 
         # Rate control logging (detailed log for tuning)
         self._audio_loop_start = time.perf_counter()
-        self._pi_log_path = os.environ.get('PYFM_PI_LOG', '/tmp/pjfm_pi_detailed.log')
-        self._pi_log_detailed = os.environ.get('PYFM_PI_LOG') is not None
+        self._pi_log_path = os.environ.get('PYFM_PI_LOG', '').strip()
+        self._pi_log_enabled = self._pi_log_path.lower() not in {
+            '', '0', 'off', 'false', 'none'
+        }
+        self._pi_log_detailed = self._pi_log_enabled
         # Audio buffer overflow recovery tracking
         self._overflow_window_start = time.perf_counter()
         self._overflow_samples_window = self.audio_player.overflow_samples
@@ -1208,8 +1372,11 @@ class FMRadio:
                     if self.use_icom:
                         recent_loss = getattr(self.device, 'recent_sample_loss', 0)
                         now = time.perf_counter()
-                        if (recent_loss >= self.IQ_LOSS_FLUSH_THRESHOLD and
-                                (now - self._last_iq_flush_time) >= self.IQ_LOSS_FLUSH_COOLDOWN_S):
+                        if self._should_flush_iq_loss(
+                                recent_loss,
+                                now_s=now,
+                                last_flush_s=self._last_iq_flush_time,
+                                stream_start_s=self._stream_start_time):
                             self._last_iq_flush_time = now
                             self.device.flush_iq()
                             self._clear_iq_queue()
@@ -1277,31 +1444,32 @@ class FMRadio:
                 else:
                     self.stereo_decoder.rate_adjust = applied_rate_adj
 
-                # Log rate control stats
-                # In detailed mode: every block for first 15s, then every 10 blocks
-                # In normal mode: every 60 blocks (~1 second)
-                if hasattr(self, '_rate_log_counter'):
-                    self._rate_log_counter += 1
-                else:
-                    self._rate_log_counter = 0
-                    self._rate_log_file = open(self._pi_log_path, 'w')
-                    self._rate_log_file.write("time_s,buf_ms,target_ms,error_ms,p_ppm,i_ppm,adj_ppm,integrator,raw_error_ms,filtered_error_ms\n")
+                # Optional PI rate-control logging (disabled by default).
+                if self._pi_log_enabled:
+                    # In detailed mode: every block for first 15s, then every 10 blocks
+                    # In normal mode: every 60 blocks (~1 second)
+                    if hasattr(self, '_rate_log_counter'):
+                        self._rate_log_counter += 1
+                    else:
+                        self._rate_log_counter = 0
+                        self._rate_log_file = open(self._pi_log_path, 'w')
+                        self._rate_log_file.write("time_s,buf_ms,target_ms,error_ms,p_ppm,i_ppm,adj_ppm,integrator,raw_error_ms,filtered_error_ms\n")
 
-                elapsed = time.perf_counter() - self._audio_loop_start
-                # Determine log interval based on mode and time
-                if self._pi_log_detailed:
-                    # Detailed mode: log every block for first 15s, then every 10 blocks
-                    should_log = (elapsed < 15.0) or (self._rate_log_counter % 10 == 0)
-                else:
-                    # Normal mode: every 60 blocks (~1 second)
-                    should_log = (self._rate_log_counter % 60 == 0)
+                    elapsed = time.perf_counter() - self._audio_loop_start
+                    # Determine log interval based on mode and time
+                    if self._pi_log_detailed:
+                        # Detailed mode: log every block for first 15s, then every 10 blocks
+                        should_log = (elapsed < 15.0) or (self._rate_log_counter % 10 == 0)
+                    else:
+                        # Normal mode: every 60 blocks (~1 second)
+                        should_log = (self._rate_log_counter % 60 == 0)
 
-                if should_log:
-                    p_ppm = p_term * 1e6
-                    i_ppm = i_term * 1e6
-                    adj_ppm = (applied_rate_adj - 1.0) * 1e6
-                    self._rate_log_file.write(f"{elapsed:.3f},{buf_level:.1f},{buf_target:.0f},{self._filtered_error:.1f},{p_ppm:.1f},{i_ppm:.1f},{adj_ppm:.1f},{self._rate_integrator:.8f},{buf_error_raw:.1f},{self._filtered_error:.1f}\n")
-                    self._rate_log_file.flush()
+                    if should_log:
+                        p_ppm = p_term * 1e6
+                        i_ppm = i_term * 1e6
+                        adj_ppm = (applied_rate_adj - 1.0) * 1e6
+                        self._rate_log_file.write(f"{elapsed:.3f},{buf_level:.1f},{buf_target:.0f},{self._filtered_error:.1f},{p_ppm:.1f},{i_ppm:.1f},{adj_ppm:.1f},{self._rate_integrator:.8f},{buf_error_raw:.1f},{self._filtered_error:.1f}\n")
+                        self._rate_log_file.flush()
 
                 # Demodulate FM using appropriate decoder
                 if self.weather_mode:
@@ -1373,6 +1541,7 @@ class FMRadio:
 
                 # Queue audio for playback
                 self.audio_player.queue_audio(audio)
+                self._log_startup_prefill(applied_rate_adj=applied_rate_adj, loss_now=loss_now)
 
                 # Detect runaway buffer overflow and recover by resetting audio state.
                 overflow_samples = self.audio_player.overflow_samples
@@ -1445,6 +1614,30 @@ class FMRadio:
         if weather_mode:
             return max(cls.NBFM_RATE_ADJ_MIN, min(cls.NBFM_RATE_ADJ_MAX, rate_adj))
         return max(cls.RATE_ADJ_MIN, min(cls.RATE_ADJ_MAX, rate_adj))
+
+    @staticmethod
+    def _normalize_pll_kernel_mode(mode):
+        """Normalize configured PLL kernel mode to a supported value."""
+        mode = str(mode).strip().lower()
+        if mode not in {"python", "auto", "numba"}:
+            return "python"
+        return mode
+
+    @classmethod
+    def _should_flush_iq_loss(cls, recent_loss, now_s, last_flush_s, stream_start_s):
+        """
+        Return True when IQ-loss recovery should force a stream flush.
+
+        Startup grace avoids compounding initial transient stalls into repeated
+        flush/re-align cycles right after stream start.
+        """
+        if recent_loss < cls.IQ_LOSS_FLUSH_THRESHOLD:
+            return False
+        if (now_s - last_flush_s) < cls.IQ_LOSS_FLUSH_COOLDOWN_S:
+            return False
+        if stream_start_s > 0.0 and (now_s - stream_start_s) < cls.IQ_STARTUP_FLUSH_GRACE_S:
+            return False
+        return True
 
     def tune_up(self):
         """Tune up by 200 kHz (FM) or 25 kHz (Weather)."""
@@ -2247,6 +2440,10 @@ def build_display(radio, width=80):
             stages = [
                 ('fm_demod', 'FM Demod'),
                 ('pilot_bpf', 'Pilot BPF'),
+            ]
+            if 'pll' in prof:
+                stages.append(('pll', 'PLL'))
+            stages.extend([
                 ('lr_sum_lpf', 'L+R LPF'),
                 ('lr_diff_bpf', 'L-R BPF'),
                 ('lr_diff_lpf', 'L-R LPF'),
@@ -2255,7 +2452,7 @@ def build_display(radio, width=80):
                 ('deemphasis', 'De-emph'),
                 ('tone', 'Tone'),
                 ('limiter', 'Limiter'),
-            ]
+            ])
             total_us = prof.get('total', 1.0)
 
             # Sort by time descending

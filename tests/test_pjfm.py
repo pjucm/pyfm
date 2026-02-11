@@ -17,8 +17,7 @@ Signal Flow:
                  Matrix: L = L+R + L-R, R = L+R - L-R <-------------+
 
 Carrier Regeneration:
-    Pilot-squaring method: Uses identity 2*sin^2(x)-1 = -cos(2x)
-    Works correctly when transmitter uses -cos(2*pi*38000*t) subcarrier.
+    PLL locks to the 19 kHz pilot and regenerates coherent 38 kHz carrier.
 
 Group Delay Alignment:
     L+R path: LPF (63 samples) + delay buffer (100 samples) = 163 samples
@@ -30,9 +29,7 @@ FM Multiplex Structure:
     23-53 kHz:  L-R on 38 kHz DSB-SC carrier
 
 Critical Phase Relationships:
-    The pilot-squaring method produces: 2*sin^2(wt) - 1 = -cos(2wt)
-
-    For correct stereo decode, transmitter must use -cos(2wt) as subcarrier:
+    For correct stereo decode, transmitter should use -cos(2wt) as subcarrier:
     - TX = -cos(2wt), RX = -cos(2wt): WORKS (correct polarity)
     - TX = cos(2wt),  RX = -cos(2wt): WORKS (inverted L/R)
     - TX = sin(2wt),  RX = -cos(2wt): FAILS (90° phase error = no separation)
@@ -53,7 +50,6 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-from demodulator import FMStereoDecoder
 from pll_stereo_decoder import PLLStereoDecoder
 
 
@@ -66,7 +62,7 @@ def demodulate_with_settling(decoder, iq, block_size=8192):
     Demodulate IQ samples in blocks to allow pilot detection to settle.
 
     Args:
-        decoder: FMStereoDecoder instance
+        decoder: Stereo decoder instance
         iq: Complex I/Q samples
         block_size: Block size for processing
 
@@ -408,6 +404,45 @@ def find_step_crossing(x, threshold=0.5):
     return -1
 
 
+def estimate_relative_delay_xcorr(x, y, max_lag=20):
+    """
+    Estimate relative delay (in samples) via cross-correlation peak.
+
+    Uses FFT-based correlation over a bounded lag window and applies a
+    parabolic fit around the peak for sub-sample resolution.
+    """
+    n = min(len(x), len(y))
+    if n <= (2 * max_lag + 1):
+        return 0.0
+
+    x0 = np.asarray(x[:n], dtype=np.float64)
+    y0 = np.asarray(y[:n], dtype=np.float64)
+    x0 = x0 - np.mean(x0)
+    y0 = y0 - np.mean(y0)
+
+    corr_full = signal.correlate(x0, y0, mode='full', method='fft')
+    lags_full = signal.correlation_lags(len(x0), len(y0), mode='full')
+
+    lag_mask = (lags_full >= -max_lag) & (lags_full <= max_lag)
+    corr = corr_full[lag_mask]
+    lags = lags_full[lag_mask]
+
+    peak_idx = int(np.argmax(corr))
+    lag_samples = float(lags[peak_idx])
+    frac = 0.0
+
+    if 0 < peak_idx < (len(corr) - 1):
+        y1 = float(corr[peak_idx - 1])
+        y2 = float(corr[peak_idx])
+        y3 = float(corr[peak_idx + 1])
+        denom = y1 - (2.0 * y2) + y3
+        if abs(denom) > 1e-12:
+            frac = 0.5 * (y1 - y3) / denom
+            frac = float(np.clip(frac, -1.0, 1.0))
+
+    return lag_samples + frac
+
+
 # =============================================================================
 # Test Functions
 # =============================================================================
@@ -436,7 +471,7 @@ def test_fm_demod_accuracy():
     iq = fm_modulate(baseband_in, sample_rate, deviation=75000)
 
     # Create decoder (disable tone controls and de-emphasis for clean test)
-    decoder = FMStereoDecoder(
+    decoder = PLLStereoDecoder(
         iq_sample_rate=sample_rate,
         audio_sample_rate=sample_rate,  # No resampling
         deviation=75000,
@@ -503,7 +538,7 @@ def test_audio_snr():
     iq = fm_modulate(multiplex, iq_rate)
 
     # Create decoder
-    decoder = FMStereoDecoder(
+    decoder = PLLStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
@@ -558,7 +593,7 @@ def test_thd_n():
     iq = fm_modulate(multiplex, iq_rate)
 
     # Create decoder
-    decoder = FMStereoDecoder(
+    decoder = PLLStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
@@ -617,7 +652,7 @@ def test_mono_decode():
     iq = fm_modulate(multiplex, iq_rate)
 
     # Create decoder (production default settings)
-    decoder = FMStereoDecoder(
+    decoder = PLLStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
@@ -686,7 +721,7 @@ def test_stereo_decode():
     iq = fm_modulate(multiplex, iq_rate)
 
     # Create decoder
-    decoder = FMStereoDecoder(
+    decoder = PLLStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
@@ -742,7 +777,7 @@ def test_stereo_separation():
 
     test_freqs = [100, 1000, 5000, 10000, 12000]
 
-    decoder = FMStereoDecoder(
+    decoder = PLLStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
@@ -805,8 +840,8 @@ def test_subcarrier_phase_sensitivity():
     print("TEST: Subcarrier Phase Sensitivity")
     print("=" * 60)
     print()
-    print("  The pilot-squaring decoder produces -cos(2wt) carrier")
-    print("  This test verifies correct behavior with different TX phases")
+    print("  FM stereo multiplex is referenced to a -cos(2wt) subcarrier phase")
+    print("  This test verifies expected decode behavior with different TX phases")
     print()
 
     iq_rate = 250000
@@ -826,7 +861,7 @@ def test_subcarrier_phase_sensitivity():
         multiplex = generate_fm_stereo_multiplex(left, right, iq_rate, subcarrier_phase=phase_name)
         iq = fm_modulate(multiplex, iq_rate)
 
-        decoder = FMStereoDecoder(
+        decoder = PLLStereoDecoder(
             iq_sample_rate=iq_rate,
             audio_sample_rate=audio_rate,
             deviation=75000,
@@ -874,29 +909,28 @@ def test_subcarrier_phase_sensitivity():
 
 def test_group_delay_alignment():
     """
-    Test L/R timing alignment.
+    Test L/R timing alignment using cross-correlation.
 
-    Uses step function to measure timing difference between channels.
-    The L+R and L-R paths should be aligned within 5 samples (~100 us at 48 kHz).
+    Uses a shared broadband mono stimulus and estimates relative delay from the
+    cross-correlation peak. This is less sensitive to transient edge-shape
+    differences than step-crossing.
     """
     print("\n" + "=" * 60)
-    print("TEST: Group Delay Alignment (L/R Timing)")
+    print("TEST: Group Delay Alignment (L/R XCorr)")
     print("=" * 60)
 
     iq_rate = 250000
     audio_rate = 48000
-    duration = 0.1
+    duration = 1.0
 
     n_samples = int(duration * iq_rate)
-    t = np.arange(n_samples) / iq_rate
+    rng = np.random.default_rng(12345)
+    mono = rng.standard_normal(n_samples)
+    mono_lpf = signal.firwin(255, 12000 / (iq_rate / 2), window=('kaiser', 6.0))
+    mono = signal.lfilter(mono_lpf, 1.0, mono)
+    mono = 0.5 * mono / (np.max(np.abs(mono)) + 1e-12)
 
-    # Create step function
-    step_point = n_samples // 2
-    step = np.zeros(n_samples)
-    step[step_point:] = 0.5
-
-    # Create left+right step for L/R alignment check
-    decoder = FMStereoDecoder(
+    decoder = PLLStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
@@ -906,30 +940,24 @@ def test_group_delay_alignment():
     decoder.treble_boost_enabled = False
     decoder.stereo_blend_enabled = False
 
-    lr_step = step.copy()
-    multiplex = generate_fm_stereo_multiplex(lr_step, lr_step, iq_rate, subcarrier_phase='neg_cos')
+    multiplex = generate_fm_stereo_multiplex(mono, mono, iq_rate, subcarrier_phase='neg_cos')
     iq = fm_modulate(multiplex, iq_rate)
     audio = demodulate_with_settling(decoder, iq)
 
-    left = audio[:, 0]
-    right = audio[:, 1]
-
-    left_crossing = find_step_crossing(left)
-    right_crossing = find_step_crossing(right)
-
-    if left_crossing < 0 or right_crossing < 0:
-        print("  ERROR: Could not find step crossings")
+    skip = int(0.2 * audio_rate)
+    left = audio[skip:, 0]
+    right = audio[skip:, 1]
+    if len(left) < 256 or len(right) < 256:
+        print("  ERROR: Insufficient audio samples for xcorr delay estimate")
         return False
 
-    lr_diff_samples = abs(left_crossing - right_crossing)
-    lr_diff_us = lr_diff_samples * (1e6 / audio_rate)
+    lr_delay_samples = estimate_relative_delay_xcorr(left, right, max_lag=20)
+    lr_delay_us = lr_delay_samples * (1e6 / audio_rate)
 
-    print(f"  Left crossing at: {left_crossing:.2f} samples")
-    print(f"  Right crossing at: {right_crossing:.2f} samples")
-    print(f"  L/R crossing difference: {lr_diff_samples:.2f} samples ({lr_diff_us:.0f} us)")
+    print(f"  L-R delay (xcorr): {lr_delay_samples:+.3f} samples ({lr_delay_us:+.1f} us)")
 
-    passed = lr_diff_samples < 5
-    print(f"  Result: {'PASS' if passed else 'FAIL'} (target: <5 samples)")
+    passed = abs(lr_delay_samples) < 1.0
+    print(f"  Result: {'PASS' if passed else 'FAIL'} (target: |delay| < 1.0 samples)")
 
     return passed
 
@@ -951,7 +979,7 @@ def test_frequency_response():
 
     test_freqs = [100, 200, 500, 1000, 2000, 5000, 8000, 10000, 12000, 14000]
 
-    decoder = FMStereoDecoder(
+    decoder = PLLStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
@@ -1018,7 +1046,7 @@ def test_snr_with_noise():
     Verifies graceful degradation.
     """
     print("\n" + "=" * 60)
-    print("TEST: IHF/EIA SNR with Noisy Input (PLL + FMSQ, firdecim)")
+    print("TEST: IHF/EIA SNR with Noisy Input (PLL, firdecim)")
     print("=" * 60)
 
     iq_rate = 480000
@@ -1034,10 +1062,7 @@ def test_snr_with_noise():
     resampler_taps = 127
     resampler_beta = 8.0
 
-    decoder_paths = [
-        ("FMStereoDecoder", FMStereoDecoder),
-        ("PLLStereoDecoder", PLLStereoDecoder),
-    ]
+    decoder_paths = [("PLLStereoDecoder", PLLStereoDecoder)]
 
     print(f"  IQ rate: {iq_rate/1000:.0f} kHz, metric: IHF/EIA (A-weighted, de-emphasized)")
     print(f"  Decoder resampler: mode={resampler_mode}, taps={resampler_taps}, beta={resampler_beta:.1f}")
@@ -1233,7 +1258,7 @@ def test_ihf_snr():
     a_weight_sos = design_a_weighting(audio_rate)
 
     # --- Stereo test ---
-    decoder_stereo = FMStereoDecoder(
+    decoder_stereo = PLLStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
@@ -1253,7 +1278,7 @@ def test_ihf_snr():
     pilot_snr = decoder_stereo.snr_db if hasattr(decoder_stereo, 'snr_db') else 0.0
 
     # --- Mono test ---
-    decoder_mono = FMStereoDecoder(
+    decoder_mono = PLLStereoDecoder(
         iq_sample_rate=iq_rate,
         audio_sample_rate=audio_rate,
         deviation=75000,
@@ -1293,7 +1318,7 @@ def run_all_tests():
     print("\n" + "=" * 60)
     print("FM STEREO DECODER TEST SUITE")
     print("=" * 60)
-    print("\nTesting demodulator.py (FMStereoDecoder)")
+    print("\nTesting pll_stereo_decoder.py (PLLStereoDecoder)")
     print("Signal flow: IQ -> FM Demod -> Pilot/L+R/L-R -> Matrix -> Audio")
 
     tests = [
@@ -1337,7 +1362,7 @@ def run_all_tests():
 
     print()
     print("NOTES:")
-    print("  - Pilot-squaring requires TX to use -cos(2wt) subcarrier")
+    print("  - Stereo multiplex phase reference uses -cos(2wt) subcarrier")
 
     return passed_count == total_count
 
