@@ -9,7 +9,7 @@ The PI controller compensates for clock drift between the IQ source
 (BB60D or IC-R8600) and the audio output (sound card).
 
 Usage:
-    ./pi_tuner.py [--run | --analyze | --optimize]
+    python3 tests/test_pi_tuner.py [--run | --analyze | --optimize]
 
 Modes:
     --run       Run pjfm for 90 seconds with detailed logging
@@ -26,8 +26,9 @@ import signal
 import numpy as np
 from pathlib import Path
 
-# Log file location
+# Log file locations
 LOG_FILE = "/tmp/pjfm_pi_detailed.log"
+STARTUP_LOG_FILE = "/tmp/pjfm_startup_prefill.log"
 METRICS_FILE = "/tmp/pjfm_pi_metrics.txt"
 
 
@@ -86,6 +87,54 @@ def parse_log_file(log_path=LOG_FILE):
         data[key] = np.array(data[key])
 
     return data
+
+
+def parse_startup_log(log_path=STARTUP_LOG_FILE):
+    """Parse startup prefill CSV log."""
+    if not os.path.exists(log_path):
+        return None
+
+    data = {
+        'elapsed_s': [],
+        'buffer_ms': [],
+        'target_ms': [],
+        'fill_pct': [],
+        'rate_ppm': [],
+        'drop_ms_total': [],
+        'drop_ms_delta': [],
+        'iq_queue_len': [],
+        'iq_queue_drops': [],
+        'iq_loss_events': [],
+        'loss_now': [],
+    }
+
+    with open(log_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split(',')
+            if len(parts) < 15 or parts[0] == 'elapsed_s':
+                continue
+            try:
+                data['elapsed_s'].append(float(parts[0]))
+                # parts[1] is stage string
+                data['buffer_ms'].append(float(parts[2]))
+                data['target_ms'].append(float(parts[3]))
+                data['fill_pct'].append(float(parts[4]))
+                data['rate_ppm'].append(float(parts[5]))
+                data['drop_ms_total'].append(float(parts[6]))
+                data['drop_ms_delta'].append(float(parts[7]))
+                data['iq_queue_len'].append(float(parts[8]))
+                data['iq_queue_drops'].append(float(parts[9]))
+                data['iq_loss_events'].append(float(parts[10]))
+                data['loss_now'].append(float(parts[14]))
+            except ValueError:
+                continue
+
+    for key in data:
+        data[key] = np.array(data[key])
+    return data if len(data['elapsed_s']) > 0 else None
 
 
 def compute_metrics(data):
@@ -154,8 +203,9 @@ def compute_metrics(data):
 
     # Overall quality score (lower is better)
     # Weights: settling time (important), startup overshoot, steady-state error
+    settling_penalty = metrics['settling_time_s'] if np.isfinite(metrics['settling_time_s']) else 180.0
     metrics['quality_score'] = (
-        metrics['settling_time_s'] * 10.0 +
+        settling_penalty * 10.0 +
         metrics['startup_max_overshoot_ms'] * 2.0 +
         metrics['startup_rms_error_ms'] * 5.0 +
         metrics['steady_rms_error_ms'] * 10.0 +
@@ -163,6 +213,65 @@ def compute_metrics(data):
     )
 
     return metrics
+
+
+def compute_startup_metrics(startup_data):
+    """Compute startup-prefill-specific metrics from startup log."""
+    if startup_data is None or len(startup_data['elapsed_s']) < 2:
+        return None
+
+    metrics = {}
+    buf = startup_data['buffer_ms']
+    target = startup_data['target_ms']
+    err = buf - target
+
+    metrics['startup_log_duration_s'] = float(startup_data['elapsed_s'][-1])
+    metrics['prefill_max_drop_ms_total'] = float(np.max(startup_data['drop_ms_total']))
+    metrics['prefill_drop_ms_sum'] = float(np.sum(startup_data['drop_ms_delta']))
+    metrics['prefill_max_abs_rate_ppm'] = float(np.max(np.abs(startup_data['rate_ppm'])))
+    metrics['prefill_max_abs_error_ms'] = float(np.max(np.abs(err)))
+    metrics['prefill_rms_error_ms'] = float(np.sqrt(np.mean(err ** 2)))
+    metrics['prefill_iq_loss_events'] = float(np.max(startup_data['iq_loss_events']))
+    metrics['prefill_iq_queue_drops'] = float(np.max(startup_data['iq_queue_drops']))
+
+    # Time to remain within ±20 ms of target for 0.5 s worth of samples.
+    within = np.abs(err) <= 20.0
+    settle_time = float('inf')
+    for i in range(len(within)):
+        if not within[i]:
+            continue
+        t0 = startup_data['elapsed_s'][i]
+        window_mask = (startup_data['elapsed_s'] >= t0) & (startup_data['elapsed_s'] <= t0 + 0.5)
+        if np.any(window_mask) and np.all(within[window_mask]):
+            settle_time = t0
+            break
+    metrics['prefill_settle_time_s'] = settle_time
+
+    settling_penalty = settle_time if np.isfinite(settle_time) else 10.0
+    metrics['prefill_quality_score'] = (
+        settling_penalty * 8.0 +
+        metrics['prefill_max_drop_ms_total'] * 12.0 +
+        metrics['prefill_max_abs_error_ms'] * 1.5 +
+        metrics['prefill_rms_error_ms'] * 3.0 +
+        metrics['prefill_max_abs_rate_ppm'] * 0.004 +
+        metrics['prefill_iq_loss_events'] * 100.0 +
+        metrics['prefill_iq_queue_drops'] * 40.0
+    )
+    return metrics
+
+
+def combine_metrics(pi_metrics, startup_metrics):
+    """Combine steady-state PI metrics with startup-prefill metrics."""
+    if pi_metrics is None:
+        return None
+    combined = dict(pi_metrics)
+    if startup_metrics:
+        combined.update(startup_metrics)
+        combined['quality_score'] = (
+            pi_metrics['quality_score'] * 0.7 +
+            startup_metrics['prefill_quality_score'] * 0.3
+        )
+    return combined
 
 
 def print_metrics(metrics):
@@ -175,8 +284,13 @@ def print_metrics(metrics):
     print("PI LOOP PERFORMANCE METRICS")
     print("=" * 60)
 
+    settle_text = (
+        f"{metrics['settling_time_s']:.2f} s"
+        if np.isfinite(metrics['settling_time_s'])
+        else "not settled"
+    )
     print("\nStartup Performance:")
-    print(f"  Settling time:       {metrics['settling_time_s']:.2f} s")
+    print(f"  Settling time:       {settle_text}")
     print(f"  Max overshoot:       {metrics['startup_max_overshoot_ms']:.1f} ms")
     print(f"  RMS error (0-10s):   {metrics['startup_rms_error_ms']:.2f} ms")
 
@@ -189,6 +303,22 @@ def print_metrics(metrics):
 
     if 'estimated_drift_ppm' in metrics:
         print(f"  Est. clock drift:    {metrics['estimated_drift_ppm']:.1f} ppm")
+
+    if 'prefill_quality_score' in metrics:
+        prefill_settle = metrics.get('prefill_settle_time_s', float('inf'))
+        prefill_settle_text = (
+            f"{prefill_settle:.2f} s"
+            if np.isfinite(prefill_settle)
+            else "not settled"
+        )
+        print("\nStartup Prefill Metrics:")
+        print(f"  Prefill settle:      {prefill_settle_text} (±20 ms)")
+        print(f"  Max drop total:      {metrics['prefill_max_drop_ms_total']:.2f} ms")
+        print(f"  Max abs error:       {metrics['prefill_max_abs_error_ms']:.1f} ms")
+        print(f"  RMS error:           {metrics['prefill_rms_error_ms']:.2f} ms")
+        print(f"  Max |rate|:          {metrics['prefill_max_abs_rate_ppm']:.1f} ppm")
+        print(f"  IQ loss events:      {metrics['prefill_iq_loss_events']:.0f}")
+        print(f"  IQ queue drops:      {metrics['prefill_iq_queue_drops']:.0f}")
 
     print(f"\nQuality Score:         {metrics['quality_score']:.1f} (lower is better)")
     print("=" * 60)
@@ -308,7 +438,8 @@ def generate_ascii_plot(data, width=70, height=15):
     return "\n".join(lines)
 
 
-def run_pjfm_headless(duration_s=90, frequency=89.9, kp=None, ki=None):
+def run_pjfm_headless(duration_s=90, frequency=89.9, kp=None, ki=None, alpha=None,
+                      prefill_ms=None, use_icom=False, use_bb60d=False):
     """
     Run pjfm in headless mode for the specified duration.
 
@@ -317,19 +448,30 @@ def run_pjfm_headless(duration_s=90, frequency=89.9, kp=None, ki=None):
         frequency: FM frequency in MHz
         kp: Optional Kp override
         ki: Optional Ki override
+        alpha: Optional PI error EMA alpha override
+        prefill_ms: Optional startup audio prefill level override
+        use_icom: Use IC-R8600 device path
+        use_bb60d: Use BB60D device path
 
     Returns:
         True if successful, False otherwise
     """
     # Build environment with PI gain overrides if specified
     env = os.environ.copy()
+    env['PYTHONUNBUFFERED'] = '1'
     if kp is not None:
         env['PYFM_PI_KP'] = str(kp)
     if ki is not None:
         env['PYFM_PI_KI'] = str(ki)
+    if alpha is not None:
+        env['PYFM_PI_ALPHA'] = str(alpha)
+    if prefill_ms is not None:
+        env['PYFM_AUDIO_PREFILL_MS'] = str(prefill_ms)
 
     # Enable detailed logging
     env['PYFM_PI_LOG'] = LOG_FILE
+    env['PYFM_STARTUP_PREFILL_LOG'] = STARTUP_LOG_FILE
+    env['PYFM_STARTUP_PREFILL_SECONDS'] = '8'
     env['PYFM_HEADLESS'] = '1'
     env['PYFM_DURATION'] = str(duration_s)
 
@@ -338,10 +480,29 @@ def run_pjfm_headless(duration_s=90, frequency=89.9, kp=None, ki=None):
         print(f"  Kp override: {kp}")
     if ki is not None:
         print(f"  Ki override: {ki}")
+    if alpha is not None:
+        print(f"  Alpha override: {alpha}")
+    if prefill_ms is not None:
+        print(f"  Prefill override: {prefill_ms} ms")
 
     # Run pjfm
-    pjfm_path = Path(__file__).parent / "pjfm.py"
+    pjfm_path = Path(__file__).resolve().parents[1] / "pjfm.py"
+    if not pjfm_path.exists():
+        print(f"pjfm.py not found at expected path: {pjfm_path}")
+        return False
+
+    # Remove stale logs so each run evaluates clean output.
+    for path in (LOG_FILE, STARTUP_LOG_FILE):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
     cmd = [sys.executable, str(pjfm_path), str(frequency)]
+    if use_icom:
+        cmd.append("--icom")
+    if use_bb60d:
+        cmd.append("--bb60d")
 
     try:
         proc = subprocess.Popen(
@@ -370,14 +531,43 @@ def run_pjfm_headless(duration_s=90, frequency=89.9, kp=None, ki=None):
             except subprocess.TimeoutExpired:
                 proc.kill()
 
-        return proc.returncode in (0, -2, None)  # -2 is SIGINT
+        # Collect output for robust success/failure detection.
+        try:
+            out_bytes, err_bytes = proc.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            out_bytes, err_bytes = b"", b""
+        stdout = out_bytes.decode('utf-8', errors='ignore') if isinstance(out_bytes, (bytes, bytearray)) else (out_bytes or "")
+        stderr = err_bytes.decode('utf-8', errors='ignore') if isinstance(err_bytes, (bytes, bytearray)) else (err_bytes or "")
+
+        # pjfm currently hard-exits with code 0 even on startup failure.
+        # Require at least one log file and reject known startup error markers.
+        startup_failed = (
+            "Error starting radio:" in stdout
+            or "Error starting radio:" in stderr
+            or "Error: " in stdout and "Goodbye!" in stdout and not os.path.exists(LOG_FILE)
+        )
+        logs_present = os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 0
+        if proc.returncode in (0, -2, None) and logs_present and not startup_failed:  # -2 is SIGINT
+            return True
+
+        # Show concise failure context to make tuning runs debuggable.
+        if stdout.strip():
+            print("  pjfm stdout (tail):")
+            for line in stdout.strip().splitlines()[-6:]:
+                print(f"    {line}")
+        if stderr.strip():
+            print("  pjfm stderr (tail):")
+            for line in stderr.strip().splitlines()[-6:]:
+                print(f"    {line}")
+        print(f"  pjfm exited with code {proc.returncode}")
+        return False
 
     except Exception as e:
         print(f"Error running pjfm: {e}")
         return False
 
 
-def optimize_pi_gains(iterations=5, frequency=89.9):
+def optimize_pi_gains(frequency=89.9, duration_s=60, use_icom=False, use_bb60d=False):
     """
     Run multiple iterations with different PI gains to find optimal values.
 
@@ -387,33 +577,72 @@ def optimize_pi_gains(iterations=5, frequency=89.9):
     print("PI GAIN OPTIMIZATION")
     print("=" * 60)
 
-    # Initial search grid (based on current values)
-    # Current: Kp = 0.00005 (50 ppm/ms), Ki = 0.0000004 (~24 ppm/ms/s)
-    kp_values = [0.00003, 0.00005, 0.00008, 0.0001]
-    ki_values = [0.0000002, 0.0000004, 0.0000008, 0.000001]
+    # Search around current defaults in pjfm.py:
+    # Kp=0.000015, Ki=0.0000006, alpha=0.25, prefill=35 ms
+    kp_values = [0.000010, 0.000015, 0.000020]
+    ki_values = [0.0000003, 0.0000006, 0.0000009]
+    alpha_values = [0.20, 0.25, 0.30]
+    prefill_values = [35, 40, 50]
 
     results = []
 
+    # Keep optimization run count manageable by doing staged sweeps.
+    staged_candidates = []
+    for prefill in prefill_values:
+        staged_candidates.append((0.000015, 0.0000006, 0.25, prefill))
     for kp in kp_values:
         for ki in ki_values:
-            print(f"\n--- Testing Kp={kp:.6f}, Ki={ki:.8f} ---")
+            staged_candidates.append((kp, ki, 0.25, 50))
+    for alpha in alpha_values:
+        staged_candidates.append((0.000015, 0.0000006, alpha, 50))
 
-            if run_pjfm_headless(duration_s=60, frequency=frequency, kp=kp, ki=ki):
-                data = parse_log_file()
-                metrics = compute_metrics(data)
+    # Remove duplicates while preserving order.
+    seen = set()
+    candidates = []
+    for item in staged_candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        candidates.append(item)
 
-                if metrics:
-                    results.append({
-                        'kp': kp,
-                        'ki': ki,
-                        'metrics': metrics,
-                        'score': metrics['quality_score']
-                    })
-                    print(f"  Score: {metrics['quality_score']:.1f}")
-                else:
-                    print("  Failed to compute metrics")
-            else:
-                print("  pjfm run failed")
+    for kp, ki, alpha, prefill in candidates:
+        print(
+            f"\n--- Testing Kp={kp:.6f}, Ki={ki:.8f}, "
+            f"alpha={alpha:.2f}, prefill={prefill:.0f}ms ---"
+        )
+
+        ok = run_pjfm_headless(
+            duration_s=duration_s,
+            frequency=frequency,
+            kp=kp,
+            ki=ki,
+            alpha=alpha,
+            prefill_ms=prefill,
+            use_icom=use_icom,
+            use_bb60d=use_bb60d,
+        )
+        if not ok:
+            print("  pjfm run failed")
+            continue
+
+        pi_data = parse_log_file()
+        startup_data = parse_startup_log()
+        pi_metrics = compute_metrics(pi_data)
+        startup_metrics = compute_startup_metrics(startup_data)
+        metrics = combine_metrics(pi_metrics, startup_metrics)
+        if metrics is None:
+            print("  Failed to compute metrics")
+            continue
+
+        results.append({
+            'kp': kp,
+            'ki': ki,
+            'alpha': alpha,
+            'prefill_ms': prefill,
+            'metrics': metrics,
+            'score': metrics['quality_score']
+        })
+        print(f"  Score: {metrics['quality_score']:.1f}")
 
     if not results:
         print("\nNo successful runs!")
@@ -429,11 +658,17 @@ def optimize_pi_gains(iterations=5, frequency=89.9):
     print(f"\nBest configuration:")
     print(f"  Kp = {best['kp']:.8f}  ({best['kp'] * 1e6:.1f} ppm per ms error)")
     print(f"  Ki = {best['ki']:.10f}  ({best['ki'] * 1e6:.3f} ppm per ms*s accumulated)")
+    print(f"  alpha = {best['alpha']:.2f}")
+    print(f"  prefill = {best['prefill_ms']:.0f} ms")
     print_metrics(best['metrics'])
 
     print("\nAll results (sorted by score):")
     for r in results[:10]:
-        print(f"  Kp={r['kp']:.6f}, Ki={r['ki']:.8f}: score={r['score']:.1f}")
+        print(
+            f"  Kp={r['kp']:.6f}, Ki={r['ki']:.8f}, "
+            f"alpha={r['alpha']:.2f}, prefill={r['prefill_ms']:.0f}ms: "
+            f"score={r['score']:.1f}"
+        )
 
     return best
 
@@ -454,15 +689,33 @@ def main():
                         help='Override Kp value')
     parser.add_argument('--ki', type=float, default=None,
                         help='Override Ki value')
+    parser.add_argument('--alpha', type=float, default=None,
+                        help='Override PI error EMA alpha (PYFM_PI_ALPHA)')
+    parser.add_argument('--prefill-ms', type=float, default=None,
+                        help='Override startup prefill in ms (PYFM_AUDIO_PREFILL_MS)')
+    parser.add_argument('--icom', action='store_true',
+                        help='Force IC-R8600 device path for tuning runs')
+    parser.add_argument('--bb60d', action='store_true',
+                        help='Force BB60D device path for tuning runs')
 
     args = parser.parse_args()
 
     if args.analyze:
         data = parse_log_file()
+        startup_data = parse_startup_log()
         if data is not None:
-            print(f"Loaded {len(data['time_s'])} samples from log")
-            print(f"Time range: {data['time_s'][0]:.1f}s - {data['time_s'][-1]:.1f}s")
-            metrics = compute_metrics(data)
+            print(f"Loaded {len(data['time_s'])} samples from PI log")
+            print(f"PI time range: {data['time_s'][0]:.1f}s - {data['time_s'][-1]:.1f}s")
+            if startup_data is not None:
+                print(
+                    f"Loaded {len(startup_data['elapsed_s'])} samples from startup log "
+                    f"(0-{startup_data['elapsed_s'][-1]:.1f}s)"
+                )
+            else:
+                print("Startup log not found; scoring steady-state PI only.")
+            pi_metrics = compute_metrics(data)
+            startup_metrics = compute_startup_metrics(startup_data)
+            metrics = combine_metrics(pi_metrics, startup_metrics)
             print_metrics(metrics)
 
             # Generate plots
@@ -471,7 +724,12 @@ def main():
         return
 
     if args.optimize:
-        optimize_pi_gains(frequency=args.frequency)
+        optimize_pi_gains(
+            frequency=args.frequency,
+            duration_s=max(30, args.duration),
+            use_icom=args.icom,
+            use_bb60d=args.bb60d,
+        )
         return
 
     if args.run:
@@ -479,14 +737,26 @@ def main():
             duration_s=args.duration,
             frequency=args.frequency,
             kp=args.kp,
-            ki=args.ki
+            ki=args.ki,
+            alpha=args.alpha,
+            prefill_ms=args.prefill_ms,
+            use_icom=args.icom,
+            use_bb60d=args.bb60d,
         )
         if success:
             print("\nRun completed. Analyzing results...")
             data = parse_log_file()
+            startup_data = parse_startup_log()
             if data is not None:
-                print(f"Loaded {len(data['time_s'])} samples from log")
-                metrics = compute_metrics(data)
+                print(f"Loaded {len(data['time_s'])} samples from PI log")
+                if startup_data is not None:
+                    print(
+                        f"Loaded {len(startup_data['elapsed_s'])} samples from startup log "
+                        f"(0-{startup_data['elapsed_s'][-1]:.1f}s)"
+                    )
+                pi_metrics = compute_metrics(data)
+                startup_metrics = compute_startup_metrics(startup_data)
+                metrics = combine_metrics(pi_metrics, startup_metrics)
                 print_metrics(metrics)
                 print("\n" + generate_ascii_plot(data))
                 generate_plot(data)

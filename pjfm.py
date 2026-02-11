@@ -17,9 +17,9 @@ Usage:
 Controls:
     Left/Right arrows: Tune down/up by 200 kHz (FM) or 25 kHz (Weather)
     Up/Down arrows: Volume up/down
-    1-5: Recall frequency preset (FM mode)
+    1-8: Recall frequency preset (FM mode)
     1-7: Recall WX channel (Weather mode)
-    Shift+1-5 (!@#$%): Set preset to current frequency (FM mode)
+    Shift+1-8 (!@#$%^&*): Set preset to current frequency (FM mode)
     w: Toggle Weather radio mode (NBFM for NWS)
     r: Toggle RDS decoder (FM mode only)
     R: Start/stop Opus recording (128 kbps stereo)
@@ -525,9 +525,9 @@ class AudioPlayer:
         # Use a lower initial prefill than the steady-state target to avoid
         # startup overfill when early decode blocks arrive in a burst.
         try:
-            prefill_ms = float(os.environ.get("PYFM_AUDIO_PREFILL_MS", "50"))
+            prefill_ms = float(os.environ.get("PYFM_AUDIO_PREFILL_MS", "35"))
         except ValueError:
-            prefill_ms = 50.0
+            prefill_ms = 35.0
         self._prefill_level_ms = max(0.0, min(self._target_level_ms, prefill_ms))
         self.overflow_samples = 0
 
@@ -706,6 +706,7 @@ class FMRadio:
     FM_FIRST_CHANNEL_HZ = 88_100_000
     FM_LAST_CHANNEL_HZ = 107_900_000
     FM_STEP_HZ = 200_000
+    USER_PRESET_COUNT = 8
 
     # Signal level calibration offset (dB)
     # IQ samples need calibration to match true power in dBm.
@@ -840,8 +841,8 @@ class FMRadio:
         self._startup_prefill_log_start_s = 0.0
         self._startup_prefill_last_overflow_samples = 0
 
-        # Frequency presets (1-5), initialized to None
-        self.presets = [None, None, None, None, None]
+        # Frequency presets (1-8), initialized to None
+        self.presets = [None] * self.USER_PRESET_COUNT
 
         # Tone control settings (applied when stereo decoder is created)
         self._initial_bass_boost = True
@@ -885,7 +886,7 @@ class FMRadio:
             config.read(self.CONFIG_FILE)
 
             # Load presets
-            for i in range(1, 6):
+            for i in range(1, self.USER_PRESET_COUNT + 1):
                 key = str(i)
                 if config.has_option('presets', key):
                     value = config.get('presets', key).strip()
@@ -1723,14 +1724,14 @@ class FMRadio:
 
     def set_preset(self, preset_num):
         """
-        Set a preset (1-5) to the current frequency (FM mode only).
+        Set a preset (1-8) to the current frequency (FM mode only).
 
         Args:
-            preset_num: Preset number 1-5
+            preset_num: Preset number 1-8
         """
         if self.weather_mode:
             return  # No user presets in weather mode
-        if 1 <= preset_num <= 5:
+        if 1 <= preset_num <= self.USER_PRESET_COUNT:
             self.presets[preset_num - 1] = self.device.frequency
             self._save_config()
 
@@ -1738,11 +1739,11 @@ class FMRadio:
         """
         Recall a preset and tune to that frequency.
 
-        In FM mode: presets 1-5 are user-defined.
+        In FM mode: presets 1-8 are user-defined.
         In Weather mode: presets 1-7 are fixed NWS channels.
 
         Args:
-            preset_num: Preset number 1-5 (FM) or 1-7 (Weather)
+            preset_num: Preset number 1-8 (FM) or 1-7 (Weather)
 
         Returns:
             True if preset was recalled, False if preset is empty/invalid
@@ -1753,8 +1754,8 @@ class FMRadio:
                 return self.tune_to(WX_CHANNELS[preset_num])
             return False
         else:
-            # FM mode: user presets 1-5
-            if 1 <= preset_num <= 5:
+            # FM mode: user presets 1-8
+            if 1 <= preset_num <= self.USER_PRESET_COUNT:
                 freq = self.presets[preset_num - 1]
                 if freq is not None:
                     return self.tune_to(freq)
@@ -2535,7 +2536,7 @@ def build_display(radio, width=80):
                 presets.append(f"WX{ch}", style="white")
             presets.append("  ", style="")
     else:
-        # FM mode: show user presets 1-5
+        # FM mode: show user presets 1-8
         presets.append("\nPresets: ", style="yellow bold")
         for i, preset_freq in enumerate(radio.presets, 1):
             presets.append(f"{i}", style="cyan bold")
@@ -2621,8 +2622,12 @@ def run_headless(radio, duration_s=90):
     """Run radio in headless mode for automated testing."""
     import sys
 
+    kp = os.environ.get('PYFM_PI_KP', '0.000015')
+    ki = os.environ.get('PYFM_PI_KI', '0.0000006')
+    alpha = os.environ.get('PYFM_PI_ALPHA', '0.25')
+    prefill_ms = os.environ.get('PYFM_AUDIO_PREFILL_MS', '35')
     print(f"Running headless on {radio.frequency_mhz:.1f} MHz for {duration_s}s...")
-    print(f"PI gains: Kp={os.environ.get('PYFM_PI_KP', '0.00005')}, Ki={os.environ.get('PYFM_PI_KI', '0.0000004')}")
+    print(f"PI gains: Kp={kp}, Ki={ki}, Alpha={alpha}, Prefill={prefill_ms}ms")
 
     try:
         radio.start()
@@ -2776,21 +2781,30 @@ def run_rich_ui(radio):
                         result = radio.toggle_rds_diagnostics()
                         # Result shown via normal display update
                         input_buffer = input_buffer[1:]
-                    elif input_buffer[0] in '1234567':
-                        # Recall preset (1-5 for FM, 1-7 for Weather)
+                    elif input_buffer[0] in '12345678':
+                        # Recall preset (1-8 for FM, 1-7 for Weather)
                         preset_num = int(input_buffer[0])
                         if radio.weather_mode:
                             # Weather mode: 1-7 are WX channels
                             radio.recall_preset(preset_num)
                         else:
-                            # FM mode: 1-5 are user presets
-                            if preset_num <= 5:
+                            # FM mode: 1-8 are user presets
+                            if preset_num <= radio.USER_PRESET_COUNT:
                                 radio.recall_preset(preset_num)
                         input_buffer = input_buffer[1:]
-                    elif input_buffer[0] in '!@#$%':
-                        # Set preset (shift+1-5) - FM mode only
+                    elif input_buffer[0] in '!@#$%^&*':
+                        # Set preset (shift+1-8) - FM mode only
                         if not radio.weather_mode:
-                            preset_map = {'!': 1, '@': 2, '#': 3, '$': 4, '%': 5}
+                            preset_map = {
+                                '!': 1,
+                                '@': 2,
+                                '#': 3,
+                                '$': 4,
+                                '%': 5,
+                                '^': 6,
+                                '&': 7,
+                                '*': 8,
+                            }
                             preset_num = preset_map[input_buffer[0]]
                             radio.set_preset(preset_num)
                         input_buffer = input_buffer[1:]
