@@ -275,7 +275,7 @@ class PLLStereoDecoder:
         # Slightly higher upper threshold keeps low-SNR operation closer to
         # mono, improving the IHF/separation balance around ~15 dB RF SNR.
         self.stereo_blend_high = 35.0
-        self._blend_factor = 1.0
+        self._blend_factor = 0.0
         self._blend_tau_s = 0.12
 
         # L-R path gain calibration (helps recover separation lost to small
@@ -682,14 +682,14 @@ class PLLStereoDecoder:
         # Store pilot for RDS decoder
         self._last_pilot = pilot
 
-        # Measure pilot level for SNR (still needed even with PLL lock detection)
-        pilot_power = np.sqrt(np.mean(pilot ** 2))
+        # Measure pilot RMS for SNR (still needed even with PLL lock detection)
+        pilot_rms = np.sqrt(np.mean(pilot ** 2))
         # Smooth pilot level with a continuous-time constant so behavior is
         # consistent across different input block sizes.
         pilot_alpha = _ema_alpha_from_tau(
             self._pilot_level_tau_s, len(baseband), self.iq_sample_rate
         )
-        self._pilot_level += pilot_alpha * (pilot_power - self._pilot_level)
+        self._pilot_level += pilot_alpha * (pilot_rms - self._pilot_level)
 
         if profiling:
             t0 = self._prof('pilot_bpf', t0)
@@ -923,7 +923,7 @@ class PLLStereoDecoder:
         self._phase_penalty_db = 0.0
         self._coherence_penalty_db = 0.0
         self._peak_amplitude = 0.0
-        self._blend_factor = 1.0
+        self._blend_factor = 0.0
 
         # Reset tone control filter states
         self.bass_state_l = sp_signal.lfilter_zi(self.bass_b, self.bass_a)
