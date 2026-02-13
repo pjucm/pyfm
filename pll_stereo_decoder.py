@@ -10,6 +10,7 @@ for 38 kHz carrier regeneration.
 - Explicit lock/unlock detection with hysteresis
 """
 
+import math
 import time
 import numpy as np
 from scipy import signal as sp_signal
@@ -43,14 +44,19 @@ def _pll_process_kernel_python(
     i_lp,
     q_lp,
 ):
-    """Reference PLL inner loop (Python)."""
+    """Reference PLL inner loop (Python).
+
+    Uses math.cos/math.sin for ~3x faster scalar trig than np.cos/np.sin
+    in the Python fallback path.  Numba compiles both to the same native
+    instruction, so this only matters when Numba is unavailable.
+    """
     n = len(pilot_filtered)
     carrier_38k = np.empty(n, dtype=np.float64)
-    two_pi = 2.0 * np.pi
+    two_pi = 2.0 * math.pi
 
     for i in range(n):
-        cos_phase = np.cos(phase)
-        sin_phase = np.sin(phase)
+        cos_phase = math.cos(phase)
+        sin_phase = math.sin(phase)
 
         # Use current phase for this sample's carrier output.
         # Emitting after phase advance introduces an ~1-sample lead at 38 kHz,
