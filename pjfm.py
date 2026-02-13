@@ -678,7 +678,7 @@ class FMRadio:
     # IQ streaming parameters
     IQ_SAMPLE_RATE = 480000  # Requested IQ sample rate (Hz); actual rate depends on device
     AUDIO_SAMPLE_RATE = 48000
-    IQ_BLOCK_SIZE = 8192  # ~26.2ms budget at 312.5kHz
+    IQ_BLOCK_SIZE = 8192  # ~17.1ms budget at 480kHz
     IQ_QUEUE_MAX_BLOCKS = 8
     IQ_QUEUE_TIMEOUT_S = 0.2
     IQ_LOSS_MUTE_BLOCKS = 1
@@ -718,7 +718,7 @@ class FMRadio:
     # Config file path (in same directory as script)
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
 
-    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False, preamp=None,
+    def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False,
                  rds_enabled=True, realtime=True, iq_sample_rate=None):
         """
         Initialize FM Radio.
@@ -729,13 +729,11 @@ class FMRadio:
             rds_enabled: If True, enable auto-RDS when pilot tone detected
             realtime: If True, real-time scheduling was requested (for config save)
             use_24bit: If True, use 24-bit I/Q samples (IC-R8600 only)
-            preamp: None (don't touch), True (force on), or False (force off)
             iq_sample_rate: Requested IQ sample rate in Hz (optional)
         """
         self.use_icom = use_icom
         self.use_24bit = use_24bit
         self.use_realtime = realtime  # For config save
-        self._preamp_setting = preamp  # None = don't touch, True = on, False = off
 
         if use_icom:
             if IcomR8600 is None:
@@ -1050,10 +1048,6 @@ class FMRadio:
             self._iq_loss_mute_remaining = 0
             self._last_iq_flush_time = 0.0
             self._last_iq_queue_drops = 0
-
-            # Apply preamp setting if specified (IC-R8600 only)
-            #if self._preamp_setting is not None and hasattr(self.device, 'set_preamp'):
-            #    self.device.set_preamp(self._preamp_setting)
 
             # Create decoders
             self.stereo_decoder = PLLStereoDecoder(
@@ -2463,7 +2457,7 @@ def build_display(radio, width=80):
             total_text = Text()
             total_text.append(f"{'Total':<12}", style="cyan bold")
             total_text.append(f"{total_us:7.0f}", style="bright_white bold")
-            budget_us = 8192 / 312500 * 1e6  # ~26214 µs at 312.5 kHz
+            budget_us = radio.IQ_BLOCK_SIZE / radio.device.iq_sample_rate * 1e6
             budget_pct = total_us / budget_us * 100
             if budget_pct > 80:
                 budget_style = "red bold"
@@ -2602,8 +2596,6 @@ def build_display(radio, width=80):
 
 def run_headless(radio, duration_s=90):
     """Run radio in headless mode for automated testing."""
-    import sys
-
     kp = os.environ.get('PYFM_PI_KP', '0.000015')
     ki = os.environ.get('PYFM_PI_KI', '0.0000006')
     alpha = os.environ.get('PYFM_PI_ALPHA', '0.25')
@@ -2642,11 +2634,9 @@ def run_headless(radio, duration_s=90):
 
 def run_rich_ui(radio):
     """Run the rich-based user interface."""
-    import sys
     import tty
     import termios
     import select
-    import os
 
     console = Console()
 
@@ -2760,8 +2750,7 @@ def run_rich_ui(radio):
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] in ('d', 'D'):
                         # Toggle RDS diagnostics (d=start, D=dump to /tmp/rds_timing_diag.txt)
-                        result = radio.toggle_rds_diagnostics()
-                        # Result shown via normal display update
+                        radio.toggle_rds_diagnostics()
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] in '12345678':
                         # Recall preset (1-8 for FM, 1-7 for Weather)
@@ -2843,12 +2832,6 @@ def main():
         action="store_true",
         dest="use_24bit",
         help="Use 24-bit I/Q samples (IC-R8600 only)"
-    )
-    parser.add_argument(
-        "--preamp",
-        choices=["on", "off"],
-        default=None,
-        help="Force preamp on or off (IC-R8600 only, default: unchanged)"
     )
     parser.add_argument(
         "--iq-rate",
@@ -2962,18 +2945,6 @@ def main():
         print("Error: --24bit requires IC-R8600 (use --icom)")
         sys.exit(1)
 
-    # Validate --preamp requires Icom
-    if args.preamp and not use_icom:
-        print("Error: --preamp requires IC-R8600 (use --icom)")
-        sys.exit(1)
-
-    # Convert preamp argument to boolean (None = don't touch)
-    preamp_setting = None
-    if args.preamp == "on":
-        preamp_setting = True
-    elif args.preamp == "off":
-        preamp_setting = False
-
     # Command-line IQ rate overrides config
     if args.iq_rate is not None:
         if args.iq_rate <= 0:
@@ -2983,7 +2954,7 @@ def main():
 
     # Create radio instance
     radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=use_24bit,
-                    preamp=preamp_setting, rds_enabled=args.rds, realtime=use_realtime,
+                    rds_enabled=args.rds, realtime=use_realtime,
                     iq_sample_rate=iq_sample_rate)
     radio.rt_enabled = rt_enabled
 
