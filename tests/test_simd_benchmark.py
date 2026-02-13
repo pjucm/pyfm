@@ -229,14 +229,14 @@ def test_lfilter_fir_benchmark():
     """
     Benchmark FIR filtering with scipy.signal.lfilter.
 
-    Tests 127-tap FIR filter (matches L+R LPF in FMStereoDecoder).
+    Tests 127-tap FIR filter (matches L+R LPF in PLLStereoDecoder).
     lfilter uses compiled C code with contiguous array optimization.
     """
     print("\n" + "=" * 70)
     print("Benchmark: FIR Filter (scipy.signal.lfilter, 127 taps)")
     print("=" * 70)
 
-    # Design filter matching FMStereoDecoder L+R LPF
+    # Design filter matching PLLStereoDecoder L+R LPF
     taps = 127
     fir_coef = signal.firwin(taps, 15000, fs=SAMPLE_RATE_IQ, window=('kaiser', 5.0))
     zi = signal.lfilter_zi(fir_coef, 1.0)
@@ -313,7 +313,7 @@ def test_fm_discriminator_benchmark():
     Benchmark FM quadrature discriminator.
 
     Tests the core FM demodulation: angle(s[n] * conj(s[n-1]))
-    This is the critical path in FMStereoDecoder.demodulate().
+    This is the critical path in PLLStereoDecoder.demodulate().
     All operations should use AVX2 vectorization.
     """
     print("\n" + "=" * 70)
@@ -327,7 +327,7 @@ def test_fm_discriminator_benchmark():
     prev_sample = iq[0]
 
     def discriminator_op():
-        # Exact operation from FMStereoDecoder.demodulate()
+        # Exact operation from PLLStereoDecoder.demodulate()
         samples = np.concatenate([[prev_sample], iq])
         product = samples[1:] * np.conj(samples[:-1])
         baseband = np.angle(product)
@@ -396,7 +396,7 @@ def test_resample_benchmark():
     Benchmark polyphase resampling.
 
     Tests scipy.signal.resample for I/Q rate to audio rate conversion.
-    This is used in FMStereoDecoder for decimation (250 kHz -> 48 kHz).
+    This is used in PLLStereoDecoder for decimation (250 kHz -> 48 kHz).
     resample() uses FFT internally and benefits from PocketFFT optimization.
     """
     print("\n" + "=" * 70)
@@ -448,7 +448,7 @@ def test_realtime_feasibility():
     block_duration_ms = (BLOCK_SIZE_IQ / SAMPLE_RATE_IQ) * 1000
     target_budget_pct = 50  # Should use less than 50% of available time
 
-    # Setup filters (matching FMStereoDecoder)
+    # Setup filters (matching PLLStereoDecoder)
     pilot_bpf = signal.firwin(201, [18500, 19500], fs=SAMPLE_RATE_IQ,
                                pass_zero=False, window=('kaiser', 8.0))
     lr_sum_lpf = signal.firwin(127, 15000, fs=SAMPLE_RATE_IQ, window=('kaiser', 5.0))

@@ -3,15 +3,14 @@ r"""
 Panadapter Demodulator Test Suite
 
 Tests the panadapter's WBFMStereoDemodulator and NBFMDemodulator classes,
-which wrap the core FMStereoDecoder/PLLStereoDecoder and standalone NBFM
-demodulation respectively.
+which wrap PLLStereoDecoder and standalone NBFM demodulation respectively.
 
 Usage:
     python test_panadapter.py          # Run all tests with detailed output
     pytest test_panadapter.py -v       # Run with pytest (if installed)
 
 WBFMStereoDemodulator Signal Flow:
-    IQ (960 kHz) -> FIR decimation (2x) -> (PLLStereoDecoder/FMStereoDecoder at 480 kHz) -> Audio (48 kHz)
+    IQ (960 kHz) -> FIR decimation (2x) -> PLLStereoDecoder (480 kHz) -> Audio (48 kHz)
     Also supports frequency offset shifting and squelch gating.
 
 NBFMDemodulator Signal Flow:

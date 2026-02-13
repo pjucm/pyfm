@@ -2,7 +2,7 @@
 """
 PLL-based FM Stereo Decoder
 
-Drop-in replacement for FMStereoDecoder that uses a second-order Type 2 PLL
+PLL-based FM stereo decoder using a second-order Type 2 PLL
 for 38 kHz carrier regeneration instead of pilot-squaring.
 
 Advantages over pilot-squaring:

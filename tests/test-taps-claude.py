@@ -3,7 +3,7 @@
 L+R / L-R LPF Tap Count Test Harness
 
 Sweeps different FIR filter lengths for the 15 kHz L+R and L-R lowpass filters
-in FMStereoDecoder and PLLStereoDecoder.  Measures:
+in PLLStereoDecoder.  Measures:
 
   - Pilot rejection at 19 kHz (the bottleneck identified in IHF_SNR_ANALYSIS.txt)
   - IHF/EIA SNR (A-weighted, de-emphasized)
@@ -167,7 +167,7 @@ def demodulate_blocks(decoder, iq, block_size=8192):
 def run_test(lpf_taps, iq_rate, audio_rate, a_sos, iq_mono, iq_stereo,
              duration, beta=6.0):
     """Run full test suite for one tap count. Returns result dict."""
-    from demodulator import FMStereoDecoder
+    from pll_stereo_decoder import PLLStereoDecoder
 
     result = {'taps': lpf_taps}
 
@@ -177,7 +177,7 @@ def run_test(lpf_taps, iq_rate, audio_rate, a_sos, iq_mono, iq_stereo,
     skip = int(0.1 * audio_rate)
 
     # --- IHF SNR (mono: identical L+R) ---
-    dec = FMStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
+    dec = PLLStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
                           deviation=75000, deemphasis=75e-6, force_mono=True)
     dec.bass_boost_enabled = False
     dec.treble_boost_enabled = False
@@ -190,7 +190,7 @@ def run_test(lpf_taps, iq_rate, audio_rate, a_sos, iq_mono, iq_stereo,
     result['ihf_mono'] = measure_snr_fft(left_m_aw, 1000, audio_rate)
 
     # --- IHF SNR (stereo: identical L+R with pilot) ---
-    dec_s = FMStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
+    dec_s = PLLStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
                             deviation=75000, deemphasis=75e-6)
     dec_s.bass_boost_enabled = False
     dec_s.treble_boost_enabled = False
@@ -203,7 +203,7 @@ def run_test(lpf_taps, iq_rate, audio_rate, a_sos, iq_mono, iq_stereo,
     result['ihf_stereo'] = measure_snr_fft(left_s_aw, 1000, audio_rate)
 
     # --- Raw SNR (stereo, no A-weighting, no de-emphasis) ---
-    dec_raw = FMStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
+    dec_raw = PLLStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
                               deviation=75000, deemphasis=1e-9)
     dec_raw.bass_boost_enabled = False
     dec_raw.treble_boost_enabled = False
@@ -215,7 +215,7 @@ def run_test(lpf_taps, iq_rate, audio_rate, a_sos, iq_mono, iq_stereo,
     result['raw_stereo'] = measure_snr_fft(left_raw, 1000, audio_rate)
 
     # --- Stereo separation (1 kHz left only) ---
-    dec_sep = FMStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
+    dec_sep = PLLStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
                               deviation=75000, deemphasis=1e-9)
     dec_sep.bass_boost_enabled = False
     dec_sep.treble_boost_enabled = False
@@ -228,7 +228,7 @@ def run_test(lpf_taps, iq_rate, audio_rate, a_sos, iq_mono, iq_stereo,
         audio_sep[half:, 0], audio_sep[half:, 1], 1000, audio_rate)
 
     # --- Throughput benchmark (5 runs, best of 3) ---
-    dec_bench = FMStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
+    dec_bench = PLLStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
                                 deviation=75000, deemphasis=75e-6)
     dec_bench.bass_boost_enabled = False
     dec_bench.treble_boost_enabled = False
@@ -253,7 +253,7 @@ def run_test(lpf_taps, iq_rate, audio_rate, a_sos, iq_mono, iq_stereo,
     result['realtime_x'] = duration / best3
 
     # --- Per-filter CPU time (single run with profiling) ---
-    dec_prof = FMStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
+    dec_prof = PLLStereoDecoder(iq_sample_rate=iq_rate, audio_sample_rate=audio_rate,
                                deviation=75000, deemphasis=75e-6)
     dec_prof.bass_boost_enabled = False
     dec_prof.treble_boost_enabled = False

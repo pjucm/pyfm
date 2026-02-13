@@ -2,7 +2,7 @@
 
 ## Overview
 
-`test_pjfm.py` is a comprehensive test suite for the FM stereo decoder in `demodulator.py`. It verifies mathematically correct mono and stereo FM decoding with textbook accuracy and documents phase/delay relationships throughout the decode chain.
+`test_pjfm.py` is a comprehensive test suite for the FM stereo decoder. It verifies mathematically correct mono and stereo FM decoding with textbook accuracy and documents phase/delay relationships throughout the decode chain.
 
 ## Running the Tests
 
@@ -64,7 +64,7 @@ iq = cos(phase) + j*sin(phase)
 
 ### Demodulation Method
 
-**Quadrature Discriminator** (`FMStereoDecoder`):
+**Quadrature Discriminator** (`PLLStereoDecoder`):
 ```python
 # Instantaneous frequency from phase difference
 product = samples[n] * conj(samples[n-1])
@@ -105,10 +105,7 @@ FM Demodulation (quadrature discriminator)
     +---> Pilot BPF (201 taps, 18.5-19.5 kHz)
     |         |
     |         v
-    |     Pilot-squaring: 2*sin^2(x)-1 = -cos(2x)
-    |         |
-    |         v
-    |     38 kHz carrier regeneration
+    |     PLL carrier recovery → 38 kHz coherent carrier
     |
     +---> L+R LPF (127 taps, 15 kHz) + 100 sample delay buffer
     |         |
@@ -191,11 +188,7 @@ Tests stereo separation across the audio frequency range.
 ### test_subcarrier_phase_sensitivity
 Documents decoder sensitivity to transmitter 38 kHz subcarrier phase.
 
-The pilot-squaring method produces a specific carrier phase:
-```
-Pilot: sin(wt)
-Squared: 2*sin^2(wt) - 1 = -cos(2wt)
-```
+The PLL produces a carrier locked to the pilot phase:
 
 | TX Subcarrier | RX Carrier | Result |
 |---------------|------------|--------|
@@ -250,11 +243,7 @@ Tests decoder behavior with AWGN-corrupted input.
 ## Implementation Notes
 
 ### Carrier Regeneration
-The decoder uses pilot-squaring for 38 kHz carrier regeneration:
-```
-carrier = 2 * (pilot_normalized)^2 - 1
-```
-This exploits the trig identity `2*sin^2(x) - 1 = -cos(2x)` to double the pilot frequency without a PLL.
+The decoder uses a PLL (phase-locked loop) to lock onto the 19 kHz pilot and synthesize a coherent 38 kHz carrier for L-R demodulation.
 
 ### Filter Design
 All FIR filters use Kaiser windows for steep rolloff:

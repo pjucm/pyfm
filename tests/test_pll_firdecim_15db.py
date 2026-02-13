@@ -3,7 +3,7 @@
 Standalone 15 dB RF-SNR matrix for stereo decoder/resampler evaluation.
 
 Matrix:
-- Decoders: FMStereoDecoder, PLLStereoDecoder
+- Decoder: PLLStereoDecoder
 - Resamplers: interp, firdecim
 
 Metrics:
@@ -20,7 +20,6 @@ from scipy import signal
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from demodulator import FMStereoDecoder
 from pll_stereo_decoder import PLLStereoDecoder
 
 
@@ -36,7 +35,6 @@ DEFAULT_BLOCK_SIZE = 8192
 BLOCK_SIZE_SWEEP = (1024, 2048, 4096, 8192)
 
 DECODER_MATRIX = (
-    ("FMStereoDecoder", FMStereoDecoder),
     ("PLLStereoDecoder", PLLStereoDecoder),
 )
 RESAMPLER_MODES = ("interp", "firdecim")

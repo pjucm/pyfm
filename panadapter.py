@@ -45,11 +45,7 @@ except (ImportError, RuntimeError):
     BB_MIN_FREQ = 9.0e3
     BB_MAX_FREQ = 6.4e9
 
-from demodulator import FMStereoDecoder
-try:
-    from pll_stereo_decoder import PLLStereoDecoder
-except ImportError:
-    PLLStereoDecoder = None
+from pll_stereo_decoder import PLLStereoDecoder
 from rds_decoder import RDSDecoder, pi_to_callsign
 
 # Optional IC-R8600 support
@@ -81,8 +77,8 @@ FM_BROADCAST_STEP = 200e3   # 200 kHz button step for FM broadcast (NA channel s
 FM_BROADCAST_SNAP = 100e3   # 100 kHz click-to-tune snap (all valid FM channels)
 FM_BROADCAST_DEFAULT = 89.9e6  # Default FM broadcast frequency
 FM_BROADCAST_SAMPLE_RATE = 1250000  # 1.25 MHz for wider spectrum view (decimated for audio)
-DEFAULT_STEREO_DECODER = 'pll'  # 'pll' or 'squaring'
-VALID_STEREO_DECODERS = ('pll', 'squaring')
+DEFAULT_STEREO_DECODER = 'pll'
+VALID_STEREO_DECODERS = ('pll',)
 
 # Configuration file path (same directory as script)
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panadapter.cfg')
@@ -410,11 +406,11 @@ class NBFMDemodulator:
 class WBFMStereoDemodulator:
     """Wideband FM stereo demodulator for FM broadcast (88-108 MHz).
 
-    Wraps either PLLStereoDecoder or FMStereoDecoder, providing stereo
-    decoding with pilot detection and SNR-based blending.
+    Wraps PLLStereoDecoder, providing stereo decoding with pilot detection
+    and SNR-based blending.
 
     Supports higher input sample rates by using efficient FIR decimation to
-    ~312.5 kHz for optimal stereo decoder performance.
+    ~480 kHz for optimal stereo decoder performance.
     """
 
     # Target sample rate for stereo decoder (matches pjfm default of 480 kHz)
@@ -452,17 +448,8 @@ class WBFMStereoDemodulator:
             self.decim_filter = None
 
         # Create the stereo decoder at the decimated rate.
-        decoder_class = FMStereoDecoder
-        if self.stereo_decoder_name == 'pll':
-            if PLLStereoDecoder is not None:
-                decoder_class = PLLStereoDecoder
-            else:
-                print("Warning: PLL stereo decoder unavailable; using pilot-squaring decoder")
-                self.stereo_decoder_name = 'squaring'
-        else:
-            self.stereo_decoder_name = 'squaring'
-
-        self.stereo_decoder = decoder_class(
+        self.stereo_decoder_name = 'pll'
+        self.stereo_decoder = PLLStereoDecoder(
             iq_sample_rate=self.decimated_rate,
             audio_sample_rate=audio_sample_rate,
             deviation=WBFM_DEVIATION,

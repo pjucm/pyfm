@@ -195,7 +195,7 @@ class BB60D:
 
     # configure_fm_demod() removed - using software FM demodulation instead
     # The hardware FM demodulator is no longer used; all FM processing
-    # is done via IQ streaming + FMStereoDecoder
+    # is done via IQ streaming + PLLStereoDecoder
 
     def configure_iq_streaming(self, freq=None, sample_rate=250000):
         """

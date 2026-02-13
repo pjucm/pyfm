@@ -46,7 +46,8 @@ pip install numpy scipy sounddevice rich pyusb  # pyusb for IC-R8600
 
 - `pjfm.py` - Main CLI application with terminal UI (Rich), audio playback, spectrum analyzer
 - `panadapter.py` - PyQt5 GUI with spectrum/waterfall display and FM demodulation
-- `demodulator.py` - FM stereo decoder (FMStereoDecoder) and NBFM decoder (NBFMDecoder)
+- `demodulator.py` - Shared DSP utilities and NBFM decoder (NBFMDecoder)
+- `pll_stereo_decoder.py` - PLL-based FM stereo decoder (PLLStereoDecoder)
 - `rds_decoder.py` - RDS/RBDS decoding (station ID, program type, radio text, clock)
 - `bb60d.py` - SignalHound BB60D I/Q streaming interface
 - `icom_r8600.py` - IC-R8600 USB I/Q interface with CI-V control
@@ -95,9 +96,9 @@ Key features:
 baseband = angle(s[n] * conj(s[n-1])) * (sample_rate / (2π * deviation))
 ```
 
-**Stereo Decoding** (FMStereoDecoder):
+**Stereo Decoding** (PLLStereoDecoder):
 - 19 kHz pilot BPF with Kaiser window (201 taps)
-- Pilot-squaring for 38 kHz carrier regeneration
+- PLL-based 38 kHz carrier recovery (replaces legacy pilot-squaring)
 - L+R/L-R bandpass filtering and matrix decoding
 - SNR-based stereo blend (mono below 15 dB, full stereo above 30 dB)
 - 75 µs de-emphasis filter
@@ -132,7 +133,7 @@ python panadapter.py --icom --sample-rate 960000    # Custom sample rate
 
 **Demodulators**:
 - **NBFMDemodulator** - NBFM for weather radio (5 kHz deviation, optional hum filter)
-- **WBFMStereoDemodulator** - Wraps FMStereoDecoder with decimation for higher sample rates
+- **WBFMStereoDemodulator** - Wraps PLLStereoDecoder with decimation for higher sample rates
 
 ### Features
 

@@ -23,7 +23,6 @@ from scipy import signal
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from demodulator import FMStereoDecoder
 from pll_stereo_decoder import PLLStereoDecoder
 
 
@@ -177,10 +176,6 @@ class _PolyphaseResamplerMixin:
         return left, right
 
 
-class PolyphaseFMStereoDecoder(_PolyphaseResamplerMixin, FMStereoDecoder):
-    """FMStereoDecoder with polyphase output resampling."""
-
-
 class PolyphasePLLStereoDecoder(_PolyphaseResamplerMixin, PLLStereoDecoder):
     """PLLStereoDecoder with polyphase output resampling."""
 
@@ -201,9 +196,9 @@ def _build_decoder(decoder_cls, settings):
     decoder.stereo_blend_enabled = False
     decoder.stereo_blend_low = -100.0
     decoder.stereo_blend_high = -90.0
-    # Synthetic pilot levels in this bench are below FMStereoDecoder's
-    # default threshold; lower the threshold so both decoder families are
-    # evaluated in true stereo mode for the resampler comparison.
+    # Synthetic pilot levels in this bench are below the default threshold;
+    # lower the threshold so the decoder is evaluated in true stereo mode
+    # for the resampler comparison.
     if hasattr(decoder, "pilot_threshold"):
         decoder.pilot_threshold = 0.002
     return decoder
@@ -324,17 +319,6 @@ def test_pll_resampler_firdecim_vs_polyphase():
     _assert_basic_result_quality(result)
 
 
-def test_pilot_squaring_resampler_firdecim_vs_polyphase():
-    settings = _load_pjfm_defaults()
-    result = _run_bench(
-        "FMStereoDecoder",
-        FMStereoDecoder,
-        PolyphaseFMStereoDecoder,
-        settings,
-    )
-    _assert_basic_result_quality(result)
-
-
 if __name__ == "__main__":
     defaults = _load_pjfm_defaults()
     print(f"Using pjfm defaults from {PJFM_CFG}:")
@@ -352,11 +336,4 @@ if __name__ == "__main__":
         PolyphasePLLStereoDecoder,
         defaults,
     )
-    fm_result = _run_bench(
-        "FMStereoDecoder",
-        FMStereoDecoder,
-        PolyphaseFMStereoDecoder,
-        defaults,
-    )
     _assert_basic_result_quality(pll_result)
-    _assert_basic_result_quality(fm_result)

@@ -33,7 +33,7 @@ from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 
 from bb60d import BB60D, get_api_version
-from demodulator import FMStereoDecoder
+from pll_stereo_decoder import PLLStereoDecoder
 from rds_decoder import RDSDecoder, pi_to_callsign
 
 app = Flask(__name__)
@@ -219,7 +219,7 @@ class WebRadio:
             self.device.configure_iq_streaming(self.device.frequency, self.IQ_SAMPLE_RATE)
 
             actual_rate = self.device.iq_sample_rate
-            self.stereo_decoder = FMStereoDecoder(
+            self.stereo_decoder = PLLStereoDecoder(
                 iq_sample_rate=actual_rate,
                 audio_sample_rate=self.AUDIO_SAMPLE_RATE,
                 deviation=75000,
