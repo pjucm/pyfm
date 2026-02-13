@@ -1046,7 +1046,7 @@ def test_snr_with_noise():
     Verifies graceful degradation.
     """
     print("\n" + "=" * 60)
-    print("TEST: IHF/EIA SNR with Noisy Input (PLL, firdecim)")
+    print("TEST: IHF/EIA SNR with Noisy Input (PLL)")
     print("=" * 60)
 
     iq_rate = 480000
@@ -1057,15 +1057,9 @@ def test_snr_with_noise():
     test_freq = 1000
     a_weight_sos = design_a_weighting(audio_rate)
 
-    # Force this test to exercise the exact path requested.
-    resampler_mode = "firdecim"
-    resampler_taps = 127
-    resampler_beta = 8.0
-
     decoder_paths = [("PLLStereoDecoder", PLLStereoDecoder)]
 
     print(f"  IQ rate: {iq_rate/1000:.0f} kHz, metric: IHF/EIA (A-weighted, de-emphasized)")
-    print(f"  Decoder resampler: mode={resampler_mode}, taps={resampler_taps}, beta={resampler_beta:.1f}")
 
     all_passed = True
 
@@ -1087,8 +1081,8 @@ def test_snr_with_noise():
 
     for path_idx, (path_name, decoder_class) in enumerate(decoder_paths):
         print(f"\n  Path: {path_name}")
-        print(f"    {'Input SNR':>12s}  {'IHF SNR':>10s}  {'Sep':>8s}  {'Pilot':>8s}  {'Blend':>8s}  {'Resampler':>10s}")
-        print(f"    {'--------':>12s}  {'-------':>10s}  {'---':>8s}  {'-----':>8s}  {'-----':>8s}  {'---------':>10s}")
+        print(f"    {'Input SNR':>12s}  {'IHF SNR':>10s}  {'Sep':>8s}  {'Pilot':>8s}  {'Blend':>8s}")
+        print(f"    {'--------':>12s}  {'-------':>10s}  {'---':>8s}  {'-----':>8s}  {'-----':>8s}")
 
         ihf_by_level = []
         blend_by_level = []
@@ -1107,9 +1101,6 @@ def test_snr_with_noise():
                 audio_sample_rate=audio_rate,
                 deviation=75000,
                 deemphasis=75e-6,
-                resampler_mode=resampler_mode,
-                resampler_taps=resampler_taps,
-                resampler_beta=resampler_beta,
             )
             decoder.bass_boost_enabled = False
             decoder.treble_boost_enabled = False
@@ -1118,7 +1109,6 @@ def test_snr_with_noise():
             audio = demodulate_with_settling(decoder, iq_noisy)
             pilot_detected = decoder.pilot_detected
             blend_factor = decoder.stereo_blend_factor
-            runtime_resampler = getattr(decoder, "_resampler_runtime_mode", decoder.resampler_mode)
 
             skip = int(0.1 * audio_rate)
             left_out = audio[skip:-skip, 0]
@@ -1143,9 +1133,6 @@ def test_snr_with_noise():
                 audio_sample_rate=audio_rate,
                 deviation=75000,
                 deemphasis=75e-6,
-                resampler_mode=resampler_mode,
-                resampler_taps=resampler_taps,
-                resampler_beta=resampler_beta,
             )
             decoder_sep.bass_boost_enabled = False
             decoder_sep.treble_boost_enabled = False
@@ -1157,21 +1144,16 @@ def test_snr_with_noise():
             sep_left_power = goertzel_power(left_sep, test_freq, audio_rate)
             sep_right_power = goertzel_power(right_sep, test_freq, audio_rate)
             separation_db = 10 * np.log10((sep_left_power + 1e-20) / (sep_right_power + 1e-20))
-            runtime_resampler_sep = getattr(decoder_sep, "_resampler_runtime_mode", decoder_sep.resampler_mode)
 
             print(
                 f"    {input_snr:10d} dB  {output_snr:8.1f} dB  {separation_db:6.1f} dB  "
-                f"{'Yes' if pilot_detected else 'No':>8s}  {blend_factor:8.2f}  {runtime_resampler:>10s}"
+                f"{'Yes' if pilot_detected else 'No':>8s}  {blend_factor:8.2f}"
             )
 
             ihf_by_level.append(output_snr)
             blend_by_level.append(blend_factor)
 
             if not pilot_detected:
-                all_passed = False
-            if runtime_resampler != "firdecim":
-                all_passed = False
-            if runtime_resampler_sep != "firdecim":
                 all_passed = False
 
         # Graceful degradation checks:
@@ -1202,7 +1184,7 @@ def test_snr_with_noise():
             if curr_blend > prev_blend + 0.03:
                 all_passed = False
 
-    print(f"\n  Result: {'PASS' if all_passed else 'FAIL'} (IHF metric + firdecim path verified)")
+    print(f"\n  Result: {'PASS' if all_passed else 'FAIL'} (IHF metric verified)")
 
     return all_passed
 

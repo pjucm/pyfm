@@ -689,9 +689,6 @@ class FMRadio:
     STARTUP_PREFILL_LOG_PATH_DEFAULT = "off"
     STEREO_LPF_TAPS_DEFAULT = 255
     STEREO_LPF_BETA_DEFAULT = 6.0
-    STEREO_RESAMPLER_MODE_DEFAULT = "firdecim"
-    STEREO_RESAMPLER_TAPS_DEFAULT = 127
-    STEREO_RESAMPLER_BETA_DEFAULT = 8.0
     PLL_KERNEL_MODE_DEFAULT = "auto"
     # Blend curve defaults (linear in decoder): 15 dB -> 50% blend.
     STEREO_BLEND_LOW_DB_DEFAULT = 5.0
@@ -771,8 +768,9 @@ class FMRadio:
         # Auto RDS mode (enabled by default, disable with --no-rds)
         self.auto_mode_enabled = rds_enabled
 
-        # Debug displays (disabled by default, toggle with '/')
-        self.show_buffer_stats = False
+        # Debug displays (hidden toggles)
+        self.show_buffer_stats = False    # '/' key
+        self.show_quality_detail = False  # '.' key
 
         # Spectrum analyzer
         self.spectrum_analyzer = SpectrumAnalyzer(
@@ -850,9 +848,6 @@ class FMRadio:
         # Stereo decoder DSP tuning
         self.stereo_lpf_taps = self.STEREO_LPF_TAPS_DEFAULT
         self.stereo_lpf_beta = self.STEREO_LPF_BETA_DEFAULT
-        self.stereo_resampler_mode = self.STEREO_RESAMPLER_MODE_DEFAULT
-        self.stereo_resampler_taps = self.STEREO_RESAMPLER_TAPS_DEFAULT
-        self.stereo_resampler_beta = self.STEREO_RESAMPLER_BETA_DEFAULT
         self.stereo_blend_low_db = self.STEREO_BLEND_LOW_DB_DEFAULT
         self.stereo_blend_high_db = self.STEREO_BLEND_HIGH_DB_DEFAULT
 
@@ -920,24 +915,6 @@ class FMRadio:
                         self.stereo_lpf_beta = beta
                 except ValueError:
                     pass
-            if config.has_option('radio', 'stereo_resampler_mode'):
-                mode = config.get('radio', 'stereo_resampler_mode').strip().lower()
-                if mode in ('interp', 'firdecim', 'auto'):
-                    self.stereo_resampler_mode = mode
-            if config.has_option('radio', 'stereo_resampler_taps'):
-                try:
-                    taps = int(config.get('radio', 'stereo_resampler_taps'))
-                    if taps >= 3 and (taps % 2) == 1:
-                        self.stereo_resampler_taps = taps
-                except ValueError:
-                    pass
-            if config.has_option('radio', 'stereo_resampler_beta'):
-                try:
-                    beta = float(config.get('radio', 'stereo_resampler_beta'))
-                    if beta > 0:
-                        self.stereo_resampler_beta = beta
-                except ValueError:
-                    pass
             if config.has_option('radio', 'stereo_blend_low_db'):
                 try:
                     self.stereo_blend_low_db = float(config.get('radio', 'stereo_blend_low_db'))
@@ -981,9 +958,6 @@ class FMRadio:
             'squelch_threshold': f'{self.squelch_threshold:.1f}',
             'stereo_lpf_taps': str(self.stereo_lpf_taps),
             'stereo_lpf_beta': f'{self.stereo_lpf_beta:.2f}',
-            'stereo_resampler_mode': self.stereo_resampler_mode,
-            'stereo_resampler_taps': str(self.stereo_resampler_taps),
-            'stereo_resampler_beta': f'{self.stereo_resampler_beta:.2f}',
             'stereo_blend_low_db': f'{self.stereo_blend_low_db:.1f}',
             'stereo_blend_high_db': f'{self.stereo_blend_high_db:.1f}',
             'pll_kernel_mode': self.pll_kernel_mode,
@@ -1058,23 +1032,17 @@ class FMRadio:
                 force_mono=self.force_mono,
                 stereo_lpf_taps=self.stereo_lpf_taps,
                 stereo_lpf_beta=self.stereo_lpf_beta,
-                resampler_mode=self.stereo_resampler_mode,
-                resampler_taps=self.stereo_resampler_taps,
-                resampler_beta=self.stereo_resampler_beta,
                 pll_kernel_mode=effective_pll_mode,
             )
             self.stereo_decoder.stereo_blend_low = self.stereo_blend_low_db
             self.stereo_decoder.stereo_blend_high = self.stereo_blend_high_db
             self.stereo_decoder.bass_boost_enabled = self._initial_bass_boost
             self.stereo_decoder.treble_boost_enabled = self._initial_treble_boost
-            configured_resampler = getattr(self.stereo_decoder, 'resampler_mode', 'unknown')
-            runtime_resampler = getattr(self.stereo_decoder, '_resampler_runtime_mode', configured_resampler)
             pll_backend = getattr(self.stereo_decoder, 'pll_backend', 'n/a')
             print(
                 "pjfm startup: "
                 f"decoder=PLLStereoDecoder, "
                 f"pll_mode={effective_pll_mode}, pll_backend={pll_backend}, "
-                f"resampler={runtime_resampler} (configured={configured_resampler}), "
                 f"blend={self.stereo_blend_low_db:.1f}-{self.stereo_blend_high_db:.1f}dB"
             )
 
@@ -1800,6 +1768,10 @@ class FMRadio:
         """Toggle buffer statistics display (hidden debug feature)."""
         self.show_buffer_stats = not self.show_buffer_stats
 
+    def toggle_quality_detail(self):
+        """Toggle stereo quality component display (hidden debug feature)."""
+        self.show_quality_detail = not self.show_quality_detail
+
     def toggle_rds_diagnostics(self):
         """Toggle RDS timing diagnostics collection."""
         if self.rds_decoder:
@@ -2037,7 +2009,6 @@ def build_display(radio, width=80):
     snr_text = Text()
     if radio.weather_mode:
         # NBFM voice thresholds (3 kHz audio bandwidth)
-        # Voice is intelligible at much lower SNR than music
         if snr > 15:
             snr_text.append(f"{snr:.1f} dB", style="green bold")
             snr_text.append("  (Excellent)", style="green")
@@ -2053,27 +2024,44 @@ def build_display(radio, width=80):
         else:
             snr_text.append(f"{snr:.1f} dB", style="red bold")
             snr_text.append("  (Very Poor)", style="red")
-        bw_label = "3kHz"
+        snr_text.append("  [3kHz]", style="dim")
+        table.add_row("SNR:", snr_text)
     else:
-        # WBFM broadcast thresholds (15-53 kHz audio bandwidth)
-        if snr > 35:
-            snr_text.append(f"{snr:.1f} dB", style="green bold")
+        # WBFM: composite stereo quality + three contributing factors
+        dec = radio.stereo_decoder
+        quality = getattr(dec, "stereo_quality_db", snr) if dec else snr
+        if quality > 35:
+            snr_text.append(f"{quality:.1f} dB", style="green bold")
             snr_text.append("  (Excellent)", style="green")
-        elif snr > 25:
-            snr_text.append(f"{snr:.1f} dB", style="green bold")
+        elif quality > 25:
+            snr_text.append(f"{quality:.1f} dB", style="green bold")
             snr_text.append("  (Good)", style="green")
-        elif snr > 15:
-            snr_text.append(f"{snr:.1f} dB", style="yellow bold")
+        elif quality > 15:
+            snr_text.append(f"{quality:.1f} dB", style="yellow bold")
             snr_text.append("  (Fair)", style="yellow")
-        elif snr > 10:
-            snr_text.append(f"{snr:.1f} dB", style="yellow bold")
+        elif quality > 10:
+            snr_text.append(f"{quality:.1f} dB", style="yellow bold")
             snr_text.append("  (Poor)", style="yellow")
         else:
-            snr_text.append(f"{snr:.1f} dB", style="red bold")
+            snr_text.append(f"{quality:.1f} dB", style="red bold")
             snr_text.append("  (Very Poor)", style="red")
         bw_label = "53kHz" if radio.pilot_detected else "15kHz"
-    snr_text.append(f"  [{bw_label}]", style="dim")
-    table.add_row("SNR:", snr_text)
+        snr_text.append(f"  [{bw_label}]", style="dim")
+        table.add_row("Quality:", snr_text)
+
+        # Three quality components (toggle with '.')
+        if dec and radio.show_quality_detail:
+            comp_text = Text()
+            pilot = getattr(dec, "pilot_metric_db", 0.0)
+            phase = getattr(dec, "phase_penalty_db", 0.0)
+            coher = getattr(dec, "coherence_penalty_db", 0.0)
+            comp_text.append(f"Pilot {pilot:+.1f}", style="cyan")
+            comp_text.append("  Phase ", style="dim")
+            comp_text.append(f"{phase:+.1f}", style="cyan" if phase > -3 else "yellow")
+            comp_text.append("  Coher ", style="dim")
+            comp_text.append(f"{coher:+.1f}", style="cyan" if coher > -3 else "yellow")
+            comp_text.append(f"  SNR {snr:.1f}", style="dim")
+            table.add_row("", comp_text)
 
     # S-meter row
     s_meter = Text()
@@ -2743,6 +2731,10 @@ def run_rich_ui(radio):
                     elif input_buffer[0] == '/':
                         # Toggle buffer stats (hidden debug feature)
                         radio.toggle_buffer_stats()
+                        input_buffer = input_buffer[1:]
+                    elif input_buffer[0] == '.':
+                        # Toggle stereo quality detail (hidden debug feature)
+                        radio.toggle_quality_detail()
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] == 'P':
                         # Toggle demod profiling (hidden debug feature)

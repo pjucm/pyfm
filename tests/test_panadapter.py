@@ -371,10 +371,8 @@ def create_wbfm_demod(iq_rate=ICOM_SAMPLE_RATE_FM, audio_rate=AUDIO_SAMPLE_RATE,
 
 
 def expected_decoder_name(requested_decoder):
-    """Return the effective decoder name after panadapter fallback logic."""
-    if requested_decoder == 'pll' and PLLStereoDecoder is None:
-        return 'squaring'
-    return requested_decoder
+    """Return the effective decoder name (always PLL)."""
+    return 'pll'
 
 
 def test_wbfm_primary_decoder_selected():
@@ -554,8 +552,6 @@ def test_wbfm_mono_decode():
     """
     Test mono decoding (no pilot tone) through WBFMStereoDemodulator.
 
-    Uses pilot-squaring decoder to match legacy pjfm validation targets.
-
     Pass criteria: no pilot detect, L/R correlation > 0.999, correct frequency
     """
     print("\n" + "=" * 60)
@@ -574,7 +570,7 @@ def test_wbfm_mono_decode():
     multiplex = generate_fm_stereo_multiplex(mono, mono, iq_rate, include_pilot=False)
     iq = fm_modulate(multiplex, iq_rate)
 
-    demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate, stereo_decoder='squaring')
+    demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate)
     audio = process_with_settling(demod, iq)
 
     pilot_detected = demod.pilot_detected
@@ -605,8 +601,6 @@ def test_wbfm_stereo_decode():
     """
     Test stereo decoding with different tones on L and R.
 
-    Uses pilot-squaring decoder to match legacy pjfm validation targets.
-
     Pass criteria: Pilot detected, channel separation > 20 dB
     """
     print("\n" + "=" * 60)
@@ -627,7 +621,7 @@ def test_wbfm_stereo_decode():
     multiplex = generate_fm_stereo_multiplex(left, right, iq_rate, subcarrier_phase='neg_cos')
     iq = fm_modulate(multiplex, iq_rate)
 
-    demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate, stereo_decoder='squaring')
+    demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate)
     audio = process_with_settling(demod, iq)
 
     pilot_detected = demod.pilot_detected
@@ -664,8 +658,6 @@ def test_wbfm_stereo_separation():
     """
     Test stereo separation across frequency range.
 
-    Uses pilot-squaring decoder to match legacy pjfm validation targets.
-
     Pass criteria: >30 dB separation at all tested frequencies
     """
     print("\n" + "=" * 60)
@@ -684,7 +676,7 @@ def test_wbfm_stereo_separation():
     separations = []
 
     for freq in test_freqs:
-        demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate, stereo_decoder='squaring')
+        demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate)
 
         n_samples = int(duration * iq_rate)
         t = np.arange(n_samples) / iq_rate
@@ -722,7 +714,7 @@ def test_wbfm_stereo_separation():
 
 def test_wbfm_subcarrier_phase():
     """
-    Test pilot-squaring decoder sensitivity to subcarrier phase.
+    Test PLL decoder sensitivity to subcarrier phase.
 
     neg_cos: Should work correctly
     cos: Should give inverted stereo
@@ -732,7 +724,7 @@ def test_wbfm_subcarrier_phase():
     print("TEST: WBFM Subcarrier Phase Sensitivity")
     print("=" * 60)
     print()
-    print("  The pilot-squaring decoder produces -cos(2wt) carrier")
+    print("  The PLL decoder produces -cos(2wt) carrier")
     print("  This test verifies correct behavior with different TX phases")
     print()
 
@@ -752,8 +744,7 @@ def test_wbfm_subcarrier_phase():
         multiplex = generate_fm_stereo_multiplex(left, right, iq_rate, subcarrier_phase=phase_name)
         iq = fm_modulate(multiplex, iq_rate)
 
-        # This phase-relationship test is specific to pilot-squaring behavior.
-        demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate, stereo_decoder='squaring')
+        demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate)
         audio = process_with_settling(demod, iq)
 
         skip = len(audio) // 2
@@ -785,9 +776,7 @@ def test_wbfm_group_delay():
     """
     Test L/R timing alignment through WBFMStereoDemodulator.
 
-    Uses pilot-squaring decoder to match legacy pjfm validation targets.
-
-    Pass criteria: L/R timing difference < 5 samples at 48 kHz
+    Pass criteria: L/R timing difference < 10 samples at 48 kHz
     """
     print("\n" + "=" * 60)
     print("TEST: WBFM Group Delay Alignment (L/R Timing)")
@@ -803,7 +792,7 @@ def test_wbfm_group_delay():
     step = np.zeros(n_samples)
     step[step_point:] = 0.5
 
-    demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate, stereo_decoder='squaring')
+    demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate)
 
     multiplex = generate_fm_stereo_multiplex(step, step, iq_rate, subcarrier_phase='neg_cos')
     iq = fm_modulate(multiplex, iq_rate)
@@ -825,8 +814,8 @@ def test_wbfm_group_delay():
     print(f"  Right crossing at: {right_crossing:.2f} samples")
     print(f"  L/R crossing difference: {lr_diff_samples:.2f} samples ({lr_diff_us:.0f} us)")
 
-    passed = lr_diff_samples < 5
-    print(f"  Result: {'PASS' if passed else 'FAIL'} (target: <5 samples)")
+    passed = lr_diff_samples < 10
+    print(f"  Result: {'PASS' if passed else 'FAIL'} (target: <10 samples)")
     assert passed, f"WBFM group delay mismatch too large: {lr_diff_samples:.2f} samples"
     return passed
 
@@ -963,7 +952,7 @@ def test_wbfm_ihf_snr():
     tuner specifications.  De-emphasis + A-weighting adds ~25-30 dB over the
     pilot-referenced RF measurement.
 
-    Tests both squaring and PLL decoder paths in stereo and mono modes.
+    Tests PLL decoder path in stereo and mono modes.
 
     Pass thresholds: stereo > 35 dB, mono > 35 dB.  The WBFMStereoDemodulator's
     decimation filter limits the processing floor to ~38 dB; the test confirms
@@ -1024,7 +1013,7 @@ def test_wbfm_ihf_snr():
 
     all_passed = True
 
-    for decoder_name in ['squaring', 'pll']:
+    for decoder_name in ['pll']:
         # --- Stereo ---
         demod_stereo = create_wbfm_demod(
             iq_rate=iq_rate, audio_rate=audio_rate,
@@ -1154,209 +1143,6 @@ def test_wbfm_squelch():
     passed = squelched and unsquelched
     print(f"  Result: {'PASS' if passed else 'FAIL'}")
     assert passed, f"WBFM squelch behavior incorrect: squelched={squelched}, unsquelched={unsquelched}"
-    return passed
-
-
-# =============================================================================
-# PLL-Specific WBFM Coverage
-# =============================================================================
-
-def test_wbfm_pll_mono_decode():
-    """
-    PLL path mono decode coverage (no pilot tone).
-
-    Pass criteria: mono output (L/R correlation > 0.999) and 1 kHz recovery.
-    """
-    print("\n" + "=" * 60)
-    print("TEST: WBFM PLL Mono Decode (No Pilot)")
-    print("=" * 60)
-
-    iq_rate = ICOM_SAMPLE_RATE_FM
-    audio_rate = AUDIO_SAMPLE_RATE
-    duration = 0.3
-    test_freq = 1000
-
-    n_samples = int(duration * iq_rate)
-    t = np.arange(n_samples) / iq_rate
-    mono = 0.5 * np.sin(2 * np.pi * test_freq * t)
-
-    multiplex = generate_fm_stereo_multiplex(mono, mono, iq_rate, include_pilot=False)
-    iq = fm_modulate(multiplex, iq_rate)
-
-    demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate, stereo_decoder='pll')
-    audio = process_with_settling(demod, iq)
-
-    skip = int(0.05 * audio_rate)
-    left_out = audio[skip:-skip, 0]
-    right_out = audio[skip:-skip, 1]
-
-    lr_corr = np.corrcoef(left_out, right_out)[0, 1]
-    left_power_1k = goertzel_power(left_out, test_freq, audio_rate)
-    left_power_total = np.mean(left_out ** 2)
-    freq_ratio = left_power_1k / left_power_total if left_power_total > 0 else 0
-
-    print(f"  Pilot detected: {demod.pilot_detected}")
-    print(f"  L/R correlation: {lr_corr:.6f}")
-    print(f"  1 kHz power ratio: {freq_ratio:.4f}")
-
-    passed = lr_corr > 0.999 and freq_ratio > 0.5
-    print(f"  Result: {'PASS' if passed else 'FAIL'} (target: corr>0.999, ratio>0.5)")
-    assert passed, f"WBFM PLL mono decode failed: corr={lr_corr:.6f}, freq_ratio={freq_ratio:.4f}"
-    return passed
-
-
-def test_wbfm_pll_stereo_decode():
-    """
-    PLL path stereo decode coverage.
-
-    Pass criteria: pilot lock and measurable channel separation.
-    """
-    print("\n" + "=" * 60)
-    print("TEST: WBFM PLL Stereo Decode (1 kHz L, 2 kHz R)")
-    print("=" * 60)
-
-    iq_rate = ICOM_SAMPLE_RATE_FM
-    audio_rate = AUDIO_SAMPLE_RATE
-    duration = 1.0
-    left_freq = 1000
-    right_freq = 2000
-
-    n_samples = int(duration * iq_rate)
-    t = np.arange(n_samples) / iq_rate
-    left = 0.5 * np.sin(2 * np.pi * left_freq * t)
-    right = 0.5 * np.sin(2 * np.pi * right_freq * t)
-
-    multiplex = generate_fm_stereo_multiplex(left, right, iq_rate, subcarrier_phase='neg_cos')
-    iq = fm_modulate(multiplex, iq_rate)
-
-    demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate, stereo_decoder='pll')
-    audio = process_with_settling(demod, iq)
-
-    skip = len(audio) // 2
-    left_out = audio[skip:, 0]
-    right_out = audio[skip:, 1]
-
-    left_1k_power = fft_bin_band_power(left_out, left_freq, audio_rate, side_bins=1)
-    left_2k_power = fft_bin_band_power(left_out, right_freq, audio_rate, side_bins=1)
-    right_1k_power = fft_bin_band_power(right_out, left_freq, audio_rate, side_bins=1)
-    right_2k_power = fft_bin_band_power(right_out, right_freq, audio_rate, side_bins=1)
-
-    left_separation = 10 * np.log10(left_1k_power / (left_2k_power + 1e-12))
-    right_separation = 10 * np.log10(right_2k_power / (right_1k_power + 1e-12))
-    min_separation = min(left_separation, right_separation)
-
-    print(f"  Pilot detected: {demod.pilot_detected}")
-    print("  Separation metric: Hann FFT bin power (target ±1 bin)")
-    print(f"  Left channel separation: {left_separation:.1f} dB")
-    print(f"  Right channel separation: {right_separation:.1f} dB")
-
-    passed = demod.pilot_detected and min_separation > 8
-    print(f"  Result: {'PASS' if passed else 'FAIL'} (target: pilot lock, >8 dB separation)")
-    assert passed, (
-        f"WBFM PLL stereo decode failed: pilot={demod.pilot_detected}, min_separation={min_separation:.2f} dB"
-    )
-    return passed
-
-
-def test_wbfm_pll_subcarrier_phase():
-    """
-    Test PLL decoder behavior vs TX subcarrier phase.
-
-    Even with PLL carrier tracking, stereo decode assumes the standard pilot-to-
-    subcarrier phase relationship:
-    - neg_cos: correct decode
-    - cos: inverted channels
-    - sin: no usable separation (quadrature mismatch)
-    """
-    print("\n" + "=" * 60)
-    print("TEST: WBFM PLL Subcarrier Phase Sensitivity")
-    print("=" * 60)
-    print()
-    print("  PLL tracks pilot phase, then derives 38 kHz by frequency doubling")
-    print("  This test verifies behavior for different TX subcarrier phases")
-    print()
-
-    iq_rate = ICOM_SAMPLE_RATE_FM
-    audio_rate = AUDIO_SAMPLE_RATE
-    duration = 1.0
-
-    n_samples = int(duration * iq_rate)
-    t = np.arange(n_samples) / iq_rate
-
-    left = 0.5 * np.sin(2 * np.pi * 1000 * t)
-    right = np.zeros(n_samples)
-
-    results = {}
-
-    for phase_name in ['neg_cos', 'cos', 'sin']:
-        multiplex = generate_fm_stereo_multiplex(left, right, iq_rate, subcarrier_phase=phase_name)
-        iq = fm_modulate(multiplex, iq_rate)
-
-        demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate, stereo_decoder='pll')
-        audio = process_with_settling(demod, iq)
-
-        skip = len(audio) // 2
-        left_out = audio[skip:, 0]
-        right_out = audio[skip:, 1]
-
-        left_power = fft_bin_band_power(left_out, 1000, audio_rate, side_bins=1)
-        right_power = fft_bin_band_power(right_out, 1000, audio_rate, side_bins=1)
-        status = classify_stereo_phase_result(left_power, right_power)
-
-        results[phase_name] = (left_power, right_power, status)
-        print(f"  TX={phase_name:8s}: L={left_power:.6f}, R={right_power:.6f} -> {status}")
-
-    print()
-
-    neg_cos_correct = 'CORRECT' in results['neg_cos'][2]
-    cos_inverted = 'INVERTED' in results['cos'][2]
-    sin_fails = 'FAILED' in results['sin'][2]
-
-    passed = neg_cos_correct and cos_inverted and sin_fails
-    print(f"  Result: {'PASS' if passed else 'FAIL'}")
-    print("  (neg_cos should decode, cos should invert, sin should lose separation)")
-    assert passed, f"Unexpected PLL phase sensitivity results: {results}"
-    return passed
-
-
-def test_wbfm_pll_group_delay():
-    """
-    PLL path timing alignment coverage.
-
-    Pass criteria: L/R crossing difference < 10 samples at 48 kHz.
-    """
-    print("\n" + "=" * 60)
-    print("TEST: WBFM PLL Group Delay Alignment")
-    print("=" * 60)
-
-    iq_rate = ICOM_SAMPLE_RATE_FM
-    audio_rate = AUDIO_SAMPLE_RATE
-    duration = 0.1
-
-    n_samples = int(duration * iq_rate)
-    step = np.zeros(n_samples)
-    step[n_samples // 2:] = 0.5
-
-    demod = create_wbfm_demod(iq_rate=iq_rate, audio_rate=audio_rate, stereo_decoder='pll')
-    multiplex = generate_fm_stereo_multiplex(step, step, iq_rate, subcarrier_phase='neg_cos')
-    iq = fm_modulate(multiplex, iq_rate)
-    audio = process_with_settling(demod, iq)
-
-    left_crossing = find_step_crossing(audio[:, 0])
-    right_crossing = find_step_crossing(audio[:, 1])
-    if left_crossing < 0 or right_crossing < 0:
-        raise AssertionError("Could not find PLL step crossings")
-
-    lr_diff_samples = abs(left_crossing - right_crossing)
-    lr_diff_us = lr_diff_samples * (1e6 / audio_rate)
-
-    print(f"  Left crossing at: {left_crossing:.2f} samples")
-    print(f"  Right crossing at: {right_crossing:.2f} samples")
-    print(f"  L/R crossing difference: {lr_diff_samples:.2f} samples ({lr_diff_us:.0f} us)")
-
-    passed = lr_diff_samples < 10
-    print(f"  Result: {'PASS' if passed else 'FAIL'} (target: <10 samples)")
-    assert passed, f"WBFM PLL group delay mismatch too large: {lr_diff_samples:.2f} samples"
     return passed
 
 
@@ -1618,7 +1404,7 @@ def run_all_tests():
     print("=" * 60)
     print("\nTesting panadapter.py demodulator classes")
     print(f"  Primary WBFM decoder under test: {PRIMARY_WBFM_DECODER}")
-    print("  WBFMStereoDemodulator: IQ -> Decimate -> (PLL or squaring stereo decoder) -> Audio")
+    print("  WBFMStereoDemodulator: IQ -> Decimate -> PLL stereo decoder -> Audio")
     print("  NBFMDemodulator: IQ -> Channel BPF -> FM Demod -> Audio")
 
     tests = [
@@ -1637,10 +1423,6 @@ def run_all_tests():
         ("WBFM IHF/EIA SNR", test_wbfm_ihf_snr),
         ("WBFM Frequency Offset", test_wbfm_freq_offset),
         ("WBFM Squelch", test_wbfm_squelch),
-        ("WBFM PLL Mono Decode", test_wbfm_pll_mono_decode),
-        ("WBFM PLL Stereo Decode", test_wbfm_pll_stereo_decode),
-        ("WBFM PLL Subcarrier Phase", test_wbfm_pll_subcarrier_phase),
-        ("WBFM PLL Group Delay", test_wbfm_pll_group_delay),
         # NBFM tests (via NBFMDemodulator)
         ("NBFM Tone Recovery", test_nbfm_tone_recovery),
         ("NBFM Audio SNR", test_nbfm_audio_snr),

@@ -38,14 +38,6 @@ def _validate_odd_taps(value, name, minimum=3):
     return taps
 
 
-def _normalize_resampler_mode(value):
-    """Normalize resampler mode string."""
-    mode = str(value).strip().lower()
-    if mode not in {"interp", "firdecim", "auto"}:
-        raise ValueError(f"Unknown resampler_mode '{value}' (expected interp|firdecim|auto)")
-    return mode
-
-
 class _StreamingLinearResampler:
     """
     Phase-continuous streaming linear resampler.
@@ -86,33 +78,6 @@ class _StreamingLinearResampler:
         self.phase = positions[-1] + step - n_in
         idx = np.arange(n_in, dtype=np.float64)
         return tuple(np.interp(positions, idx, ch) for ch in channels)
-
-
-class _StreamingFIRDecimator:
-    """Stateful FIR decimator (lfilter + phased downsample)."""
-
-    def __init__(self, decimation, taps=127, beta=8.0):
-        self.decimation = int(decimation)
-        if self.decimation < 2:
-            raise ValueError(f"decimation must be >=2, got {decimation}")
-        self.taps = _validate_odd_taps(taps, "resampler_taps")
-        self.beta = float(beta)
-        cutoff = 0.45 / self.decimation
-        self.h = signal.firwin(self.taps, cutoff, window=("kaiser", self.beta))
-        self.zi = np.zeros(len(self.h) - 1, dtype=np.float64)
-        self.phase = 0
-
-    def reset(self):
-        self.zi.fill(0.0)
-        self.phase = 0
-
-    def process(self, x):
-        if len(x) == 0:
-            return np.array([], dtype=np.float64)
-        y, self.zi = signal.lfilter(self.h, [1.0], x, zi=self.zi)
-        out = y[self.phase::self.decimation]
-        self.phase = (self.phase - len(y)) % self.decimation
-        return out
 
 
 def _soft_clip(x, threshold=0.8):
