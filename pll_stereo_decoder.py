@@ -167,8 +167,7 @@ class PLLStereoDecoder:
             _pll_process_kernel_numba if backend == "numba" else _pll_process_kernel_python
         )
 
-        # Pilot detection state
-        self._pilot_detected = False
+        # Pilot level state
         self._pilot_level = 0.0
         self.pilot_threshold = 0.05
 
@@ -786,7 +785,7 @@ class PLLStereoDecoder:
             t0 = self._prof('lr_sum_lpf', t0)
 
         if stereo_allowed:
-            # Extract L-R subcarrier region (23-53 kHz)
+            # Extract L-R subcarrier region (20-56 kHz)
             lr_diff_mod, self.lr_diff_bpf_state = sp_signal.lfilter(
                 self.lr_diff_bpf, 1.0, baseband, zi=self.lr_diff_bpf_state
             )
@@ -895,9 +894,9 @@ class PLLStereoDecoder:
     def reset(self):
         """Reset decoder state (call when changing frequency)."""
         self.last_sample = complex(1, 0)
-        self._pilot_detected = False
         self._pilot_level = 0.0
         self._last_baseband = None
+        self._last_pilot = None
 
         # Reset filter states
         self.pilot_bpf_state = sp_signal.lfilter_zi(self.pilot_bpf, 1.0)
