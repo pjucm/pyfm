@@ -794,6 +794,8 @@ class FMRadio:
         self.audio_thread = None
         self.error_message = None
         self.signal_dbm = -140.0
+        self._signal_dbm_smooth = -140.0
+        self._signal_dbm_alpha = 0.15  # EMA alpha: ~6 block time constant
         self.is_tuning = False
         self._last_total_sample_loss = 0
         self._iq_loss_events = 0
@@ -1357,7 +1359,8 @@ class FMRadio:
                         dbm = 10 * np.log10(mean_power) + self.SIGNAL_CAL_OFFSET_DB_BB60D
                 else:
                     dbm = -140.0
-                self.signal_dbm = dbm  # No lock needed for single float assignment
+                self._signal_dbm_smooth += self._signal_dbm_alpha * (dbm - self._signal_dbm_smooth)
+                self.signal_dbm = self._signal_dbm_smooth
 
                 # Check squelch
                 squelched = self.squelch_enabled and dbm < self.squelch_threshold
@@ -2640,7 +2643,7 @@ def run_rich_ui(radio):
     try:
         tty.setcbreak(sys.stdin.fileno())
 
-        with Live(build_display(radio, console.width), console=console, refresh_per_second=10, screen=True) as live:
+        with Live(build_display(radio, console.width), console=console, refresh_per_second=20, screen=True) as live:
             input_buffer = ''
 
             while True:
