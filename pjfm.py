@@ -22,6 +22,7 @@ Controls:
     Shift+1-8 (!@#$%^&*): Set preset to current frequency (FM mode)
     w: Toggle Weather radio mode (NBFM for NWS)
     r: Toggle RDS decoder (FM mode only)
+    h: Toggle HD Radio decoder (FM mode only)
     R: Start/stop Opus recording (128 kbps stereo)
     b: Toggle bass boost
     t: Toggle treble boost
@@ -76,6 +77,10 @@ from demodulator import NBFMDecoder
 from pll_stereo_decoder import PLLStereoDecoder, prewarm_numba_pll_kernel
 from rds_decoder import RDSDecoder, pi_to_callsign
 from opus import OpusRecorder, build_recording_status_text
+try:
+    from nrsc5 import NRSC5Demodulator
+except ImportError:
+    NRSC5Demodulator = None
 
 
 def enable_realtime_mode():
@@ -678,7 +683,8 @@ class FMRadio:
     # IQ streaming parameters
     IQ_SAMPLE_RATE = 480000  # Requested IQ sample rate (Hz); actual rate depends on device
     AUDIO_SAMPLE_RATE = 48000
-    IQ_BLOCK_SIZE = 8192  # ~17.1ms budget at 480kHz
+    # previous setting was 8192, 17.1ms budget at 480Khz.
+    IQ_BLOCK_SIZE = 8192
     IQ_QUEUE_MAX_BLOCKS = 8
     IQ_QUEUE_TIMEOUT_S = 0.2
     IQ_LOSS_MUTE_BLOCKS = 1
@@ -764,6 +770,10 @@ class FMRadio:
         self.rds_enabled = False
         self.rds_data = {}
         self.rds_forced_off = False
+
+        # Optional HD Radio decoder hooks (nrsc5 external process)
+        self.hd_decoder = NRSC5Demodulator() if NRSC5Demodulator else None
+        self.hd_enabled = False
 
         # Auto RDS mode (enabled by default, disable with --no-rds)
         self.auto_mode_enabled = rds_enabled
@@ -1100,6 +1110,9 @@ class FMRadio:
                 self.recorder.stop()
             except Exception:
                 pass
+        if self.hd_decoder:
+            self.hd_decoder.stop()
+            self.hd_enabled = False
         self.audio_player.stop()
         self.device.close()
 
@@ -1287,6 +1300,8 @@ class FMRadio:
                     time.sleep(0.01)
                     continue
 
+                self._sync_hd_decoder_state()
+
                 # Get IQ samples from capture thread
                 iq = self._get_iq_block()
 
@@ -1341,6 +1356,13 @@ class FMRadio:
                             self._last_total_sample_loss = getattr(self.device, 'total_sample_loss', 0)
                             self._last_iq_queue_drops = self._iq_queue_drops
                             continue
+
+                # Feed optional HD decoder with raw IQ stream.
+                if (not self.weather_mode and
+                        not loss_now and
+                        self.hd_enabled and
+                        self.hd_decoder):
+                    self.hd_decoder.push_iq(iq, getattr(self.device, 'iq_sample_rate', self.iq_sample_rate))
 
                 # Measure signal power from IQ data (use subset for speed)
                 # Only measure every 16th sample to reduce overhead
@@ -1465,6 +1487,14 @@ class FMRadio:
                         self.stereo_decoder.last_baseband
                     )
 
+                # If HD decode is active and audio is available, prefer digital audio.
+                if (not self.weather_mode and
+                        self.hd_enabled and
+                        self.hd_decoder):
+                    hd_audio = self.hd_decoder.pull_audio(len(audio))
+                    if hd_audio is not None:
+                        audio = hd_audio
+
                 # Apply squelch (mute if signal below threshold)
                 if squelched:
                     audio = np.zeros_like(audio)
@@ -1588,6 +1618,27 @@ class FMRadio:
             return False
         return True
 
+    def _sync_hd_decoder_state(self):
+        """Update HD decoder state when the external process exits."""
+        if self.hd_decoder and self.hd_enabled and not self.hd_decoder.poll():
+            self.hd_enabled = False
+            if self.hd_decoder.last_error:
+                self.error_message = self.hd_decoder.last_error
+
+    def _retune_hd_decoder(self):
+        """Retune or disable HD decoder after frequency/mode changes."""
+        if not self.hd_enabled or not self.hd_decoder:
+            return
+        if self.weather_mode:
+            self.hd_decoder.stop()
+            self.hd_enabled = False
+            return
+        try:
+            self.hd_decoder.start(self.device.frequency)
+        except RuntimeError as exc:
+            self.hd_enabled = False
+            self.error_message = str(exc)
+
     def tune_up(self):
         """Tune up by 200 kHz (FM) or 25 kHz (Weather)."""
         self.is_tuning = True
@@ -1609,6 +1660,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
                 self.rds_data = {}
+            self._retune_hd_decoder()
         self._clear_iq_queue()
         self.audio_player.reset()
         self.is_tuning = False
@@ -1636,6 +1688,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
                 self.rds_data = {}
+            self._retune_hd_decoder()
         self._clear_iq_queue()
         self.audio_player.reset()
         self.is_tuning = False
@@ -1663,6 +1716,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
                 self.rds_data = {}
+            self._retune_hd_decoder()
         self._clear_iq_queue()
         self.audio_player.reset()
         self.is_tuning = False
@@ -1733,6 +1787,26 @@ class FMRadio:
         if self.rds_decoder:
             self.rds_decoder.reset()
         self.rds_data = {}
+
+    def toggle_hd_radio(self):
+        """Toggle HD Radio decoding via nrsc5 hooks (FM mode only)."""
+        if self.weather_mode:
+            return
+        if not self.hd_decoder:
+            self.error_message = "HD Radio unavailable: nrsc5 hooks are disabled"
+            return
+        self._sync_hd_decoder_state()
+        if self.hd_enabled:
+            self.hd_decoder.stop()
+            self.hd_enabled = False
+            return
+        try:
+            self.hd_decoder.start(self.device.frequency)
+            self.hd_enabled = True
+            self.error_message = None
+        except RuntimeError as exc:
+            self.hd_enabled = False
+            self.error_message = str(exc)
 
     def toggle_recording(self):
         """Toggle Opus recording on/off."""
@@ -1824,6 +1898,7 @@ class FMRadio:
             if self.rds_decoder:
                 self.rds_decoder.reset()
 
+        self._retune_hd_decoder()
         self._clear_iq_queue()
         self.audio_player.reset()
 
@@ -1895,6 +1970,54 @@ class FMRadio:
         if self.stereo_decoder:
             return self.stereo_decoder.treble_boost_enabled
         return False
+
+    @property
+    def hd_available(self):
+        """Returns True if nrsc5 hooks are available."""
+        return bool(self.hd_decoder and self.hd_decoder.available)
+
+    @property
+    def hd_status(self):
+        """Return HD decoder status for UI display."""
+        self._sync_hd_decoder_state()
+        if self.weather_mode:
+            return "OFF"
+        if not self.hd_decoder:
+            return "N/A"
+        if self.hd_enabled:
+            return "ON"
+        if self.hd_decoder.last_error:
+            return "ERR"
+        if self.hd_decoder.available:
+            return "OFF"
+        return "N/A"
+
+    @property
+    def hd_audio_active(self):
+        """Returns True when the HD decoder is currently producing audio."""
+        if not self.hd_decoder:
+            return False
+        return bool(self.hd_enabled and self.hd_decoder.audio_active)
+
+    @property
+    def hd_status_detail(self):
+        """Return a short status detail string for HD decode."""
+        if not self.hd_decoder:
+            return ""
+        if self.hd_enabled and self.hd_decoder.audio_active:
+            return "Digital audio active"
+        if self.hd_enabled:
+            iq_bytes = getattr(self.hd_decoder, "iq_bytes_in_total", 0)
+            audio_bytes = getattr(self.hd_decoder, "audio_bytes_out_total", 0)
+            if iq_bytes > 0 and audio_bytes <= 0:
+                return f"Waiting for lock (IQ {iq_bytes / 1e6:.1f} MB)"
+        if self.hd_enabled and self.hd_decoder.last_output_line:
+            return self.hd_decoder.last_output_line
+        if self.hd_decoder.last_error:
+            return self.hd_decoder.last_error
+        if not self.hd_decoder.available:
+            return self.hd_decoder.unavailable_reason
+        return ""
 
     @property
     def volume(self):
@@ -2206,6 +2329,28 @@ def build_display(radio, width=80):
         tone_text.append("Treble OFF", style="dim")
     table.add_row("Boost:", tone_text)
 
+    # HD Radio status (FM mode only)
+    if not radio.weather_mode:
+        hd_text = Text()
+        hd_state = radio.hd_status
+        if hd_state == "ON":
+            hd_text.append("ON", style="green bold")
+            if radio.hd_audio_active:
+                hd_text.append("  [AUDIO]", style="green")
+            else:
+                hd_text.append("  [WAIT]", style="yellow")
+        elif hd_state == "ERR":
+            hd_text.append("ERR", style="red bold")
+        elif hd_state == "N/A":
+            hd_text.append("N/A", style="dim")
+        else:
+            hd_text.append("OFF", style="dim")
+
+        hd_detail = radio.hd_status_detail
+        if hd_detail:
+            hd_text.append(f"  {hd_detail[:64]}", style="dim")
+        table.add_row("HD Radio:", hd_text)
+
     # RDS status (FM mode only)
     if not radio.weather_mode and not radio.rds_forced_off:
         rds_text = Text()
@@ -2471,6 +2616,8 @@ def build_display(radio, width=80):
     if not radio.weather_mode:
         controls.append("r ", style="cyan bold")
         controls.append("RDS  ", style="dim")
+        controls.append("h ", style="cyan bold")
+        controls.append("HD  ", style="dim")
     controls.append("R ", style="cyan bold")
     controls.append("Record  ", style="dim")
     controls.append("b ", style="cyan bold")
@@ -2718,6 +2865,11 @@ def run_rich_ui(radio):
                         # Toggle RDS decoder (FM mode only)
                         if not radio.weather_mode:
                             radio.toggle_rds()
+                        input_buffer = input_buffer[1:]
+                    elif input_buffer[0] in ('h', 'H'):
+                        # Toggle HD Radio decoder (FM mode only)
+                        if not radio.weather_mode:
+                            radio.toggle_hd_radio()
                         input_buffer = input_buffer[1:]
                     elif input_buffer[0] == 'R':
                         # Toggle Opus recording
