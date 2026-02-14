@@ -146,10 +146,11 @@ def test_hd_metadata_summaries_include_station_and_track():
         "title": "Song A",
         "artist": "Artist B",
         "album": "Album C",
+        "genre": "Classical",
     })
     radio.hd_enabled = True
 
-    assert radio.hd_station_summary == "WXYZ-HD / Alt Rock"
+    assert radio.hd_station_summary == "WXYZ-HD (Classical)"
     assert radio.hd_now_playing_summary == "Artist B - Song A (Album C)"
 
 
@@ -166,7 +167,7 @@ def test_hd_metadata_extended_summaries():
     radio.hd_enabled = True
 
     assert radio.hd_genre_summary == "Classical"
-    assert radio.hd_info_summary == "Listener-Supported | Public Radio for NC"
+    assert radio.hd_info_summary == "HD1 | Public Radio for NC"
     assert radio.hd_weather_summary == "2026-02-14T18:00:00Z  WeatherImage_0_0_rdhs.png"
 
 
@@ -179,7 +180,7 @@ def test_hd_info_summary_prefers_active_alert():
     })
     radio.hd_enabled = True
 
-    assert radio.hd_info_summary == "Alert: Category=[Weather] [12345] Storm Warning"
+    assert radio.hd_info_summary == "HD1 | Alert: Category=[Weather] [12345] Storm Warning"
 
 
 def test_hd_status_detail_falls_back_to_last_output_line():

@@ -2055,15 +2055,20 @@ class FMRadio:
         """Best-effort station/service summary for HD metadata."""
         meta = self.hd_metadata
         station = str(meta.get("station_name", "")).strip()
+        genre = str(meta.get("genre", "")).strip()
         service = str(
             meta.get("program_name")
             or meta.get("service_name")
             or meta.get("sig_service_name")
             or ""
         ).strip()
-        if station and service:
-            return f"{station} / {service}"
-        return station or service
+        if station and genre:
+            return f"{station} ({genre})"
+        if station:
+            return station
+        if service and genre and service != genre:
+            return f"{service} ({genre})"
+        return service or genre
 
     @property
     def hd_now_playing_summary(self):
@@ -2092,14 +2097,20 @@ class FMRadio:
     def hd_info_summary(self):
         """Best-effort station text/alert summary for HD metadata."""
         meta = self.hd_metadata
+        hd_label = self.hd_program_label
         alert = str(meta.get("emergency_alert", "")).strip()
-        if alert:
-            return f"Alert: {alert}"
-        slogan = str(meta.get("station_slogan", "")).strip()
+        payload = ""
         message = str(meta.get("station_message", "")).strip()
-        if slogan and message and slogan != message:
-            return f"{slogan} | {message}"
-        return slogan or message
+        slogan = str(meta.get("station_slogan", "")).strip()
+        if alert:
+            payload = f"Alert: {alert}"
+        elif message:
+            payload = message
+        elif slogan:
+            payload = slogan
+        if payload and hd_label:
+            return f"{hd_label} | {payload}"
+        return payload
 
     @property
     def hd_weather_summary(self):
@@ -2539,20 +2550,15 @@ def build_display(radio, width=80):
             station_text = Text(hd_station[:72], style="green")
             table.add_row("HD Station:", station_text)
 
-        hd_now_playing = radio.hd_now_playing_summary
-        if hd_now_playing:
-            track_text = Text(hd_now_playing[:72], style="cyan")
-            table.add_row("HD Track:", track_text)
-
-        hd_genre = radio.hd_genre_summary
-        if hd_genre:
-            genre_text = Text(hd_genre[:72], style="magenta")
-            table.add_row("HD Genre:", genre_text)
-
         hd_info = radio.hd_info_summary
         if hd_info:
             info_text = Text(hd_info[:72], style="yellow")
             table.add_row("HD Info:", info_text)
+
+        hd_now_playing = radio.hd_now_playing_summary
+        if hd_now_playing:
+            track_text = Text(hd_now_playing[:72], style="cyan")
+            table.add_row("HD Track:", track_text)
 
         hd_weather = radio.hd_weather_summary
         if hd_weather:

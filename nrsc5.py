@@ -81,6 +81,12 @@ class NRSC5Demodulator:
     _RE_STATION_NAME = re.compile(r"Station name:\s*(?P<name>.+)$")
     _RE_AUDIO_PROGRAM = re.compile(r"Audio program\s+(?P<num>\d+):\s*(?P<name>[^,]+)")
     _RE_AUDIO_SERVICE = re.compile(r"Audio service\s+(?P<num>\d+):\s*(?P<name>[^,]+)")
+    _RE_AUDIO_PROGRAM_DESC = re.compile(
+        r"Audio program\s+(?P<num>\d+):\s*(?P<access>[^,]+),\s*type:\s*(?P<type>[^,]+)"
+    )
+    _RE_AUDIO_SERVICE_DESC = re.compile(
+        r"Audio service\s+(?P<num>\d+):\s*(?P<access>[^,]+),\s*type:\s*(?P<type>[^,]+)"
+    )
     _RE_SIG_SERVICE = re.compile(
         r"SIG Service:\s*type=(?P<type>\S+)\s+number=(?P<num>\d+)\s+name=(?P<name>.+)$"
     )
@@ -252,6 +258,7 @@ class NRSC5Demodulator:
             "program_number": None,
             "service_name": "",
             "service_number": None,
+            "genre_program_number": None,
             "sig_service_name": "",
             "title": "",
             "artist": "",
@@ -311,6 +318,8 @@ class NRSC5Demodulator:
     def _update_program_metadata_locked(self, name_key, number_key, number, name):
         text = str(name).strip()
         if not text:
+            return False
+        if text.lower() in {"public", "restricted"}:
             return False
         try:
             num = int(number)
@@ -396,6 +405,38 @@ class NRSC5Demodulator:
             elif image_type == "TRAFFIC":
                 self._update_text_metadata_locked("here_traffic_time_utc", image_time)
                 self._update_text_metadata_locked("here_traffic_name", image_name)
+            return
+
+        prog_desc_match = self._RE_AUDIO_PROGRAM_DESC.search(line)
+        if prog_desc_match:
+            self._update_program_metadata_locked(
+                "program_name",
+                "program_number",
+                prog_desc_match.group("num"),
+                prog_desc_match.group("access"),
+            )
+            self._update_program_metadata_locked(
+                "genre",
+                "genre_program_number",
+                prog_desc_match.group("num"),
+                prog_desc_match.group("type"),
+            )
+            return
+
+        svc_desc_match = self._RE_AUDIO_SERVICE_DESC.search(line)
+        if svc_desc_match:
+            self._update_program_metadata_locked(
+                "service_name",
+                "service_number",
+                svc_desc_match.group("num"),
+                svc_desc_match.group("access"),
+            )
+            self._update_program_metadata_locked(
+                "genre",
+                "genre_program_number",
+                svc_desc_match.group("num"),
+                svc_desc_match.group("type"),
+            )
             return
 
         prog_match = self._RE_AUDIO_PROGRAM.search(line)

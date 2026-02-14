@@ -211,6 +211,18 @@ def test_nrsc5_metadata_alert_ended_clears_alert():
     assert meta["emergency_alert"] == ""
 
 
+def test_nrsc5_metadata_ignores_public_as_service_name_and_keeps_type():
+    demod = NRSC5Demodulator(binary_name="python3", program=0)
+    demod._drain_output(io.StringIO(
+        "Audio program 0: public, type: Classical, sound experience 0\n"
+        "Audio service 0: public, type: Classical, codec: 0, blend: 0, gain: 0 dB, delay: 0, latency: 0\n"
+    ))
+    meta = demod.metadata_snapshot
+    assert meta["program_name"] == ""
+    assert meta["service_name"] == ""
+    assert meta["genre"] == "Classical"
+
+
 def test_nrsc5_stop_clears_metadata():
     demod = NRSC5Demodulator(binary_name="python3")
     demod._drain_output(io.StringIO("Station name: TEST\nTitle: Example\n"))
