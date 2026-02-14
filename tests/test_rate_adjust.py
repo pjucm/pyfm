@@ -153,6 +153,35 @@ def test_hd_metadata_summaries_include_station_and_track():
     assert radio.hd_now_playing_summary == "Artist B - Song A (Album C)"
 
 
+def test_hd_metadata_extended_summaries():
+    radio = FMRadio.__new__(FMRadio)
+    radio.hd_decoder = _FakeHDMetadataDecoder({
+        "genre": "Classical",
+        "station_slogan": "Listener-Supported",
+        "station_message": "Public Radio for NC",
+        "emergency_alert": "",
+        "here_weather_time_utc": "2026-02-14T18:00:00Z",
+        "here_weather_name": "WeatherImage_0_0_rdhs.png",
+    })
+    radio.hd_enabled = True
+
+    assert radio.hd_genre_summary == "Classical"
+    assert radio.hd_info_summary == "Listener-Supported | Public Radio for NC"
+    assert radio.hd_weather_summary == "2026-02-14T18:00:00Z  WeatherImage_0_0_rdhs.png"
+
+
+def test_hd_info_summary_prefers_active_alert():
+    radio = FMRadio.__new__(FMRadio)
+    radio.hd_decoder = _FakeHDMetadataDecoder({
+        "station_slogan": "Listener-Supported",
+        "station_message": "Public Radio for NC",
+        "emergency_alert": "Category=[Weather] [12345] Storm Warning",
+    })
+    radio.hd_enabled = True
+
+    assert radio.hd_info_summary == "Alert: Category=[Weather] [12345] Storm Warning"
+
+
 def test_hd_status_detail_falls_back_to_last_output_line():
     radio = FMRadio.__new__(FMRadio)
     radio.hd_decoder = _FakeHDMetadataDecoder({})

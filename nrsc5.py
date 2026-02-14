@@ -87,6 +87,15 @@ class NRSC5Demodulator:
     _RE_TITLE = re.compile(r"Title:\s*(?P<value>.+)$")
     _RE_ARTIST = re.compile(r"Artist:\s*(?P<value>.+)$")
     _RE_ALBUM = re.compile(r"Album:\s*(?P<value>.+)$")
+    _RE_GENRE = re.compile(r"Genre:\s*(?P<value>.+)$")
+    _RE_STATION_SLOGAN = re.compile(r"Slogan:\s*(?P<value>.+)$")
+    _RE_STATION_MESSAGE = re.compile(r"Message:\s*(?P<value>.+)$")
+    _RE_ALERT = re.compile(r"Alert:\s*(?P<value>.+)$")
+    _RE_ALERT_ENDED = re.compile(r"Alert ended$")
+    _RE_HERE_IMAGE = re.compile(
+        r"HERE Image:\s*type=(?P<type>[A-Z]+),.*?time=(?P<time>[^,]+),.*?name=(?P<name>.+?),\s*size=",
+        re.IGNORECASE,
+    )
 
     def __init__(self, program=0, binary_name=None, extra_args=None):
         self.binary_name = (
@@ -247,6 +256,14 @@ class NRSC5Demodulator:
             "title": "",
             "artist": "",
             "album": "",
+            "genre": "",
+            "station_slogan": "",
+            "station_message": "",
+            "emergency_alert": "",
+            "here_weather_time_utc": "",
+            "here_weather_name": "",
+            "here_traffic_time_utc": "",
+            "here_traffic_name": "",
             "updated_at_s": 0.0,
         }
 
@@ -281,6 +298,13 @@ class NRSC5Demodulator:
         if not text or self._metadata.get(key) == text:
             return False
         self._metadata[key] = text
+        self._metadata["updated_at_s"] = time.monotonic()
+        return True
+
+    def _clear_text_metadata_locked(self, key):
+        if not self._metadata.get(key):
+            return False
+        self._metadata[key] = ""
         self._metadata["updated_at_s"] = time.monotonic()
         return True
 
@@ -335,6 +359,43 @@ class NRSC5Demodulator:
         album_match = self._RE_ALBUM.search(line)
         if album_match:
             self._update_text_metadata_locked("album", album_match.group("value"))
+            return
+
+        genre_match = self._RE_GENRE.search(line)
+        if genre_match:
+            self._update_text_metadata_locked("genre", genre_match.group("value"))
+            return
+
+        slogan_match = self._RE_STATION_SLOGAN.search(line)
+        if slogan_match:
+            self._update_text_metadata_locked("station_slogan", slogan_match.group("value"))
+            return
+
+        message_match = self._RE_STATION_MESSAGE.search(line)
+        if message_match:
+            self._update_text_metadata_locked("station_message", message_match.group("value"))
+            return
+
+        alert_match = self._RE_ALERT.search(line)
+        if alert_match:
+            self._update_text_metadata_locked("emergency_alert", alert_match.group("value"))
+            return
+
+        if self._RE_ALERT_ENDED.search(line):
+            self._clear_text_metadata_locked("emergency_alert")
+            return
+
+        here_match = self._RE_HERE_IMAGE.search(line)
+        if here_match:
+            image_type = here_match.group("type").strip().upper()
+            image_time = here_match.group("time").strip()
+            image_name = here_match.group("name").strip()
+            if image_type == "WEATHER":
+                self._update_text_metadata_locked("here_weather_time_utc", image_time)
+                self._update_text_metadata_locked("here_weather_name", image_name)
+            elif image_type == "TRAFFIC":
+                self._update_text_metadata_locked("here_traffic_time_utc", image_time)
+                self._update_text_metadata_locked("here_traffic_name", image_name)
             return
 
         prog_match = self._RE_AUDIO_PROGRAM.search(line)

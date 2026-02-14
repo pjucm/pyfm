@@ -2083,6 +2083,35 @@ class FMRadio:
         return album
 
     @property
+    def hd_genre_summary(self):
+        """Genre metadata from HD stream when available."""
+        meta = self.hd_metadata
+        return str(meta.get("genre", "")).strip()
+
+    @property
+    def hd_info_summary(self):
+        """Best-effort station text/alert summary for HD metadata."""
+        meta = self.hd_metadata
+        alert = str(meta.get("emergency_alert", "")).strip()
+        if alert:
+            return f"Alert: {alert}"
+        slogan = str(meta.get("station_slogan", "")).strip()
+        message = str(meta.get("station_message", "")).strip()
+        if slogan and message and slogan != message:
+            return f"{slogan} | {message}"
+        return slogan or message
+
+    @property
+    def hd_weather_summary(self):
+        """Best-effort HD weather (HERE image) time/name summary."""
+        meta = self.hd_metadata
+        wx_time = str(meta.get("here_weather_time_utc", "")).strip()
+        wx_name = str(meta.get("here_weather_name", "")).strip()
+        if wx_time and wx_name:
+            return f"{wx_time}  {wx_name}"
+        return wx_time or wx_name
+
+    @property
     def hd_status(self):
         """Return HD decoder status for UI display."""
         self._sync_hd_decoder_state()
@@ -2514,6 +2543,21 @@ def build_display(radio, width=80):
         if hd_now_playing:
             track_text = Text(hd_now_playing[:72], style="cyan")
             table.add_row("HD Track:", track_text)
+
+        hd_genre = radio.hd_genre_summary
+        if hd_genre:
+            genre_text = Text(hd_genre[:72], style="magenta")
+            table.add_row("HD Genre:", genre_text)
+
+        hd_info = radio.hd_info_summary
+        if hd_info:
+            info_text = Text(hd_info[:72], style="yellow")
+            table.add_row("HD Info:", info_text)
+
+        hd_weather = radio.hd_weather_summary
+        if hd_weather:
+            weather_text = Text(hd_weather[:72], style="bright_blue")
+            table.add_row("HD Weather:", weather_text)
 
     # Error message if any
     if radio.error_message:

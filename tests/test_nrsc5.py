@@ -160,6 +160,12 @@ def test_nrsc5_metadata_parsing_selects_active_program():
         "Title: Song A\n"
         "Artist: Artist B\n"
         "Album: Album C\n"
+        "Genre: Classical\n"
+        "Slogan: Listener-Supported\n"
+        "Message: Public Radio for NC\n"
+        "Alert: Category=[Weather] [12345] Storm Warning\n"
+        "HERE Image: type=WEATHER, seq=1, n1=0, n2=0, time=2026-02-14T18:00:00Z, lat1=1.0, lon1=2.0, lat2=3.0, lon2=4.0, name=WeatherImage_0_0_rdhs.png, size=12345\n"
+        "HERE Image: type=TRAFFIC, seq=2, n1=1, n2=9, time=2026-02-14T18:01:00Z, lat1=1.0, lon1=2.0, lat2=3.0, lon2=4.0, name=trafficMap_1_2_rdhs.png, size=22222\n"
     )
     demod._drain_output(stream)
     meta = demod.metadata_snapshot
@@ -172,6 +178,14 @@ def test_nrsc5_metadata_parsing_selects_active_program():
     assert meta["title"] == "Song A"
     assert meta["artist"] == "Artist B"
     assert meta["album"] == "Album C"
+    assert meta["genre"] == "Classical"
+    assert meta["station_slogan"] == "Listener-Supported"
+    assert meta["station_message"] == "Public Radio for NC"
+    assert meta["emergency_alert"] == "Category=[Weather] [12345] Storm Warning"
+    assert meta["here_weather_time_utc"] == "2026-02-14T18:00:00Z"
+    assert meta["here_weather_name"] == "WeatherImage_0_0_rdhs.png"
+    assert meta["here_traffic_time_utc"] == "2026-02-14T18:01:00Z"
+    assert meta["here_traffic_name"] == "trafficMap_1_2_rdhs.png"
 
 
 def test_nrsc5_metadata_parses_prefixed_log_lines():
@@ -185,6 +199,16 @@ def test_nrsc5_metadata_parses_prefixed_log_lines():
     assert meta["station_name"] == "PREFIX-HD"
     assert meta["title"] == "Prefixed Song"
     assert meta["artist"] == "Prefixed Artist"
+
+
+def test_nrsc5_metadata_alert_ended_clears_alert():
+    demod = NRSC5Demodulator(binary_name="python3", program=0)
+    demod._drain_output(io.StringIO(
+        "Alert: Category=[Weather] [12345] Storm Warning\n"
+        "Alert ended\n"
+    ))
+    meta = demod.metadata_snapshot
+    assert meta["emergency_alert"] == ""
 
 
 def test_nrsc5_stop_clears_metadata():
