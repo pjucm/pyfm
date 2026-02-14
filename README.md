@@ -1,13 +1,13 @@
 # pjfm
 
-A real-time FM broadcast receiver with software-defined stereo demodulation and RDS decoding, supporting both SignalHound BB60D and Icom IC-R8600.
+A real-time FM broadcast receiver with software-defined stereo demodulation, RDS decoding, and optional HD Radio decoding, supporting both SignalHound BB60D and Icom IC-R8600.
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
 ![License](https://img.shields.io/badge/license-proprietary-red.svg)
 
 ## Overview
 
-pjfm is a command-line FM radio application that receives broadcast FM signals (88-108 MHz) and NOAA Weather Radio (162 MHz), performs all demodulation in software, and plays audio through the default Linux audio device. It features a rich terminal UI with real-time signal metrics, a 16-band spectrum analyzer, and full RDS (Radio Data System) decoding.
+pjfm is a command-line FM radio application that receives broadcast FM signals (88-108 MHz) and NOAA Weather Radio (162 MHz), performs all demodulation in software, and plays audio through the default Linux audio device. It features a rich terminal UI with real-time signal metrics, AF/RF spectrum analyzers, full RDS (Radio Data System) decoding, and optional HD Radio (`nrsc5`) integration.
 
 ## Features
 
@@ -15,12 +15,15 @@ pjfm is a command-line FM radio application that receives broadcast FM signals (
 - **Real-time FM stereo reception** with automatic mono/stereo switching
 - **NOAA Weather Radio** (NBFM mode for NWS frequencies)
 - **RDS decoding** with station identification, program type, radio text, and clock time
+- **Optional HD Radio decode** via external `nrsc5` with HD1/HD2/HD3 subchannel selection
+- **HD metadata display** (station/service plus title/artist/album when broadcast)
 - **GPU acceleration** via PyTorch (ROCm/CUDA) for FM demod, FIR filters, and resampling
-- **16-band audio spectrum analyzer** with peak hold
+- **AF and RF spectrum analyzers** in the terminal UI
 - **Signal quality metrics** including S-meter, SNR, and pilot detection
-- **Frequency presets** (5 programmable, saved to config)
+- **Frequency presets** (8 programmable FM presets, saved to config)
 - **Tone controls** with bass and treble boost
 - **Squelch** for muting weak signals
+- **Opus recording** (128 kbps stereo)
 - **Responsive terminal UI** built with Rich
 
 ## Supported Hardware
@@ -135,6 +138,15 @@ RDS data is organized into 26-bit blocks (16 data + 10 checkword), grouped into 
 - 0x1000-0x54A7: K stations (KAAA-KZZZ)
 - 0x54A8-0x994F: W stations (WAAA-WZZZ)
 
+### HD Radio (`nrsc5`) Integration
+
+HD Radio decoding is supported through the external `nrsc5` CLI process.
+
+- **Subchannels**: `h` cycles HD1/HD2/HD3, `H` toggles HD decode on/off
+- **Metadata**: terminal UI displays `HD Station` and `HD Track` rows when available
+- **Retune behavior**: changing channels (left/right tune or preset recall) snaps HD decode off, so it does not carry across stations
+- **Metadata fields parsed** (when broadcast): station/service name, title, artist, album
+
 ### Adaptive Rate Control
 
 pjfm uses a PI (proportional-integral) controller to match the I/Q sample rate to the audio card clock:
@@ -225,15 +237,19 @@ output = tanh(input * 1.5) / tanh(1.5)
 
 | Key | Function |
 |-----|----------|
-| ←/→ | Tune down/up (100 kHz FM, 25 kHz Weather) |
+| ←/→ | Tune down/up (200 kHz FM, 25 kHz Weather) |
 | ↑/↓ | Volume up/down |
-| 1-5 | Recall preset (FM) or 1-7 for WX channels (Weather) |
-| !@#$% | Set preset to current frequency (Shift+1-5, FM mode) |
+| 1-8 | Recall preset (FM) or 1-7 for WX channels (Weather) |
+| !@#$%^&* | Set preset to current frequency (Shift+1-8, FM mode) |
 | w | Toggle Weather radio mode (NBFM) |
 | r | Toggle RDS decoding (FM mode) |
+| h | Cycle HD subchannel (HD1/HD2/HD3, FM mode) |
+| H | Toggle HD decoder on/off (FM mode) |
+| R | Start/stop Opus recording |
 | b | Toggle bass boost |
 | t | Toggle treble boost |
-| a | Toggle spectrum analyzer |
+| a | Toggle AF spectrum analyzer |
+| s | Toggle RF spectrum analyzer |
 | Q | Toggle squelch |
 | q | Quit |
 
@@ -253,6 +269,7 @@ Settings are saved to `pjfm.cfg`:
 ### Software
 - Python 3.8+
 - Linux with ALSA/PulseAudio
+- Optional: `nrsc5` binary in `PATH` for HD Radio decode/metadata
 
 ### Python Dependencies
 
