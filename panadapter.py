@@ -73,6 +73,8 @@ AUDIO_SAMPLE_RATE = 48000  # Output audio sample rate
 # WBFM settings (FM Broadcast)
 WBFM_DEVIATION = 75000   # ±75 kHz deviation
 WBFM_DEEMPHASIS = 75e-6  # 75µs de-emphasis (US standard)
+WBFM_STEREO_LPF_TAPS_DEFAULT = 255
+WBFM_STEREO_LPF_BETA_DEFAULT = 6.0
 FM_BROADCAST_STEP = 200e3   # 200 kHz button step for FM broadcast (NA channel spacing)
 FM_BROADCAST_SNAP = 100e3   # 100 kHz click-to-tune snap (all valid FM channels)
 FM_BROADCAST_DEFAULT = 89.9e6  # Default FM broadcast frequency
@@ -82,6 +84,22 @@ VALID_STEREO_DECODERS = ('pll',)
 
 # Configuration file path (same directory as script)
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'panadapter.cfg')
+
+
+def _validate_stereo_lpf_taps(value):
+    """Return validated odd stereo LPF tap count."""
+    taps = int(value)
+    if taps < 3 or (taps % 2) == 0:
+        raise ValueError(f"stereo_lpf_taps must be an odd integer >= 3, got {value}")
+    return taps
+
+
+def _validate_stereo_lpf_beta(value):
+    """Return validated stereo LPF Kaiser beta."""
+    beta = float(value)
+    if beta <= 0:
+        raise ValueError(f"stereo_lpf_beta must be > 0, got {value}")
+    return beta
 
 
 def load_config():
@@ -124,6 +142,14 @@ def load_config():
                     decoder = config.get('demod', 'stereo_decoder').strip().lower()
                     if decoder in VALID_STEREO_DECODERS:
                         settings['stereo_decoder'] = decoder
+                if config.has_option('demod', 'stereo_lpf_taps'):
+                    settings['stereo_lpf_taps'] = _validate_stereo_lpf_taps(
+                        config.getint('demod', 'stereo_lpf_taps')
+                    )
+                if config.has_option('demod', 'stereo_lpf_beta'):
+                    settings['stereo_lpf_beta'] = _validate_stereo_lpf_beta(
+                        config.getfloat('demod', 'stereo_lpf_beta')
+                    )
 
         except (configparser.Error, ValueError) as e:
             print(f"Warning: Error reading config file: {e}")
@@ -133,7 +159,9 @@ def load_config():
 
 def save_config(use_icom=False, use_24bit=False, sample_rate=None,
                 frequency=None, mode='weather', weather_span_khz=None,
-                fm_span_khz=None, spectrum_averaging=None, stereo_decoder=None):
+                fm_span_khz=None, spectrum_averaging=None, stereo_decoder=None,
+                stereo_lpf_taps=WBFM_STEREO_LPF_TAPS_DEFAULT,
+                stereo_lpf_beta=WBFM_STEREO_LPF_BETA_DEFAULT):
     """Save settings to config file.
 
     Args:
@@ -145,6 +173,8 @@ def save_config(use_icom=False, use_24bit=False, sample_rate=None,
         weather_span_khz: Spectrum span for weather mode in kHz
         fm_span_khz: Spectrum span for FM broadcast mode in kHz
         stereo_decoder: Stereo decoder for WBFM ('pll')
+        stereo_lpf_taps: WBFM stereo LPF taps (odd integer, >=3)
+        stereo_lpf_beta: WBFM stereo LPF Kaiser beta (>0)
     """
     config = configparser.ConfigParser()
 
@@ -177,7 +207,11 @@ def save_config(use_icom=False, use_24bit=False, sample_rate=None,
     decoder = (stereo_decoder or DEFAULT_STEREO_DECODER).strip().lower()
     if decoder not in VALID_STEREO_DECODERS:
         decoder = DEFAULT_STEREO_DECODER
+    taps = _validate_stereo_lpf_taps(stereo_lpf_taps)
+    beta = _validate_stereo_lpf_beta(stereo_lpf_beta)
     config['demod']['stereo_decoder'] = decoder
+    config['demod']['stereo_lpf_taps'] = str(taps)
+    config['demod']['stereo_lpf_beta'] = f"{beta:.2f}"
 
     try:
         with open(CONFIG_FILE, 'w') as f:
@@ -417,7 +451,9 @@ class WBFMStereoDemodulator:
     TARGET_RATE = 480000
 
     def __init__(self, input_sample_rate, audio_sample_rate=AUDIO_SAMPLE_RATE,
-                 stereo_decoder=DEFAULT_STEREO_DECODER):
+                 stereo_decoder=DEFAULT_STEREO_DECODER,
+                 stereo_lpf_taps=WBFM_STEREO_LPF_TAPS_DEFAULT,
+                 stereo_lpf_beta=WBFM_STEREO_LPF_BETA_DEFAULT):
         self.input_sample_rate = input_sample_rate
         self.audio_sample_rate = audio_sample_rate
         self.tuned_offset = 0
@@ -426,6 +462,8 @@ class WBFMStereoDemodulator:
         self.stereo_decoder_name = str(stereo_decoder).strip().lower()
         if self.stereo_decoder_name not in VALID_STEREO_DECODERS:
             self.stereo_decoder_name = DEFAULT_STEREO_DECODER
+        self.stereo_lpf_taps = _validate_stereo_lpf_taps(stereo_lpf_taps)
+        self.stereo_lpf_beta = _validate_stereo_lpf_beta(stereo_lpf_beta)
 
         # Calculate decimation factor to get close to TARGET_RATE
         # Use integer decimation for efficiency
@@ -449,6 +487,8 @@ class WBFMStereoDemodulator:
             audio_sample_rate=audio_sample_rate,
             deviation=WBFM_DEVIATION,
             deemphasis=WBFM_DEEMPHASIS,
+            stereo_lpf_taps=self.stereo_lpf_taps,
+            stereo_lpf_beta=self.stereo_lpf_beta,
         )
         # Disable tone boosts by default (no UI switches wired yet)
         self.stereo_decoder.bass_boost_enabled = False
@@ -1451,7 +1491,9 @@ class MainWindow(QMainWindow):
     def __init__(self, center_freq=DEFAULT_CENTER_FREQ, use_icom=False,
                  sample_rate=None, use_24bit=False, initial_mode='weather',
                  weather_span_khz=None, fm_span_khz=None, spectrum_averaging=None,
-                 stereo_decoder=DEFAULT_STEREO_DECODER):
+                 stereo_decoder=DEFAULT_STEREO_DECODER,
+                 stereo_lpf_taps=WBFM_STEREO_LPF_TAPS_DEFAULT,
+                 stereo_lpf_beta=WBFM_STEREO_LPF_BETA_DEFAULT):
         super().__init__()
 
         self.center_freq = center_freq
@@ -1466,6 +1508,8 @@ class MainWindow(QMainWindow):
         self.stereo_decoder = str(stereo_decoder).strip().lower()
         if self.stereo_decoder not in VALID_STEREO_DECODERS:
             self.stereo_decoder = DEFAULT_STEREO_DECODER
+        self.stereo_lpf_taps = _validate_stereo_lpf_taps(stereo_lpf_taps)
+        self.stereo_lpf_beta = _validate_stereo_lpf_beta(stereo_lpf_beta)
 
         # Spectrum span per mode (kHz) - None means full bandwidth
         # Default: 100 kHz for weather, full bandwidth for FM
@@ -1958,7 +2002,9 @@ class MainWindow(QMainWindow):
             # Use stereo demodulator for FM broadcast (better audio quality)
             self.wbfm_demodulator = WBFMStereoDemodulator(
                 self.device.iq_sample_rate,
-                stereo_decoder=self.stereo_decoder
+                stereo_decoder=self.stereo_decoder,
+                stereo_lpf_taps=self.stereo_lpf_taps,
+                stereo_lpf_beta=self.stereo_lpf_beta,
             )
             self.wbfm_demodulator.set_squelch(self.squelch_slider.value())
             self.wbfm_demodulator.set_tuned_offset(self.tuned_freq - self.center_freq)
@@ -1966,7 +2012,9 @@ class MainWindow(QMainWindow):
             self.stereo_decoder = self.wbfm_demodulator.stereo_decoder_name
             print(
                 "panadapter startup: "
-                f"decoder={type(self.wbfm_demodulator.stereo_decoder).__name__}"
+                f"decoder={type(self.wbfm_demodulator.stereo_decoder).__name__}, "
+                f"stereo_lpf_taps={self.stereo_lpf_taps}, "
+                f"stereo_lpf_beta={self.stereo_lpf_beta:.2f}"
             )
 
             # Set active demodulator based on mode
@@ -2488,7 +2536,9 @@ class MainWindow(QMainWindow):
             weather_span_khz=self.weather_span_khz,
             fm_span_khz=self.fm_span_khz,
             spectrum_averaging=self.avg_factor,
-            stereo_decoder=self.stereo_decoder
+            stereo_decoder=self.stereo_decoder,
+            stereo_lpf_taps=self.stereo_lpf_taps,
+            stereo_lpf_beta=self.stereo_lpf_beta,
         )
 
         # Stop audio output
@@ -2528,6 +2578,10 @@ def main():
                         help='Initial mode: weather or fm (default: from config)')
     parser.add_argument('--stereo-decoder', choices=['pll'], default=None,
                         help='FM stereo decoder (default: pll)')
+    parser.add_argument('--stereo-lpf-taps', type=int, default=None,
+                        help='WBFM stereo LPF taps (odd integer, default: 255)')
+    parser.add_argument('--stereo-lpf-beta', type=float, default=None,
+                        help='WBFM stereo LPF Kaiser beta (default: 6.0)')
     args = parser.parse_args()
 
     # Load saved config
@@ -2539,6 +2593,8 @@ def main():
     sample_rate = config.get('sample_rate', None)
     mode = config.get('mode', 'weather')
     stereo_decoder = config.get('stereo_decoder', DEFAULT_STEREO_DECODER)
+    stereo_lpf_taps = config.get('stereo_lpf_taps', WBFM_STEREO_LPF_TAPS_DEFAULT)
+    stereo_lpf_beta = config.get('stereo_lpf_beta', WBFM_STEREO_LPF_BETA_DEFAULT)
     weather_span_khz = config.get('weather_span_khz', None)
     fm_span_khz = config.get('fm_span_khz', None)
     spectrum_averaging = config.get('spectrum_averaging', None)
@@ -2570,6 +2626,10 @@ def main():
         mode = 'fm_broadcast' if args.mode == 'fm' else 'weather'
     if args.stereo_decoder is not None:
         stereo_decoder = args.stereo_decoder
+    if args.stereo_lpf_taps is not None:
+        stereo_lpf_taps = args.stereo_lpf_taps
+    if args.stereo_lpf_beta is not None:
+        stereo_lpf_beta = args.stereo_lpf_beta
 
     # Validate conflicting options
     if args.icom and args.bb60d:
@@ -2609,7 +2669,9 @@ def main():
         weather_span_khz=weather_span_khz,
         fm_span_khz=fm_span_khz,
         spectrum_averaging=spectrum_averaging,
-        stereo_decoder=stereo_decoder
+        stereo_decoder=stereo_decoder,
+        stereo_lpf_taps=stereo_lpf_taps,
+        stereo_lpf_beta=stereo_lpf_beta,
     )
     window.show()
 
