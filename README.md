@@ -17,7 +17,6 @@ pjfm is a command-line FM radio application that receives broadcast FM signals (
 - **RDS decoding** with station identification, program type, radio text, and clock time
 - **Optional HD Radio decode** via external `nrsc5` with HD1/HD2/HD3 subchannel selection
 - **HD metadata display** (station/service plus title/artist/album when broadcast)
-- **GPU acceleration** via PyTorch (ROCm/CUDA) for FM demod, FIR filters, and resampling
 - **AF and RF spectrum analyzers** in the terminal UI
 - **Signal quality metrics** including S-meter, SNR, and pilot detection
 - **Frequency presets** (8 programmable FM presets, saved to config)
