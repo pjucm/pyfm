@@ -2034,6 +2034,45 @@ class FMRadio:
         return self._hd_program_label(getattr(self.hd_decoder, "program", 0))
 
     @property
+    def hd_metadata(self):
+        """Latest parsed metadata from nrsc5 output."""
+        if not self.hd_decoder:
+            return {}
+        return self.hd_decoder.metadata_snapshot
+
+    @property
+    def hd_station_summary(self):
+        """Best-effort station/service summary for HD metadata."""
+        meta = self.hd_metadata
+        station = str(meta.get("station_name", "")).strip()
+        service = str(
+            meta.get("program_name")
+            or meta.get("service_name")
+            or meta.get("sig_service_name")
+            or ""
+        ).strip()
+        if station and service:
+            return f"{station} / {service}"
+        return station or service
+
+    @property
+    def hd_now_playing_summary(self):
+        """Best-effort now-playing summary for HD metadata."""
+        meta = self.hd_metadata
+        title = str(meta.get("title", "")).strip()
+        artist = str(meta.get("artist", "")).strip()
+        album = str(meta.get("album", "")).strip()
+        if title and artist:
+            base = f"{artist} - {title}"
+        else:
+            base = title or artist
+        if base and album:
+            return f"{base} ({album})"
+        if base:
+            return base
+        return album
+
+    @property
     def hd_status(self):
         """Return HD decoder status for UI display."""
         self._sync_hd_decoder_state()
@@ -2062,7 +2101,13 @@ class FMRadio:
         if not self.hd_decoder:
             return ""
         hd_label = self.hd_program_label
+        hd_station = self.hd_station_summary
+        hd_now_playing = self.hd_now_playing_summary
         if self.hd_enabled and self.hd_decoder.audio_active:
+            if hd_station or hd_now_playing:
+                return ""
+            if self.hd_decoder.last_output_line:
+                return f"{hd_label} {self.hd_decoder.last_output_line}"
             return f"{hd_label} digital audio active"
         if self.hd_enabled:
             iq_bytes = getattr(self.hd_decoder, "iq_bytes_in_total", 0)
@@ -2387,35 +2432,6 @@ def build_display(radio, width=80):
         tone_text.append("Treble OFF", style="dim")
     table.add_row("Boost:", tone_text)
 
-    # HD Radio status (FM mode only)
-    if not radio.weather_mode:
-        hd_text = Text()
-        hd_state = radio.hd_status
-        hd_label = radio.hd_program_label
-        if hd_state == "ON":
-            hd_text.append("ON", style="green bold")
-            if hd_label:
-                hd_text.append(f" {hd_label}", style="cyan")
-            if radio.hd_audio_active:
-                hd_text.append("  [AUDIO]", style="green")
-            else:
-                hd_text.append("  [WAIT]", style="yellow")
-        elif hd_state == "ERR":
-            hd_text.append("ERR", style="red bold")
-            if hd_label:
-                hd_text.append(f" {hd_label}", style="cyan")
-        elif hd_state == "N/A":
-            hd_text.append("N/A", style="dim")
-        else:
-            hd_text.append("OFF", style="dim")
-            if hd_label:
-                hd_text.append(f" {hd_label}", style="cyan")
-
-        hd_detail = radio.hd_status_detail
-        if hd_detail:
-            hd_text.append(f"  {hd_detail[:64]}", style="dim")
-        table.add_row("HD Radio:", hd_text)
-
     # RDS status (FM mode only)
     if not radio.weather_mode and not radio.rds_forced_off:
         rds_text = Text()
@@ -2447,6 +2463,47 @@ def build_display(radio, width=80):
         else:
             rds_text.append("OFF", style="dim")
         table.add_row("RDS:", rds_text)
+
+    # HD status/metadata (FM mode only) below RDS with a separator line.
+    if not radio.weather_mode:
+        table.add_row("", "")
+
+        hd_text = Text()
+        hd_state = radio.hd_status
+        hd_label = radio.hd_program_label
+        if hd_state == "ON":
+            hd_text.append("ON", style="green bold")
+            if hd_label:
+                hd_text.append(f" {hd_label}", style="cyan")
+            if radio.hd_audio_active:
+                hd_text.append("  [AUDIO]", style="green")
+            else:
+                hd_text.append("  [WAIT]", style="yellow")
+        elif hd_state == "ERR":
+            hd_text.append("ERR", style="red bold")
+            if hd_label:
+                hd_text.append(f" {hd_label}", style="cyan")
+        elif hd_state == "N/A":
+            hd_text.append("N/A", style="dim")
+        else:
+            hd_text.append("OFF", style="dim")
+            if hd_label:
+                hd_text.append(f" {hd_label}", style="cyan")
+
+        hd_detail = radio.hd_status_detail
+        if hd_detail:
+            hd_text.append(f"  {hd_detail[:64]}", style="dim")
+        table.add_row("HD Radio:", hd_text)
+
+        hd_station = radio.hd_station_summary
+        if hd_station:
+            station_text = Text(hd_station[:72], style="green")
+            table.add_row("HD Station:", station_text)
+
+        hd_now_playing = radio.hd_now_playing_summary
+        if hd_now_playing:
+            track_text = Text(hd_now_playing[:72], style="cyan")
+            table.add_row("HD Track:", track_text)
 
     # Error message if any
     if radio.error_message:

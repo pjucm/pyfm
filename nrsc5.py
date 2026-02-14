@@ -5,6 +5,7 @@ Optional HD Radio demodulation hooks for pjfm via the external `nrsc5` CLI.
 
 from collections import deque
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -50,7 +51,7 @@ class NRSC5Demodulator:
     Manage an optional nrsc5 subprocess for HD Radio decoding.
 
     By default this launches stdin IQ mode:
-        nrsc5 -q -r - -o - -t raw <program>
+        nrsc5 -r - -o - -t raw <program>
 
     and accepts IQ pushes from pjfm, converting to the CU8 stream format
     expected by nrsc5's file input mode.
@@ -71,12 +72,21 @@ class NRSC5Demodulator:
     TARGET_IQ_RATE_HZ = 1_488_375.0
     TARGET_AUDIO_IN_RATE_HZ = 44_100.0
     TARGET_AUDIO_OUT_RATE_HZ = 48_000.0
-    DEFAULT_ARGS = ("-q", "-r", "-", "-o", "-", "-t", "raw")
+    DEFAULT_ARGS = ("-r", "-", "-o", "-", "-t", "raw")
     IQ_QUEUE_MAX_BLOCKS_DEFAULT = 8
     AUDIO_QUEUE_MAX_BLOCKS_DEFAULT = 64
     IQ_TARGET_RMS_DEFAULT = 0.18
     IQ_GAIN_MIN = 0.2
     IQ_GAIN_MAX = 120.0
+    _RE_STATION_NAME = re.compile(r"Station name:\s*(?P<name>.+)$")
+    _RE_AUDIO_PROGRAM = re.compile(r"Audio program\s+(?P<num>\d+):\s*(?P<name>[^,]+)")
+    _RE_AUDIO_SERVICE = re.compile(r"Audio service\s+(?P<num>\d+):\s*(?P<name>[^,]+)")
+    _RE_SIG_SERVICE = re.compile(
+        r"SIG Service:\s*type=(?P<type>\S+)\s+number=(?P<num>\d+)\s+name=(?P<name>.+)$"
+    )
+    _RE_TITLE = re.compile(r"Title:\s*(?P<value>.+)$")
+    _RE_ARTIST = re.compile(r"Artist:\s*(?P<value>.+)$")
+    _RE_ALBUM = re.compile(r"Album:\s*(?P<value>.+)$")
 
     def __init__(self, program=0, binary_name=None, extra_args=None):
         self.binary_name = (
@@ -159,6 +169,8 @@ class NRSC5Demodulator:
 
         self.last_error = ""
         self.last_output_line = ""
+        self._metadata = {}
+        self._reset_metadata_locked()
 
     @property
     def available(self):
@@ -216,6 +228,146 @@ class NRSC5Demodulator:
     def audio_bytes_out_total(self):
         with self._lock:
             return int(self._audio_bytes_out_total)
+
+    @property
+    def metadata_snapshot(self):
+        """Latest parsed metadata from nrsc5 output lines."""
+        with self._lock:
+            return dict(self._metadata)
+
+    def _reset_metadata_locked(self):
+        """Reset cached metadata state. Caller must hold `_lock`."""
+        self._metadata = {
+            "station_name": "",
+            "program_name": "",
+            "program_number": None,
+            "service_name": "",
+            "service_number": None,
+            "sig_service_name": "",
+            "title": "",
+            "artist": "",
+            "album": "",
+            "updated_at_s": 0.0,
+        }
+
+    def _active_program_index_locked(self):
+        prog = self._active_program
+        if prog is None:
+            prog = self.program
+        try:
+            return int(prog)
+        except (TypeError, ValueError):
+            return None
+
+    def _program_match_score_locked(self, number):
+        if number is None:
+            return -1
+        try:
+            num = int(number)
+        except (TypeError, ValueError):
+            return -1
+        active = self._active_program_index_locked()
+        if active is None:
+            return 0
+        if num == active:
+            return 3
+        # Some nrsc5 builds log program numbers as 1-based service IDs.
+        if num == (active + 1):
+            return 2
+        return 0
+
+    def _update_text_metadata_locked(self, key, value):
+        text = str(value).strip()
+        if not text or self._metadata.get(key) == text:
+            return False
+        self._metadata[key] = text
+        self._metadata["updated_at_s"] = time.monotonic()
+        return True
+
+    def _update_program_metadata_locked(self, name_key, number_key, number, name):
+        text = str(name).strip()
+        if not text:
+            return False
+        try:
+            num = int(number)
+        except (TypeError, ValueError):
+            num = None
+
+        current_name = self._metadata.get(name_key, "")
+        current_num = self._metadata.get(number_key)
+        current_score = self._program_match_score_locked(current_num)
+        new_score = self._program_match_score_locked(num)
+
+        replace = False
+        if not current_name:
+            replace = True
+        elif num is not None and current_num == num:
+            replace = True
+        elif new_score > current_score:
+            replace = True
+
+        if not replace:
+            return False
+        changed = (current_name != text) or (current_num != num)
+        if not changed:
+            return False
+        self._metadata[name_key] = text
+        self._metadata[number_key] = num
+        self._metadata["updated_at_s"] = time.monotonic()
+        return True
+
+    def _ingest_output_line_locked(self, line):
+        station_match = self._RE_STATION_NAME.search(line)
+        if station_match:
+            self._update_text_metadata_locked("station_name", station_match.group("name"))
+            return
+
+        title_match = self._RE_TITLE.search(line)
+        if title_match:
+            self._update_text_metadata_locked("title", title_match.group("value"))
+            return
+
+        artist_match = self._RE_ARTIST.search(line)
+        if artist_match:
+            self._update_text_metadata_locked("artist", artist_match.group("value"))
+            return
+
+        album_match = self._RE_ALBUM.search(line)
+        if album_match:
+            self._update_text_metadata_locked("album", album_match.group("value"))
+            return
+
+        prog_match = self._RE_AUDIO_PROGRAM.search(line)
+        if prog_match:
+            self._update_program_metadata_locked(
+                "program_name",
+                "program_number",
+                prog_match.group("num"),
+                prog_match.group("name"),
+            )
+            return
+
+        svc_match = self._RE_AUDIO_SERVICE.search(line)
+        if svc_match:
+            self._update_program_metadata_locked(
+                "service_name",
+                "service_number",
+                svc_match.group("num"),
+                svc_match.group("name"),
+            )
+            return
+
+        sig_match = self._RE_SIG_SERVICE.search(line)
+        if not sig_match:
+            return
+        self._update_text_metadata_locked("sig_service_name", sig_match.group("name"))
+        if sig_match.group("type").strip().lower().startswith("audio"):
+            self._update_program_metadata_locked(
+                "service_name",
+                "service_number",
+                sig_match.group("num"),
+                sig_match.group("name"),
+            )
 
     @staticmethod
     def _args_use_stdin_iq(args):
@@ -306,6 +458,7 @@ class NRSC5Demodulator:
                     continue
                 with self._lock:
                     self.last_output_line = line[-240:]
+                    self._ingest_output_line_locked(line)
         except Exception:
             pass
 
@@ -527,6 +680,7 @@ class NRSC5Demodulator:
             self._audio_bytes_out_total = 0
             self.last_error = ""
             self.last_output_line = ""
+            self._reset_metadata_locked()
 
             self._log_stderr_thread = threading.Thread(
                 target=self._drain_output,
@@ -639,6 +793,7 @@ class NRSC5Demodulator:
             self._audio_buffer = np.zeros((0, 2), dtype=np.float32)
             self._reset_iq_resampler_state()
             self._reset_audio_resampler_state()
+            self._reset_metadata_locked()
             self._last_audio_time_s = 0.0
             self._iq_cond.notify_all()
 
@@ -709,6 +864,7 @@ class NRSC5Demodulator:
                 self._audio_buffer = np.zeros((0, 2), dtype=np.float32)
                 self._reset_iq_resampler_state()
                 self._reset_audio_resampler_state()
+                self._reset_metadata_locked()
                 self._last_audio_time_s = 0.0
                 self._iq_cond.notify_all()
                 if rc != 0:

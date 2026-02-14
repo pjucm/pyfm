@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for nrsc5 process hooks."""
 
+import io
 import os
 import sys
 import time
@@ -62,6 +63,7 @@ def test_nrsc5_default_command_uses_stdin_iq(monkeypatch):
     demod = NRSC5Demodulator(program=3, binary_name="python3")
     cmd = demod._build_command(101_700_000)
 
+    assert "-q" not in cmd
     assert "-r" in cmd
     r_index = cmd.index("-r")
     assert cmd[r_index + 1] == "-"
@@ -145,3 +147,52 @@ def test_nrsc5_audio_pull_returns_exact_frames():
     pulled = demod.pull_audio(100)
     assert pulled is not None
     assert pulled.shape == (100, 2)
+
+
+def test_nrsc5_metadata_parsing_selects_active_program():
+    demod = NRSC5Demodulator(binary_name="python3", program=1)
+
+    stream = io.StringIO(
+        "Station name: WXYZ-HD\n"
+        "Audio program 0: Main Channel, type: Rock, sound experience 0\n"
+        "Audio program 1: Alt Channel, type: Alternative, sound experience 0\n"
+        "Audio service 1: Alt Channel, type: Alternative, codec: 0, blend: 0, gain: 0 dB, delay: 0, latency: 0\n"
+        "Title: Song A\n"
+        "Artist: Artist B\n"
+        "Album: Album C\n"
+    )
+    demod._drain_output(stream)
+    meta = demod.metadata_snapshot
+
+    assert meta["station_name"] == "WXYZ-HD"
+    assert meta["program_name"] == "Alt Channel"
+    assert meta["program_number"] == 1
+    assert meta["service_name"] == "Alt Channel"
+    assert meta["service_number"] == 1
+    assert meta["title"] == "Song A"
+    assert meta["artist"] == "Artist B"
+    assert meta["album"] == "Album C"
+
+
+def test_nrsc5_metadata_parses_prefixed_log_lines():
+    demod = NRSC5Demodulator(binary_name="python3", program=0)
+    demod._drain_output(io.StringIO(
+        "[I] Station name: PREFIX-HD\n"
+        "2026-02-14T13:00:00Z INFO Title: Prefixed Song\n"
+        "2026-02-14T13:00:01Z INFO Artist: Prefixed Artist\n"
+    ))
+    meta = demod.metadata_snapshot
+    assert meta["station_name"] == "PREFIX-HD"
+    assert meta["title"] == "Prefixed Song"
+    assert meta["artist"] == "Prefixed Artist"
+
+
+def test_nrsc5_stop_clears_metadata():
+    demod = NRSC5Demodulator(binary_name="python3")
+    demod._drain_output(io.StringIO("Station name: TEST\nTitle: Example\n"))
+    assert demod.metadata_snapshot["station_name"] == "TEST"
+
+    demod.stop()
+    meta = demod.metadata_snapshot
+    assert meta["station_name"] == ""
+    assert meta["title"] == ""
