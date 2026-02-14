@@ -9,6 +9,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from pjfm import FMRadio
 
 
+class _FakeHDDecoder:
+    def __init__(self):
+        self.stop_calls = 0
+
+    def stop(self):
+        self.stop_calls += 1
+
+
 def test_rate_adjust_clamp_fm_mode():
     assert FMRadio._clamp_rate_adjust(1.02, weather_mode=False) == FMRadio.RATE_ADJ_MAX
     assert FMRadio._clamp_rate_adjust(0.98, weather_mode=False) == FMRadio.RATE_ADJ_MIN
@@ -62,3 +70,34 @@ def test_iq_loss_flush_requires_threshold_and_cooldown():
         last_flush_s=now_s - (FMRadio.IQ_LOSS_FLUSH_COOLDOWN_S + 0.1),
         stream_start_s=stream_start_s,
     )
+
+
+def test_hd_program_helpers_cycle_hd1_hd2_hd3():
+    assert FMRadio._normalize_hd_program("bad") == 0
+    assert FMRadio._next_hd_program(0) == 1
+    assert FMRadio._next_hd_program(1) == 2
+    assert FMRadio._next_hd_program(2) == 0
+    assert FMRadio._hd_program_label(0) == "HD1"
+    assert FMRadio._hd_program_label(1) == "HD2"
+    assert FMRadio._hd_program_label(2) == "HD3"
+
+
+def test_snap_hd_decoder_off_stops_running_decoder():
+    radio = FMRadio.__new__(FMRadio)
+    radio.hd_decoder = _FakeHDDecoder()
+    radio.hd_enabled = True
+
+    FMRadio._snap_hd_decoder_off(radio)
+
+    assert radio.hd_enabled is False
+    assert radio.hd_decoder.stop_calls == 1
+
+
+def test_snap_hd_decoder_off_handles_missing_decoder():
+    radio = FMRadio.__new__(FMRadio)
+    radio.hd_decoder = None
+    radio.hd_enabled = True
+
+    FMRadio._snap_hd_decoder_off(radio)
+
+    assert radio.hd_enabled is False

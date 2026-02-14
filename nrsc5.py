@@ -111,6 +111,7 @@ class NRSC5Demodulator:
         self._iq_cond = threading.Condition(self._lock)
         self._process = None
         self._frequency_hz = None
+        self._active_program = None
         self._stdin_iq_mode = False
         self._audio_stdout_mode = False
         self._uses_frequency_arg = True
@@ -183,6 +184,12 @@ class NRSC5Demodulator:
             return self._frequency_hz
 
     @property
+    def active_program(self):
+        """Program index currently running in nrsc5, or None when stopped."""
+        with self._lock:
+            return self._active_program
+
+    @property
     def stdin_iq_mode(self):
         """True when nrsc5 was launched in '-r -' IQ stdin mode."""
         with self._lock:
@@ -224,9 +231,18 @@ class NRSC5Demodulator:
                 return True
         return False
 
-    def _build_runtime_command(self, frequency_hz):
+    def set_program(self, program):
+        """Set the HD subprogram index for subsequent starts/restarts."""
+        new_program = int(program)
+        if new_program < 0:
+            raise ValueError("program must be >= 0")
+        with self._lock:
+            self.program = new_program
+
+    def _build_runtime_command(self, frequency_hz, program=None):
         freq_hz = int(round(float(frequency_hz)))
         freq_mhz = float(freq_hz) / 1e6
+        program = int(self.program if program is None else program)
 
         if self.command_template:
             template_parts = shlex.split(self.command_template)
@@ -234,7 +250,7 @@ class NRSC5Demodulator:
                 token.format(
                     freq_hz=freq_hz,
                     freq_mhz=f"{freq_mhz:.3f}",
-                    program=self.program,
+                    program=program,
                     nrsc5=self._binary_path or self.binary_name,
                 )
                 for token in template_parts
@@ -254,7 +270,7 @@ class NRSC5Demodulator:
             token.format(
                 freq_hz=freq_hz,
                 freq_mhz=f"{freq_mhz:.3f}",
-                program=self.program,
+                program=program,
                 nrsc5=self._binary_path,
             )
             for token in self.extra_args
@@ -262,10 +278,10 @@ class NRSC5Demodulator:
         stdin_iq_mode = self._args_use_stdin_iq(args)
         audio_stdout_mode = self._args_use_audio_stdout(args)
         if stdin_iq_mode:
-            cmd = [self._binary_path] + args + [str(self.program)]
+            cmd = [self._binary_path] + args + [str(program)]
             return cmd, True, False, audio_stdout_mode
 
-        cmd = [self._binary_path] + args + [f"{freq_mhz:.3f}", str(self.program)]
+        cmd = [self._binary_path] + args + [f"{freq_mhz:.3f}", str(program)]
         return cmd, False, True, audio_stdout_mode
 
     def _build_command(self, frequency_hz):
@@ -459,9 +475,12 @@ class NRSC5Demodulator:
         with self._lock:
             proc = self._process
             current_freq = self._frequency_hz
+            active_program = self._active_program
+            desired_program = int(self.program)
             uses_frequency = self._uses_frequency_arg
 
         if (proc is not None and proc.poll() is None and
+                active_program == desired_program and
                 ((not uses_frequency) or current_freq == freq_hz)):
             return
 
@@ -471,7 +490,10 @@ class NRSC5Demodulator:
             raise RuntimeError(f"HD Radio unavailable: {self.unavailable_reason}")
 
         try:
-            cmd, stdin_iq_mode, uses_frequency, audio_stdout_mode = self._build_runtime_command(freq_hz)
+            cmd, stdin_iq_mode, uses_frequency, audio_stdout_mode = self._build_runtime_command(
+                freq_hz,
+                program=desired_program,
+            )
         except Exception as exc:
             raise RuntimeError(f"Failed to build nrsc5 command: {exc}") from exc
 
@@ -490,6 +512,7 @@ class NRSC5Demodulator:
         with self._lock:
             self._process = proc
             self._frequency_hz = freq_hz
+            self._active_program = desired_program
             self._stdin_iq_mode = stdin_iq_mode
             self._audio_stdout_mode = audio_stdout_mode
             self._uses_frequency_arg = uses_frequency
@@ -606,6 +629,7 @@ class NRSC5Demodulator:
             self._writer_thread = None
             self._audio_thread = None
             self._frequency_hz = None
+            self._active_program = None
             self._stdin_iq_mode = False
             self._audio_stdout_mode = False
             self._uses_frequency_arg = True
@@ -675,6 +699,7 @@ class NRSC5Demodulator:
                 self._writer_thread = None
                 self._audio_thread = None
                 self._frequency_hz = None
+                self._active_program = None
                 self._stdin_iq_mode = False
                 self._audio_stdout_mode = False
                 self._uses_frequency_arg = True

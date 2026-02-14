@@ -73,6 +73,49 @@ def test_nrsc5_default_command_uses_stdin_iq(monkeypatch):
     assert "101.700" not in cmd
 
 
+def test_nrsc5_set_program_updates_runtime_command(monkeypatch):
+    monkeypatch.delenv("PJFM_NRSC5_COMMAND", raising=False)
+    monkeypatch.delenv("PJFM_NRSC5_ARGS", raising=False)
+    monkeypatch.delenv("PJFM_NRSC5_PROGRAM", raising=False)
+
+    demod = NRSC5Demodulator(program=0, binary_name="python3")
+    demod.set_program(2)
+    cmd = demod._build_command(101_700_000)
+
+    assert cmd[-1] == "2"
+
+
+def test_nrsc5_start_restarts_when_program_changes(monkeypatch):
+    monkeypatch.setenv(
+        "PJFM_NRSC5_COMMAND",
+        f"{sys.executable} -c 'import time; time.sleep(10)'",
+    )
+
+    demod = NRSC5Demodulator(program=0)
+    try:
+        demod.start(99_900_000)
+        assert demod.is_running
+        with demod._lock:
+            first_proc = demod._process
+
+        # Same program/frequency should keep the running process.
+        demod.start(99_900_000)
+        with demod._lock:
+            second_proc = demod._process
+        assert second_proc is first_proc
+
+        demod.set_program(1)
+        demod.start(99_900_000)
+        assert demod.is_running
+        with demod._lock:
+            third_proc = demod._process
+
+        assert third_proc is not first_proc
+        assert demod.active_program == 1
+    finally:
+        demod.stop()
+
+
 def test_nrsc5_iq_conversion_generates_cu8():
     demod = NRSC5Demodulator(binary_name="python3")
     t = np.arange(8192, dtype=np.float64)
