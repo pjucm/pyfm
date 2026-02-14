@@ -429,6 +429,8 @@ Copyright (c) 2026 Phil Jensen. All rights reserved.
 
 - SignalHound for the BB60D API
 - Icom for the IC-R8600 I/Q Reference Guide
+- Clayton Smith, author of [`nrsc5`](https://github.com/theori-io/nrsc5)
+- The [`nrsc5`](https://github.com/theori-io/nrsc5) project and contributors for HD Radio decoding support
 - The Rich library for terminal UI
 - PyQt5 and pyqtgraph for panadapter GUI
 - IEC 62106 (RDS specification)
