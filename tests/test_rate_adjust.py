@@ -35,6 +35,14 @@ class _FakeHDMetadataDecoder:
         self.program = 0
 
 
+class _FakeRDSDecoder:
+    def __init__(self):
+        self.reset_calls = 0
+
+    def reset(self):
+        self.reset_calls += 1
+
+
 def test_rate_adjust_clamp_fm_mode():
     assert FMRadio._clamp_rate_adjust(1.02, weather_mode=False) == FMRadio.RATE_ADJ_MAX
     assert FMRadio._clamp_rate_adjust(0.98, weather_mode=False) == FMRadio.RATE_ADJ_MIN
@@ -135,6 +143,35 @@ def test_snap_hd_decoder_off_resets_program_when_already_off():
     assert radio.hd_decoder.program == 0
     assert radio.hd_decoder.set_program_calls == [0]
 
+
+def test_suspend_rds_for_hd_clears_decoder_state():
+    radio = FMRadio.__new__(FMRadio)
+    radio.weather_mode = False
+    radio.hd_enabled = True
+    radio.rds_enabled = True
+    radio.rds_data = {"station_name": "WXYZ"}
+    radio.rds_decoder = _FakeRDSDecoder()
+
+    FMRadio._suspend_rds_for_hd(radio)
+
+    assert radio.rds_enabled is False
+    assert radio.rds_data == {}
+    assert radio.rds_decoder.reset_calls == 1
+
+
+def test_suspend_rds_for_hd_noop_when_not_active():
+    radio = FMRadio.__new__(FMRadio)
+    radio.weather_mode = False
+    radio.hd_enabled = False
+    radio.rds_enabled = True
+    radio.rds_data = {"station_name": "WXYZ"}
+    radio.rds_decoder = _FakeRDSDecoder()
+
+    FMRadio._suspend_rds_for_hd(radio)
+
+    assert radio.rds_enabled is True
+    assert radio.rds_data == {"station_name": "WXYZ"}
+    assert radio.rds_decoder.reset_calls == 0
 
 def test_hd_metadata_summaries_include_station_and_track():
     radio = FMRadio.__new__(FMRadio)

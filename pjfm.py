@@ -1303,6 +1303,7 @@ class FMRadio:
                     continue
 
                 self._sync_hd_decoder_state()
+                self._suspend_rds_for_hd()
 
                 # Get IQ samples from capture thread
                 iq = self._get_iq_block()
@@ -1456,6 +1457,7 @@ class FMRadio:
                 # (pilot = station has stereo/RDS capability)
                 # Don't enable RDS on noise - require signal above squelch threshold
                 if (not self.weather_mode and
+                        not self.hd_enabled and
                         not self.rds_forced_off and
                         self.auto_mode_enabled and
                         self.stereo_decoder):
@@ -1481,6 +1483,7 @@ class FMRadio:
                 # Process RDS inline (no queue) for sample continuity (FM broadcast only)
                 if (not loss_now and
                         not self.weather_mode and
+                        not self.hd_enabled and
                         not self.rds_forced_off and
                         self.rds_enabled and
                         self.rds_decoder and
@@ -1655,6 +1658,17 @@ class FMRadio:
             self.hd_enabled = False
             if self.hd_decoder.last_error:
                 self.error_message = self.hd_decoder.last_error
+
+    def _suspend_rds_for_hd(self):
+        """Disable/clear RDS state while HD mode is active."""
+        if self.weather_mode or not self.hd_enabled:
+            return
+        if self.rds_enabled:
+            self.rds_enabled = False
+        if self.rds_data:
+            self.rds_data = {}
+        if self.rds_decoder:
+            self.rds_decoder.reset()
 
     def _snap_hd_decoder_off(self):
         """Stop HD decoding after channel/mode changes and reset to HD1."""
@@ -1843,6 +1857,7 @@ class FMRadio:
             self.hd_decoder.set_program(target_program)
             self.hd_decoder.start(self.device.frequency)
             self.hd_enabled = True
+            self._suspend_rds_for_hd()
             self.error_message = None
         except (RuntimeError, ValueError) as exc:
             self.hd_enabled = False
@@ -1863,6 +1878,7 @@ class FMRadio:
         try:
             self.hd_decoder.start(self.device.frequency)
             self.hd_enabled = True
+            self._suspend_rds_for_hd()
             self.error_message = None
         except RuntimeError as exc:
             self.hd_enabled = False
@@ -2243,11 +2259,61 @@ def build_display(radio, width=80):
     freq = radio.frequency_mhz
     signal_dbm = radio.get_signal_strength()
     s_reading = format_s_meter(signal_dbm)
+    hd_active = (not radio.weather_mode and radio.hd_enabled)
 
     # Create main table for aligned fields (not expanded, will be centered)
     table = Table(show_header=False, box=None, padding=(0, 1), expand=False)
     table.add_column("Label", style="cyan", width=12, justify="right")
     table.add_column("Value", style="green bold")
+
+    def add_hd_rows():
+        """Render HD status and metadata lines."""
+        hd_text = Text()
+        hd_state = radio.hd_status
+        hd_label = radio.hd_program_label
+        if hd_state == "ON":
+            hd_text.append("ON", style="green bold")
+            if hd_label:
+                hd_text.append(f" {hd_label}", style="cyan")
+            if radio.hd_audio_active:
+                hd_text.append("  [AUDIO]", style="green")
+            else:
+                hd_text.append("  [WAIT]", style="yellow")
+        elif hd_state == "ERR":
+            hd_text.append("ERR", style="red bold")
+            if hd_label:
+                hd_text.append(f" {hd_label}", style="cyan")
+        elif hd_state == "N/A":
+            hd_text.append("N/A", style="dim")
+        else:
+            hd_text.append("OFF", style="dim")
+            if hd_label:
+                hd_text.append(f" {hd_label}", style="cyan")
+
+        hd_detail = radio.hd_status_detail
+        if hd_detail:
+            hd_text.append(f"  {hd_detail[:64]}", style="dim")
+        table.add_row("HD Radio:", hd_text)
+
+        hd_station = radio.hd_station_summary
+        if hd_station:
+            station_text = Text(hd_station[:72], style="green")
+            table.add_row("HD Station:", station_text)
+
+        hd_info = radio.hd_info_summary
+        if hd_info:
+            info_text = Text(hd_info[:72], style="yellow")
+            table.add_row("HD Info:", info_text)
+
+        hd_now_playing = radio.hd_now_playing_summary
+        if hd_now_playing:
+            track_text = Text(hd_now_playing[:72], style="cyan")
+            table.add_row("HD Track:", track_text)
+
+        hd_weather = radio.hd_weather_summary
+        if hd_weather:
+            weather_text = Text(hd_weather[:72], style="bright_blue")
+            table.add_row("HD Weather:", weather_text)
 
     # Frequency row
     freq_text = Text()
@@ -2384,7 +2450,8 @@ def build_display(radio, width=80):
             stereo_text.append("Mono", style="yellow")
         else:
             stereo_text.append(f"Stereo ({blend:.0%})", style="yellow bold")
-    table.add_row("Audio:", stereo_text)
+    if not hd_active:
+        table.add_row("Audio:", stereo_text)
     if radio.recorder and radio.recorder.is_recording:
         rec_text = build_recording_status_text(
             is_recording=True,
@@ -2393,8 +2460,11 @@ def build_display(radio, width=80):
         )
         table.add_row("Record:", rec_text)
 
-    # RDS data display (FM mode only - hidden in weather mode or when forced off)
-    if not radio.weather_mode and not radio.rds_forced_off:
+    # RDS data display (FM mode only - hidden in weather mode/forced-off/HD active)
+    rds_snapshot = {}  # For RDS status section below
+    if hd_active:
+        add_hd_rows()
+    elif not radio.weather_mode and not radio.rds_forced_off:
         rds_snapshot = dict(radio.rds_data) if radio.rds_data else {}
         ps_name = rds_snapshot.get('station_name', '') if radio.rds_enabled else ''
         pty = rds_snapshot.get('program_type', '') if radio.rds_enabled else ''
@@ -2437,8 +2507,6 @@ def build_display(radio, width=80):
             rtplus_display = f"Title: {rtplus_title}  Artist: {rtplus_artist}  Album: {rtplus_album}"
             rtplus_text = Text(rtplus_display, style="green")
             table.add_row("RT+:", rtplus_text)
-    else:
-        rds_snapshot = {}  # For RDS status section below
 
     table.add_row("", "")  # Spacer
 
@@ -2483,7 +2551,7 @@ def build_display(radio, width=80):
     table.add_row("Boost:", tone_text)
 
     # RDS status (FM mode only)
-    if not radio.weather_mode and not radio.rds_forced_off:
+    if not radio.weather_mode and not radio.rds_forced_off and not hd_active:
         rds_text = Text()
         if radio.rds_enabled:
             rds_text.append("ON", style="green bold")
@@ -2515,55 +2583,10 @@ def build_display(radio, width=80):
         table.add_row("RDS:", rds_text)
 
     # HD status/metadata (FM mode only) below RDS with a separator line.
-    if not radio.weather_mode:
+    # When HD is active, HD rows are rendered above Spectrum/Squelch/Boost.
+    if not radio.weather_mode and not hd_active:
         table.add_row("", "")
-
-        hd_text = Text()
-        hd_state = radio.hd_status
-        hd_label = radio.hd_program_label
-        if hd_state == "ON":
-            hd_text.append("ON", style="green bold")
-            if hd_label:
-                hd_text.append(f" {hd_label}", style="cyan")
-            if radio.hd_audio_active:
-                hd_text.append("  [AUDIO]", style="green")
-            else:
-                hd_text.append("  [WAIT]", style="yellow")
-        elif hd_state == "ERR":
-            hd_text.append("ERR", style="red bold")
-            if hd_label:
-                hd_text.append(f" {hd_label}", style="cyan")
-        elif hd_state == "N/A":
-            hd_text.append("N/A", style="dim")
-        else:
-            hd_text.append("OFF", style="dim")
-            if hd_label:
-                hd_text.append(f" {hd_label}", style="cyan")
-
-        hd_detail = radio.hd_status_detail
-        if hd_detail:
-            hd_text.append(f"  {hd_detail[:64]}", style="dim")
-        table.add_row("HD Radio:", hd_text)
-
-        hd_station = radio.hd_station_summary
-        if hd_station:
-            station_text = Text(hd_station[:72], style="green")
-            table.add_row("HD Station:", station_text)
-
-        hd_info = radio.hd_info_summary
-        if hd_info:
-            info_text = Text(hd_info[:72], style="yellow")
-            table.add_row("HD Info:", info_text)
-
-        hd_now_playing = radio.hd_now_playing_summary
-        if hd_now_playing:
-            track_text = Text(hd_now_playing[:72], style="cyan")
-            table.add_row("HD Track:", track_text)
-
-        hd_weather = radio.hd_weather_summary
-        if hd_weather:
-            weather_text = Text(hd_weather[:72], style="bright_blue")
-            table.add_row("HD Weather:", weather_text)
+        add_hd_rows()
 
     # Error message if any
     if radio.error_message:
