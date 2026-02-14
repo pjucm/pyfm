@@ -1657,12 +1657,22 @@ class FMRadio:
                 self.error_message = self.hd_decoder.last_error
 
     def _snap_hd_decoder_off(self):
-        """Stop HD decoding after channel/mode changes."""
+        """Stop HD decoding after channel/mode changes and reset to HD1."""
         if not self.hd_decoder:
             self.hd_enabled = False
             return
         if self.hd_enabled:
             self.hd_decoder.stop()
+        if hasattr(self.hd_decoder, "set_program"):
+            try:
+                self.hd_decoder.set_program(self.HD_PROGRAMS[0])
+            except (TypeError, ValueError):
+                pass
+        elif hasattr(self.hd_decoder, "program"):
+            try:
+                self.hd_decoder.program = self.HD_PROGRAMS[0]
+            except Exception:
+                pass
         self.hd_enabled = False
 
     def tune_up(self):

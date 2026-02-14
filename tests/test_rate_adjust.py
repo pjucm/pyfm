@@ -12,9 +12,15 @@ from pjfm import FMRadio
 class _FakeHDDecoder:
     def __init__(self):
         self.stop_calls = 0
+        self.program = 2
+        self.set_program_calls = []
 
     def stop(self):
         self.stop_calls += 1
+
+    def set_program(self, program):
+        self.program = int(program)
+        self.set_program_calls.append(self.program)
 
 
 class _FakeHDMetadataDecoder:
@@ -103,6 +109,8 @@ def test_snap_hd_decoder_off_stops_running_decoder():
 
     assert radio.hd_enabled is False
     assert radio.hd_decoder.stop_calls == 1
+    assert radio.hd_decoder.program == 0
+    assert radio.hd_decoder.set_program_calls == [0]
 
 
 def test_snap_hd_decoder_off_handles_missing_decoder():
@@ -113,6 +121,19 @@ def test_snap_hd_decoder_off_handles_missing_decoder():
     FMRadio._snap_hd_decoder_off(radio)
 
     assert radio.hd_enabled is False
+
+
+def test_snap_hd_decoder_off_resets_program_when_already_off():
+    radio = FMRadio.__new__(FMRadio)
+    radio.hd_decoder = _FakeHDDecoder()
+    radio.hd_enabled = False
+
+    FMRadio._snap_hd_decoder_off(radio)
+
+    assert radio.hd_enabled is False
+    assert radio.hd_decoder.stop_calls == 0
+    assert radio.hd_decoder.program == 0
+    assert radio.hd_decoder.set_program_calls == [0]
 
 
 def test_hd_metadata_summaries_include_station_and_track():
