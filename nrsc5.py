@@ -120,6 +120,7 @@ class NRSC5Demodulator:
         self._python_seen_program_zero = False
 
         self._lock = threading.Lock()
+        self._decoder_call_lock = threading.Lock()
         self._iq_cond = threading.Condition(self._lock)
         self._process = None
         self._frequency_hz = None
@@ -915,7 +916,11 @@ class NRSC5Demodulator:
             if not payload:
                 continue
             try:
-                decoder.pipe_samples_cu8(payload)
+                with self._decoder_call_lock:
+                    with self._lock:
+                        if self._python_decoder is not decoder or self._writer_stop:
+                            return
+                    decoder.pipe_samples_cu8(payload)
                 with self._lock:
                     if self._python_decoder is decoder:
                         self._iq_bytes_in_total += int(len(payload))
@@ -1203,11 +1208,15 @@ class NRSC5Demodulator:
             return
 
         try:
-            decoder.stop()
-        except Exception:
-            pass
-        try:
-            decoder.close()
+            with self._decoder_call_lock:
+                try:
+                    decoder.stop()
+                except Exception:
+                    pass
+                try:
+                    decoder.close()
+                except Exception:
+                    pass
         except Exception:
             pass
 

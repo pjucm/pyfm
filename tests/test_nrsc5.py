@@ -4,6 +4,7 @@
 import io
 import os
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -407,3 +408,94 @@ def test_nrsc5_stop_clears_stats():
     assert stats["agc_gain_db"] is None
     assert stats["agc_peak_dbfs"] is None
     assert stats["agc_is_final"] is None
+
+
+def test_nrsc5_stop_waits_for_inflight_pipe_write(monkeypatch):
+    class _FakeMode:
+        FM = object()
+
+    class _FakeNRSC5:
+        libnrsc5 = object()
+
+        def __init__(self, callback):
+            self.callback = callback
+            self.pipe_enter = threading.Event()
+            self.pipe_release = threading.Event()
+            self.stop_calls = 0
+            self.close_calls = 0
+            self.stop_or_close_during_pipe = False
+            self._in_pipe = False
+
+        def open_pipe(self):
+            return None
+
+        def set_mode(self, _mode):
+            return None
+
+        def start(self):
+            return None
+
+        def stop(self):
+            if self._in_pipe:
+                self.stop_or_close_during_pipe = True
+            self.stop_calls += 1
+
+        def close(self):
+            if self._in_pipe:
+                self.stop_or_close_during_pipe = True
+            self.close_calls += 1
+
+        def pipe_samples_cu8(self, _samples):
+            self._in_pipe = True
+            self.pipe_enter.set()
+            self.pipe_release.wait(timeout=2.0)
+            self._in_pipe = False
+
+    class _FakeBindings:
+        NRSC5 = _FakeNRSC5
+        Mode = _FakeMode
+        EventType = object()
+
+    monkeypatch.setattr(
+        NRSC5Demodulator,
+        "_load_python_bindings",
+        lambda self: (_FakeBindings, "/tmp/nrsc5.py", "/tmp/libnrsc5.so", ""),
+    )
+
+    demod = NRSC5Demodulator(program=0)
+    try:
+        demod.start(99_900_000)
+        decoder = demod._python_decoder
+        assert decoder is not None
+
+        iq = np.ones(8192, dtype=np.complex64) * (0.1 + 0.1j)
+        demod.push_iq(iq, sample_rate_hz=480000)
+        assert decoder.pipe_enter.wait(timeout=1.0)
+
+        stop_exc = {}
+
+        def _run_stop():
+            try:
+                demod.stop()
+            except Exception as exc:  # pragma: no cover - defensive
+                stop_exc["error"] = exc
+
+        stop_thread = threading.Thread(target=_run_stop, daemon=True)
+        stop_thread.start()
+
+        # stop() should block until the inflight write exits
+        time.sleep(0.05)
+        assert stop_thread.is_alive()
+
+        decoder.pipe_release.set()
+        stop_thread.join(timeout=2.0)
+
+        assert not stop_thread.is_alive()
+        assert "error" not in stop_exc
+        assert decoder.stop_calls == 1
+        assert decoder.close_calls == 1
+        assert decoder.stop_or_close_during_pipe is False
+    finally:
+        decoder = demod._python_decoder
+        if decoder is not None:
+            demod.stop()
