@@ -713,6 +713,9 @@ class FMRadio:
     FM_STEP_HZ = 200_000
     HD_PROGRAMS = (0, 1, 2)
     USER_PRESET_COUNT = 8
+    HD_SOLID_SYNC_MIN_S = 1.0
+    HD_SOLID_SYNC_BER_MAX = 2e-2
+    HD_SOLID_SYNC_MER_MIN_DB = 8.0
 
     # Signal level calibration offset (dB)
     # IQ samples need calibration to match true power in dBm.
@@ -1295,6 +1298,29 @@ class FMRadio:
         self._overflow_window_s = 2.0
         self._overflow_threshold_ms = 500.0
         self._overflow_recovery_cooldown_s = 2.0
+        try:
+            hd_solid_sync_min_s = max(
+                0.0,
+                float(os.environ.get("PJFM_HD_SOLID_SYNC_MIN_S", str(self.HD_SOLID_SYNC_MIN_S))),
+            )
+        except ValueError:
+            hd_solid_sync_min_s = self.HD_SOLID_SYNC_MIN_S
+        try:
+            hd_solid_sync_ber_max = max(
+                0.0,
+                float(os.environ.get("PJFM_HD_SOLID_SYNC_BER_MAX", str(self.HD_SOLID_SYNC_BER_MAX))),
+            )
+        except ValueError:
+            hd_solid_sync_ber_max = self.HD_SOLID_SYNC_BER_MAX
+        try:
+            hd_solid_sync_mer_min_db = float(
+                os.environ.get("PJFM_HD_SOLID_SYNC_MER_MIN_DB", str(self.HD_SOLID_SYNC_MER_MIN_DB))
+            )
+        except ValueError:
+            hd_solid_sync_mer_min_db = self.HD_SOLID_SYNC_MER_MIN_DB
+        hd_sync_good_since_s = 0.0
+        hd_bypass_active = False
+        hd_pull_fractional_frames = 0.0
 
         while self.running:
             try:
@@ -1419,6 +1445,47 @@ class FMRadio:
                 else:
                     self.stereo_decoder.rate_adjust = applied_rate_adj
 
+                hd_sync_solid = False
+                if (not self.weather_mode and
+                        not loss_now and
+                        self.hd_enabled and
+                        self.hd_decoder):
+                    hd_stats = getattr(self.hd_decoder, "stats_snapshot", {}) or {}
+                    hd_sync = bool(hd_stats.get("sync", False))
+                    hd_audio_active = bool(self.hd_decoder.audio_active)
+                    hd_ber = hd_stats.get("ber_cber")
+                    hd_mer_lower = hd_stats.get("mer_lower_db")
+                    hd_mer_upper = hd_stats.get("mer_upper_db")
+
+                    ber_ok = True
+                    try:
+                        if hd_ber is not None:
+                            ber_ok = float(hd_ber) <= hd_solid_sync_ber_max
+                    except (TypeError, ValueError):
+                        ber_ok = False
+
+                    mer_ok = True
+                    try:
+                        if hd_mer_lower is not None and float(hd_mer_lower) < hd_solid_sync_mer_min_db:
+                            mer_ok = False
+                        if hd_mer_upper is not None and float(hd_mer_upper) < hd_solid_sync_mer_min_db:
+                            mer_ok = False
+                    except (TypeError, ValueError):
+                        mer_ok = False
+
+                    hd_sync_solid = hd_sync and hd_audio_active and ber_ok and mer_ok
+
+                loop_now_s = time.monotonic()
+                if hd_sync_solid:
+                    if hd_sync_good_since_s <= 0.0:
+                        hd_sync_good_since_s = loop_now_s
+                    if (loop_now_s - hd_sync_good_since_s) >= hd_solid_sync_min_s:
+                        hd_bypass_active = True
+                else:
+                    hd_sync_good_since_s = 0.0
+                    hd_bypass_active = False
+                    hd_pull_fractional_frames = 0.0
+
                 # Optional PI rate-control logging (disabled by default).
                 if self._pi_log_enabled:
                     # In detailed mode: every block for first 15s, then every 10 blocks
@@ -1446,13 +1513,35 @@ class FMRadio:
                         self._rate_log_file.write(f"{elapsed:.3f},{buf_level:.1f},{buf_target:.0f},{self._filtered_error:.1f},{p_ppm:.1f},{i_ppm:.1f},{adj_ppm:.1f},{self._rate_integrator:.8f},{buf_error_raw:.1f},{self._filtered_error:.1f}\n")
                         self._rate_log_file.flush()
 
+                hd_audio_used = False
                 # Demodulate FM using appropriate decoder
                 if self.weather_mode:
                     # NBFM for weather radio
                     audio = self.nbfm_decoder.demodulate(iq)
                 else:
-                    # Wideband FM stereo for broadcast
-                    audio = self.stereo_decoder.demodulate(iq)
+                    if hd_bypass_active and self.hd_enabled and self.hd_decoder:
+                        iq_rate_hz = float(getattr(self.device, 'iq_sample_rate', self.iq_sample_rate))
+                        if iq_rate_hz <= 0.0:
+                            iq_rate_hz = float(self.iq_sample_rate or self.IQ_SAMPLE_RATE)
+                        block_duration_s = float(len(iq)) / iq_rate_hz
+                        target_frames_f = (
+                            block_duration_s * float(self.audio_player.sample_rate) * applied_rate_adj
+                        ) + hd_pull_fractional_frames
+                        target_frames = max(1, int(target_frames_f))
+                        hd_pull_fractional_frames = max(0.0, target_frames_f - target_frames)
+                        hd_audio = self.hd_decoder.pull_audio(target_frames)
+                        if hd_audio is not None:
+                            audio = hd_audio
+                            hd_audio_used = True
+                        else:
+                            # If HD under-runs, immediately fall back to analog demod this block.
+                            hd_bypass_active = False
+                            hd_sync_good_since_s = 0.0
+                            hd_pull_fractional_frames = 0.0
+                            audio = self.stereo_decoder.demodulate(iq)
+                    else:
+                        # Wideband FM stereo for broadcast
+                        audio = self.stereo_decoder.demodulate(iq)
 
                 # Auto mode: RDS is enabled when pilot is present (FM broadcast only)
                 # (pilot = station has stereo/RDS capability)
@@ -1493,11 +1582,11 @@ class FMRadio:
                         self.stereo_decoder.last_baseband
                     )
 
-                hd_audio_used = False
                 # If HD decode is active and audio is available, prefer digital audio.
                 if (not self.weather_mode and
                         self.hd_enabled and
-                        self.hd_decoder):
+                        self.hd_decoder and
+                        not hd_audio_used):
                     hd_audio = self.hd_decoder.pull_audio(len(audio))
                     if hd_audio is not None:
                         audio = hd_audio
