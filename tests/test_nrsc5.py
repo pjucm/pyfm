@@ -5,6 +5,7 @@ import io
 import os
 import sys
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,111 +16,211 @@ from nrsc5 import NRSC5Demodulator
 
 
 def test_nrsc5_unavailable_reports_reason(monkeypatch):
-    monkeypatch.delenv("PJFM_NRSC5_COMMAND", raising=False)
-    monkeypatch.setenv("PJFM_NRSC5_BIN", "nrsc5-definitely-not-installed")
+    monkeypatch.setattr(
+        NRSC5Demodulator,
+        "_load_python_bindings",
+        lambda self: (None, "", "", "bindings unavailable for test"),
+    )
 
     demod = NRSC5Demodulator()
 
     assert not demod.available
-    assert "not found" in demod.unavailable_reason
+    assert "bindings unavailable" in demod.unavailable_reason
     with pytest.raises(RuntimeError):
         demod.start(101_700_000)
 
 
-def test_nrsc5_command_template_formats_frequency(monkeypatch):
-    monkeypatch.setenv(
-        "PJFM_NRSC5_COMMAND",
-        "{nrsc5} --freq={freq_mhz} --hz={freq_hz} --program={program}",
-    )
-    monkeypatch.setenv("PJFM_NRSC5_BIN", "nrsc5")
+def test_nrsc5_start_stop_python_backend(monkeypatch):
+    class _FakeMode:
+        FM = object()
 
-    demod = NRSC5Demodulator(program=2)
-    cmd = demod._build_command(101_700_000)
+    class _FakeNRSC5:
+        libnrsc5 = object()
 
-    assert cmd[1] == "--freq=101.700"
-    assert cmd[2] == "--hz=101700000"
-    assert cmd[3] == "--program=2"
+        def __init__(self, callback):
+            self.callback = callback
+            self.open_pipe_calls = 0
+            self.set_mode_calls = 0
+            self.start_calls = 0
+            self.stop_calls = 0
+            self.close_calls = 0
 
+        def open_pipe(self):
+            self.open_pipe_calls += 1
 
-def test_nrsc5_start_stop_with_template_process(monkeypatch):
-    monkeypatch.setenv(
-        "PJFM_NRSC5_COMMAND",
-        f"{sys.executable} -c 'import time; time.sleep(10)'",
+        def set_mode(self, _mode):
+            self.set_mode_calls += 1
+
+        def start(self):
+            self.start_calls += 1
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def close(self):
+            self.close_calls += 1
+
+        def pipe_samples_cu8(self, _samples):
+            return None
+
+    class _FakeBindings:
+        NRSC5 = _FakeNRSC5
+        Mode = _FakeMode
+        EventType = object()
+
+    monkeypatch.setattr(
+        NRSC5Demodulator,
+        "_load_python_bindings",
+        lambda self: (_FakeBindings, "/tmp/nrsc5.py", "/tmp/libnrsc5.so", ""),
     )
 
     demod = NRSC5Demodulator()
     demod.start(99_900_000)
     assert demod.is_running
+    assert demod.backend == NRSC5Demodulator.BACKEND_PYTHON
 
     demod.stop()
     assert not demod.is_running
 
 
-def test_nrsc5_default_command_uses_stdin_iq(monkeypatch):
-    monkeypatch.delenv("PJFM_NRSC5_COMMAND", raising=False)
-    monkeypatch.delenv("PJFM_NRSC5_ARGS", raising=False)
-    monkeypatch.delenv("PJFM_NRSC5_PROGRAM", raising=False)
+def test_nrsc5_python_backend_changes_program_without_restart(monkeypatch):
+    class _FakeMode:
+        FM = object()
 
-    demod = NRSC5Demodulator(program=3, binary_name="python3")
-    cmd = demod._build_command(101_700_000)
+    class _FakeNRSC5:
+        libnrsc5 = object()
+        instances = []
 
-    assert "-q" not in cmd
-    assert "-r" in cmd
-    r_index = cmd.index("-r")
-    assert cmd[r_index + 1] == "-"
-    assert "-o" in cmd
-    o_index = cmd.index("-o")
-    assert cmd[o_index + 1] == "-"
-    assert cmd[-1] == "3"
-    # stdin mode command should not append frequency argument.
-    assert "101.700" not in cmd
+        def __init__(self, callback):
+            self.callback = callback
+            self.open_pipe_calls = 0
+            self.set_mode_calls = 0
+            self.start_calls = 0
+            self.stop_calls = 0
+            self.close_calls = 0
+            _FakeNRSC5.instances.append(self)
 
+        def open_pipe(self):
+            self.open_pipe_calls += 1
 
-def test_nrsc5_set_program_updates_runtime_command(monkeypatch):
-    monkeypatch.delenv("PJFM_NRSC5_COMMAND", raising=False)
-    monkeypatch.delenv("PJFM_NRSC5_ARGS", raising=False)
-    monkeypatch.delenv("PJFM_NRSC5_PROGRAM", raising=False)
+        def set_mode(self, _mode):
+            self.set_mode_calls += 1
 
-    demod = NRSC5Demodulator(program=0, binary_name="python3")
-    demod.set_program(2)
-    cmd = demod._build_command(101_700_000)
+        def start(self):
+            self.start_calls += 1
 
-    assert cmd[-1] == "2"
+        def stop(self):
+            self.stop_calls += 1
 
+        def close(self):
+            self.close_calls += 1
 
-def test_nrsc5_start_restarts_when_program_changes(monkeypatch):
-    monkeypatch.setenv(
-        "PJFM_NRSC5_COMMAND",
-        f"{sys.executable} -c 'import time; time.sleep(10)'",
+        def pipe_samples_cu8(self, _samples):
+            return None
+
+    class _FakeBindings:
+        NRSC5 = _FakeNRSC5
+        Mode = _FakeMode
+        EventType = object()
+
+    monkeypatch.setattr(
+        NRSC5Demodulator,
+        "_load_python_bindings",
+        lambda self: (_FakeBindings, "/tmp/nrsc5.py", "/tmp/libnrsc5.so", ""),
     )
 
     demod = NRSC5Demodulator(program=0)
     try:
+        assert demod.backend == NRSC5Demodulator.BACKEND_PYTHON
+
         demod.start(99_900_000)
         assert demod.is_running
-        with demod._lock:
-            first_proc = demod._process
-
-        # Same program/frequency should keep the running process.
-        demod.start(99_900_000)
-        with demod._lock:
-            second_proc = demod._process
-        assert second_proc is first_proc
+        first_decoder = demod._python_decoder
 
         demod.set_program(1)
         demod.start(99_900_000)
         assert demod.is_running
-        with demod._lock:
-            third_proc = demod._process
+        second_decoder = demod._python_decoder
 
-        assert third_proc is not first_proc
+        assert first_decoder is second_decoder
         assert demod.active_program == 1
+        assert len(_FakeNRSC5.instances) == 1
+        assert first_decoder.start_calls == 1
+    finally:
+        demod.stop()
+
+
+def test_nrsc5_python_audio_program_filter_locks_to_zero_based(monkeypatch):
+    class _FakeMode:
+        FM = object()
+
+    class _FakeNRSC5:
+        libnrsc5 = object()
+
+        def __init__(self, callback):
+            self.callback = callback
+
+        def open_pipe(self):
+            return None
+
+        def set_mode(self, _mode):
+            return None
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def close(self):
+            return None
+
+        def pipe_samples_cu8(self, _samples):
+            return None
+
+    class _FakeBindings:
+        NRSC5 = _FakeNRSC5
+        Mode = _FakeMode
+        EventType = object()
+
+    monkeypatch.setattr(
+        NRSC5Demodulator,
+        "_load_python_bindings",
+        lambda self: (_FakeBindings, "/tmp/nrsc5.py", "/tmp/libnrsc5.so", ""),
+    )
+
+    demod = NRSC5Demodulator(program=0)
+    raw = np.zeros((4096, 2), dtype=np.int16).tobytes()
+    audio_evt_type = SimpleNamespace(name="AUDIO")
+    try:
+        demod.start(99_900_000)
+        assert demod.backend == NRSC5Demodulator.BACKEND_PYTHON
+
+        # Before seeing program 0, allow +1 fallback for one-based streams.
+        with demod._lock:
+            demod._python_seen_program_zero = False
+            demod._audio_queue.clear()
+        demod._handle_python_event(audio_evt_type, SimpleNamespace(program=1, data=raw))
+        with demod._lock:
+            assert len(demod._audio_queue) > 0
+            demod._audio_queue.clear()
+
+        # After program 0 is observed, reject +1 so HD1/HD2 don't interleave.
+        with demod._lock:
+            demod._python_seen_program_zero = True
+        demod._handle_python_event(audio_evt_type, SimpleNamespace(program=1, data=raw))
+        with demod._lock:
+            assert len(demod._audio_queue) == 0
+
+        demod._handle_python_event(audio_evt_type, SimpleNamespace(program=0, data=raw))
+        with demod._lock:
+            assert len(demod._audio_queue) > 0
     finally:
         demod.stop()
 
 
 def test_nrsc5_iq_conversion_generates_cu8():
-    demod = NRSC5Demodulator(binary_name="python3")
+    demod = NRSC5Demodulator()
     t = np.arange(8192, dtype=np.float64)
     iq = (0.3 * np.exp(1j * (2 * np.pi * 0.01 * t))).astype(np.complex64)
 
@@ -131,7 +232,7 @@ def test_nrsc5_iq_conversion_generates_cu8():
 
 
 def test_nrsc5_audio_pull_returns_exact_frames():
-    demod = NRSC5Demodulator(binary_name="python3")
+    demod = NRSC5Demodulator()
     t = np.arange(4410, dtype=np.float32) / 44100.0
     audio_44100 = np.column_stack((
         np.sin(2 * np.pi * 1000.0 * t),
@@ -150,7 +251,7 @@ def test_nrsc5_audio_pull_returns_exact_frames():
 
 
 def test_nrsc5_metadata_parsing_selects_active_program():
-    demod = NRSC5Demodulator(binary_name="python3", program=1)
+    demod = NRSC5Demodulator(program=1)
 
     stream = io.StringIO(
         "Station name: WXYZ-HD\n"
@@ -189,7 +290,7 @@ def test_nrsc5_metadata_parsing_selects_active_program():
 
 
 def test_nrsc5_metadata_parses_prefixed_log_lines():
-    demod = NRSC5Demodulator(binary_name="python3", program=0)
+    demod = NRSC5Demodulator(program=0)
     demod._drain_output(io.StringIO(
         "[I] Station name: PREFIX-HD\n"
         "2026-02-14T13:00:00Z INFO Title: Prefixed Song\n"
@@ -202,7 +303,7 @@ def test_nrsc5_metadata_parses_prefixed_log_lines():
 
 
 def test_nrsc5_metadata_strips_terminal_title_escape_sequences():
-    demod = NRSC5Demodulator(binary_name="python3", program=0)
+    demod = NRSC5Demodulator(program=0)
     demod._drain_output(io.StringIO(
         "\x1b]0;nrsc5\x07Station name: CLEAN-HD\n"
         "\x1b]0;nrsc5\x07Title: Clean Song\n"
@@ -214,7 +315,7 @@ def test_nrsc5_metadata_strips_terminal_title_escape_sequences():
 
 
 def test_nrsc5_metadata_alert_ended_clears_alert():
-    demod = NRSC5Demodulator(binary_name="python3", program=0)
+    demod = NRSC5Demodulator(program=0)
     demod._drain_output(io.StringIO(
         "Alert: Category=[Weather] [12345] Storm Warning\n"
         "Alert ended\n"
@@ -224,7 +325,7 @@ def test_nrsc5_metadata_alert_ended_clears_alert():
 
 
 def test_nrsc5_metadata_ignores_public_as_service_name_and_keeps_type():
-    demod = NRSC5Demodulator(binary_name="python3", program=0)
+    demod = NRSC5Demodulator(program=0)
     demod._drain_output(io.StringIO(
         "Audio program 0: public, type: Classical, sound experience 0\n"
         "Audio service 0: public, type: Classical, codec: 0, blend: 0, gain: 0 dB, delay: 0, latency: 0\n"
@@ -236,7 +337,7 @@ def test_nrsc5_metadata_ignores_public_as_service_name_and_keeps_type():
 
 
 def test_nrsc5_stop_clears_metadata():
-    demod = NRSC5Demodulator(binary_name="python3")
+    demod = NRSC5Demodulator()
     demod._drain_output(io.StringIO("Station name: TEST\nTitle: Example\n"))
     assert demod.metadata_snapshot["station_name"] == "TEST"
 

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Optional HD Radio demodulation hooks for pjfm via the external `nrsc5` CLI.
+Optional HD Radio demodulation hooks for pjfm.
+
+Supports NRSC5 Python bindings only.
 """
 
 from collections import deque
+import ctypes
+import importlib.util
 import os
+from pathlib import Path
+import platform
 import re
-import shlex
-import shutil
-import subprocess
 import threading
 import time
 
@@ -48,31 +51,20 @@ class _StreamingLinearResampler:
 
 class NRSC5Demodulator:
     """
-    Manage an optional nrsc5 subprocess for HD Radio decoding.
+    Manage NRSC5 HD Radio decode via Python bindings.
 
-    By default this launches stdin IQ mode:
-        nrsc5 -r - -o - -t raw <program>
-
-    and accepts IQ pushes from pjfm, converting to the CU8 stream format
-    expected by nrsc5's file input mode.
+    The decoder accepts IQ pushes from pjfm, converts them to CU8 at NRSC5's
+    expected input rate, and feeds them into libnrsc5 through `open_pipe()`.
 
     Environment overrides:
-      - PJFM_NRSC5_BIN: binary name/path (default: nrsc5)
+      - PJFM_NRSC5_PY_BINDINGS: Python binding module path (nrsc5.py)
+      - PJFM_NRSC5_LIB: explicit libnrsc5 shared library path
       - PJFM_NRSC5_PROGRAM: HD subprogram number (default: 0)
-      - PJFM_NRSC5_ARGS: extra args before frequency/program
-      - PJFM_NRSC5_COMMAND: full command template (highest priority)
-
-    `PJFM_NRSC5_COMMAND` tokens support format keys:
-      - {freq_mhz}
-      - {freq_hz}
-      - {program}
-      - {nrsc5}   (resolved binary path)
     """
 
     TARGET_IQ_RATE_HZ = 1_488_375.0
     TARGET_AUDIO_IN_RATE_HZ = 44_100.0
     TARGET_AUDIO_OUT_RATE_HZ = 48_000.0
-    DEFAULT_ARGS = ("-r", "-", "-o", "-", "-t", "raw")
     IQ_QUEUE_MAX_BLOCKS_DEFAULT = 8
     AUDIO_QUEUE_MAX_BLOCKS_DEFAULT = 64
     IQ_TARGET_RMS_DEFAULT = 0.18
@@ -106,15 +98,9 @@ class NRSC5Demodulator:
     _RE_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
     _RE_ESC_SINGLE = re.compile(r"\x1b[@-_]")
     _RE_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+    BACKEND_PYTHON = "python"
 
-    def __init__(self, program=0, binary_name=None, extra_args=None):
-        self.binary_name = (
-            binary_name
-            or os.environ.get("PJFM_NRSC5_BIN", "nrsc5").strip()
-            or "nrsc5"
-        )
-        self._binary_path = shutil.which(self.binary_name)
-
+    def __init__(self, program=0):
         program_override = os.environ.get("PJFM_NRSC5_PROGRAM", "").strip()
         if program_override:
             try:
@@ -124,17 +110,14 @@ class NRSC5Demodulator:
         else:
             self.program = int(program)
 
-        if extra_args is not None:
-            self.extra_args = [str(arg) for arg in extra_args]
-        else:
-            arg_string = os.environ.get("PJFM_NRSC5_ARGS", "").strip()
-            if arg_string:
-                self.extra_args = shlex.split(arg_string)
-            else:
-                self.extra_args = list(self.DEFAULT_ARGS)
-
-        cmd_template = os.environ.get("PJFM_NRSC5_COMMAND", "").strip()
-        self.command_template = cmd_template or None
+        self._python_bindings = None
+        self._python_binding_path = ""
+        self._python_library_path = ""
+        self._python_binding_error = ""
+        self._python_decoder = None
+        self._python_lost_device = False
+        self._python_sync = False
+        self._python_seen_program_zero = False
 
         self._lock = threading.Lock()
         self._iq_cond = threading.Condition(self._lock)
@@ -144,6 +127,14 @@ class NRSC5Demodulator:
         self._stdin_iq_mode = False
         self._audio_stdout_mode = False
         self._uses_frequency_arg = True
+
+        (
+            self._python_bindings,
+            self._python_binding_path,
+            self._python_library_path,
+            self._python_binding_error,
+        ) = self._load_python_bindings()
+        self._backend = self.BACKEND_PYTHON
 
         self._log_stderr_thread = None
         self._log_stdout_thread = None
@@ -193,20 +184,27 @@ class NRSC5Demodulator:
 
     @property
     def available(self):
-        """True if nrsc5 launch prerequisites are satisfied."""
-        return bool(self.command_template or self._binary_path)
+        """True if NRSC5 Python bindings are available."""
+        return self._python_bindings is not None
 
     @property
     def unavailable_reason(self):
         """Human-readable reason when hooks are unavailable."""
         if self.available:
             return ""
-        return f"{self.binary_name} not found in PATH"
+        if self._python_binding_error:
+            return self._python_binding_error
+        return "NRSC5 Python bindings unavailable"
 
     @property
     def is_running(self):
-        """True if the nrsc5 subprocess is currently alive."""
+        """True if the nrsc5 decoder backend is currently active."""
         return self.poll()
+
+    @property
+    def backend(self):
+        """Selected NRSC5 backend."""
+        return self._backend
 
     @property
     def frequency_hz(self):
@@ -300,6 +298,8 @@ class NRSC5Demodulator:
         if num == active:
             return 3
         # Some nrsc5 builds log program numbers as 1-based service IDs.
+        if self._python_seen_program_zero:
+            return 0
         if num == (active + 1):
             return 2
         return 0
@@ -476,18 +476,361 @@ class NRSC5Demodulator:
             )
 
     @staticmethod
-    def _args_use_stdin_iq(args):
-        for i, token in enumerate(args):
-            if token == "-r" and i + 1 < len(args) and args[i + 1] == "-":
-                return True
-        return False
+    def _lib_names_for_platform():
+        system = platform.system()
+        if system == "Windows":
+            return ("libnrsc5.dll", "nrsc5.dll")
+        if system == "Darwin":
+            return ("libnrsc5.dylib",)
+        return ("libnrsc5.so",)
+
+    def _candidate_binding_module_paths(self):
+        candidates = []
+        env_path = os.environ.get("PJFM_NRSC5_PY_BINDINGS", "").strip()
+        if env_path:
+            path = Path(env_path).expanduser()
+            if path.is_dir():
+                path = path / "nrsc5.py"
+            candidates.append(path)
+
+        this_dir = Path(__file__).resolve().parent
+        candidates.append(this_dir / "support" / "nrsc5.py")
+        candidates.append(this_dir.parent / "nrsc5" / "support" / "nrsc5.py")
+
+        seen = set()
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                continue
+            if str(resolved) in seen or not resolved.is_file():
+                continue
+            seen.add(str(resolved))
+            yield resolved
+
+    def _candidate_binding_library_paths(self, binding_path):
+        names = self._lib_names_for_platform()
+        explicit = os.environ.get("PJFM_NRSC5_LIB", "").strip()
+        if explicit:
+            path = Path(explicit).expanduser()
+            if path.is_file():
+                yield path.resolve()
+
+        explicit_dir = os.environ.get("PJFM_NRSC5_LIB_DIR", "").strip()
+        if explicit_dir:
+            base = Path(explicit_dir).expanduser()
+            for name in names:
+                path = base / name
+                if path.is_file():
+                    yield path.resolve()
+
+        base = binding_path.parent.parent
+        for name in names:
+            for candidate in (
+                base / "build" / "src" / name,
+                base / "src" / name,
+                Path.home() / ".local" / "lib" / name,
+                Path("/usr/local/lib") / name,
+                Path("/opt/homebrew/lib") / name,
+                Path("/usr/lib") / name,
+            ):
+                if candidate.is_file():
+                    yield candidate.resolve()
 
     @staticmethod
-    def _args_use_audio_stdout(args):
-        for i, token in enumerate(args):
-            if token == "-o" and i + 1 < len(args) and args[i + 1] == "-":
-                return True
-        return False
+    def _import_binding_module_from_path(binding_path):
+        module_name = f"_pjfm_nrsc5_bindings_{abs(hash(str(binding_path)))}"
+        spec = importlib.util.spec_from_file_location(module_name, str(binding_path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load Python bindings spec from {binding_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _load_python_bindings(self):
+        errors = []
+        for binding_path in self._candidate_binding_module_paths():
+            try:
+                module = self._import_binding_module_from_path(binding_path)
+            except Exception as exc:
+                errors.append(f"{binding_path}: {exc}")
+                continue
+
+            if not all(hasattr(module, attr) for attr in ("NRSC5", "EventType", "Mode")):
+                errors.append(f"{binding_path}: missing required NRSC5 binding attributes")
+                continue
+
+            tried = set()
+            candidates = [None]
+            candidates.extend(list(self._candidate_binding_library_paths(binding_path)))
+            for lib_path in candidates:
+                key = "" if lib_path is None else str(lib_path)
+                if key in tried:
+                    continue
+                tried.add(key)
+                try:
+                    module.NRSC5.libnrsc5 = None
+                    if lib_path is not None:
+                        module.NRSC5.libnrsc5 = ctypes.cdll.LoadLibrary(str(lib_path))
+                    _probe = module.NRSC5(lambda *_args: None)
+                    del _probe
+                    return (
+                        module,
+                        str(binding_path),
+                        "" if lib_path is None else str(lib_path),
+                        "",
+                    )
+                except Exception as exc:
+                    source = "default loader" if lib_path is None else str(lib_path)
+                    errors.append(f"{binding_path} via {source}: {exc}")
+
+        reason = "NRSC5 Python bindings were not found"
+        if errors:
+            reason = f"{reason} ({errors[-1]})"
+        return None, "", "", reason
+
+    @staticmethod
+    def _format_program_type(value):
+        if value is None:
+            return ""
+        if hasattr(value, "name"):
+            text = str(value.name)
+        else:
+            text = str(value)
+        text = text.strip().replace("_", " ")
+        return text.title() if text else ""
+
+    def _program_matches_active_locked(self, number):
+        if number is None:
+            return True
+        try:
+            num = int(number)
+        except (TypeError, ValueError):
+            return True
+        active = self._active_program_index_locked()
+        if active is None:
+            return True
+        if num == active:
+            return True
+        if num != (active + 1):
+            return False
+        if self._python_seen_program_zero:
+            return False
+        return True
+
+    def _set_last_output_line_locked(self, text):
+        line = self._sanitize_output_line(text)
+        if line:
+            self.last_output_line = line[-240:]
+
+    def _observe_program_number_locked(self, number):
+        try:
+            num = int(number)
+        except (TypeError, ValueError):
+            return
+        if num == 0:
+            self._python_seen_program_zero = True
+
+    def _handle_python_event(self, evt_type, evt):
+        if evt is None:
+            return
+
+        event_name = getattr(evt_type, "name", str(evt_type))
+        now = time.monotonic()
+
+        if event_name == "LOST_DEVICE":
+            with self._lock:
+                self.last_error = "nrsc5 lost input device"
+                self._set_last_output_line_locked("Lost input device")
+                self._python_lost_device = True
+            return
+
+        if event_name == "SYNC":
+            with self._lock:
+                freq_offset = getattr(evt, "freq_offset", 0.0)
+                self._set_last_output_line_locked(f"SYNC lock (offset {freq_offset:.1f} Hz)")
+                self._python_sync = True
+            return
+
+        if event_name == "LOST_SYNC":
+            with self._lock:
+                self._set_last_output_line_locked("SYNC lost")
+                self._python_sync = False
+            return
+
+        if event_name == "STATION_NAME":
+            with self._lock:
+                self._update_text_metadata_locked("station_name", getattr(evt, "name", ""))
+                self._set_last_output_line_locked(f"Station name: {getattr(evt, 'name', '')}")
+            return
+
+        if event_name == "STATION_SLOGAN":
+            with self._lock:
+                self._update_text_metadata_locked("station_slogan", getattr(evt, "slogan", ""))
+            return
+
+        if event_name == "STATION_MESSAGE":
+            with self._lock:
+                self._update_text_metadata_locked("station_message", getattr(evt, "message", ""))
+            return
+
+        if event_name == "EMERGENCY_ALERT":
+            with self._lock:
+                self._update_text_metadata_locked("emergency_alert", getattr(evt, "message", ""))
+                self._set_last_output_line_locked(f"Alert: {getattr(evt, 'message', '')}")
+            return
+
+        if event_name == "HERE_IMAGE":
+            image_type = getattr(getattr(evt, "image_type", None), "name", "")
+            image_name = str(getattr(evt, "name", "")).strip()
+            image_time = ""
+            time_utc = getattr(evt, "time_utc", None)
+            if time_utc is not None:
+                try:
+                    image_time = time_utc.isoformat().replace("+00:00", "Z")
+                except Exception:
+                    image_time = str(time_utc)
+            with self._lock:
+                if image_type == "WEATHER":
+                    self._update_text_metadata_locked("here_weather_time_utc", image_time)
+                    self._update_text_metadata_locked("here_weather_name", image_name)
+                elif image_type == "TRAFFIC":
+                    self._update_text_metadata_locked("here_traffic_time_utc", image_time)
+                    self._update_text_metadata_locked("here_traffic_name", image_name)
+                if image_name:
+                    self._set_last_output_line_locked(f"HERE {image_type}: {image_name}")
+            return
+
+        if event_name in {"AUDIO_SERVICE", "AUDIO_SERVICE_DESCRIPTOR"}:
+            number = getattr(evt, "program", None)
+            genre = self._format_program_type(getattr(evt, "type", None))
+            with self._lock:
+                self._observe_program_number_locked(number)
+                if genre:
+                    self._update_program_metadata_locked(
+                        "genre",
+                        "genre_program_number",
+                        number,
+                        genre,
+                    )
+            return
+
+        if event_name == "SIG":
+            services = evt if isinstance(evt, (list, tuple)) else []
+            with self._lock:
+                for service in services:
+                    if not getattr(service, "audio_component", None):
+                        continue
+                    number = getattr(service, "number", None)
+                    self._observe_program_number_locked(number)
+                    name = str(getattr(service, "name", "")).strip()
+                    if not name:
+                        continue
+                    self._update_program_metadata_locked("program_name", "program_number", number, name)
+                    self._update_program_metadata_locked("service_name", "service_number", number, name)
+                    self._update_text_metadata_locked("sig_service_name", name)
+            return
+
+        if event_name == "SIS":
+            with self._lock:
+                self._update_text_metadata_locked("station_name", getattr(evt, "name", ""))
+                self._update_text_metadata_locked("station_slogan", getattr(evt, "slogan", ""))
+                self._update_text_metadata_locked("station_message", getattr(evt, "message", ""))
+                alert_text = getattr(evt, "alert", "")
+                if alert_text:
+                    self._update_text_metadata_locked("emergency_alert", alert_text)
+                for svc in getattr(evt, "audio_services", []) or []:
+                    program = getattr(svc, "program", None)
+                    self._observe_program_number_locked(program)
+                    genre = self._format_program_type(getattr(svc, "type", None))
+                    if genre:
+                        self._update_program_metadata_locked(
+                            "genre",
+                            "genre_program_number",
+                            program,
+                            genre,
+                        )
+            return
+
+        if event_name == "ID3":
+            program = getattr(evt, "program", None)
+            with self._lock:
+                self._observe_program_number_locked(program)
+                if not self._program_matches_active_locked(program):
+                    return
+                self._update_text_metadata_locked("title", getattr(evt, "title", ""))
+                self._update_text_metadata_locked("artist", getattr(evt, "artist", ""))
+                self._update_text_metadata_locked("album", getattr(evt, "album", ""))
+                self._update_text_metadata_locked("genre", getattr(evt, "genre", ""))
+                title = getattr(evt, "title", "") or ""
+                artist = getattr(evt, "artist", "") or ""
+                if title and artist:
+                    self._set_last_output_line_locked(f"{title} - {artist}")
+                elif title:
+                    self._set_last_output_line_locked(f"Title: {title}")
+            return
+
+        if event_name == "AUDIO":
+            program = getattr(evt, "program", None)
+            raw = getattr(evt, "data", None)
+            if not raw:
+                return
+
+            with self._lock:
+                self._observe_program_number_locked(program)
+                if not self._program_matches_active_locked(program):
+                    return
+
+            pcm16 = np.frombuffer(raw, dtype="<i2")
+            if pcm16.size < 2:
+                return
+            if pcm16.size & 1:
+                pcm16 = pcm16[:-1]
+                if pcm16.size < 2:
+                    return
+            frames = pcm16.reshape(-1, 2).astype(np.float32) / 32768.0
+            out = self._resample_audio(frames)
+            if out.shape[0] == 0:
+                return
+
+            with self._lock:
+                if self._python_decoder is None:
+                    return
+                if len(self._audio_queue) >= self._audio_queue_max_blocks:
+                    self._audio_queue.popleft()
+                self._audio_queue.append(out)
+                self._audio_bytes_out_total += int(len(raw))
+                self._last_audio_time_s = now
+            return
+
+    def _python_writer_loop(self, decoder):
+        while True:
+            with self._iq_cond:
+                while (
+                    not self._writer_stop and
+                    self._python_decoder is decoder and
+                    not self._iq_queue
+                ):
+                    self._iq_cond.wait(timeout=0.2)
+
+                if self._writer_stop or self._python_decoder is not decoder:
+                    return
+
+                iq_block, sample_rate_hz = self._iq_queue.popleft()
+
+            payload = self._iq_to_cu8(iq_block, sample_rate_hz)
+            if not payload:
+                continue
+            try:
+                decoder.pipe_samples_cu8(payload)
+                with self._lock:
+                    if self._python_decoder is decoder:
+                        self._iq_bytes_in_total += int(len(payload))
+            except Exception as exc:
+                with self._lock:
+                    if self._python_decoder is decoder and not self.last_error:
+                        self.last_error = f"nrsc5 pipe write failed: {exc}"
+                return
 
     def set_program(self, program):
         """Set the HD subprogram index for subsequent starts/restarts."""
@@ -496,60 +839,8 @@ class NRSC5Demodulator:
             raise ValueError("program must be >= 0")
         with self._lock:
             self.program = new_program
-
-    def _build_runtime_command(self, frequency_hz, program=None):
-        freq_hz = int(round(float(frequency_hz)))
-        freq_mhz = float(freq_hz) / 1e6
-        program = int(self.program if program is None else program)
-
-        if self.command_template:
-            template_parts = shlex.split(self.command_template)
-            cmd = [
-                token.format(
-                    freq_hz=freq_hz,
-                    freq_mhz=f"{freq_mhz:.3f}",
-                    program=program,
-                    nrsc5=self._binary_path or self.binary_name,
-                )
-                for token in template_parts
-            ]
-            stdin_iq_mode = self._args_use_stdin_iq(cmd)
-            uses_frequency = (
-                ("{freq_hz}" in self.command_template) or
-                ("{freq_mhz}" in self.command_template)
-            )
-            audio_stdout_mode = self._args_use_audio_stdout(cmd)
-            return cmd, stdin_iq_mode, uses_frequency, audio_stdout_mode
-
-        if not self._binary_path:
-            raise RuntimeError(self.unavailable_reason)
-
-        args = [
-            token.format(
-                freq_hz=freq_hz,
-                freq_mhz=f"{freq_mhz:.3f}",
-                program=program,
-                nrsc5=self._binary_path,
-            )
-            for token in self.extra_args
-        ]
-        stdin_iq_mode = self._args_use_stdin_iq(args)
-        audio_stdout_mode = self._args_use_audio_stdout(args)
-        if stdin_iq_mode:
-            cmd = [self._binary_path] + args + [str(program)]
-            return cmd, True, False, audio_stdout_mode
-
-        cmd = [self._binary_path] + args + [f"{freq_mhz:.3f}", str(program)]
-        return cmd, False, True, audio_stdout_mode
-
-    def _build_command(self, frequency_hz):
-        """
-        Return the command list (tests and diagnostics helper).
-
-        Runtime mode metadata is resolved by `_build_runtime_command()`.
-        """
-        cmd, _, _, _ = self._build_runtime_command(frequency_hz)
-        return cmd
+            if self._python_decoder is not None:
+                self._active_program = new_program
 
     @classmethod
     def _sanitize_output_line(cls, line):
@@ -666,129 +957,55 @@ class NRSC5Demodulator:
         out[:, 1] = right[:n_out].astype(np.float32)
         return out
 
-    def _audio_reader_loop(self, proc):
-        stdout = proc.stdout
-        if stdout is None:
-            return
-
-        remainder = b""
-        while True:
-            with self._lock:
-                if self._process is not proc or self._writer_stop:
-                    return
-            try:
-                chunk = stdout.read(32768)
-            except Exception:
-                return
-            if not chunk:
-                return
-
-            blob = remainder + chunk
-            frame_bytes = (len(blob) // 4) * 4
-            remainder = blob[frame_bytes:]
-            if frame_bytes <= 0:
-                continue
-
-            pcm16 = np.frombuffer(blob[:frame_bytes], dtype="<i2")
-            if pcm16.size < 2:
-                continue
-            audio = pcm16.reshape(-1, 2).astype(np.float32) / 32768.0
-            out = self._resample_audio(audio)
-            if out.shape[0] == 0:
-                continue
-
-            with self._lock:
-                if self._process is not proc or self._writer_stop:
-                    return
-                self._audio_bytes_out_total += int(frame_bytes)
-                if len(self._audio_queue) >= self._audio_queue_max_blocks:
-                    self._audio_queue.popleft()
-                self._audio_queue.append(out)
-                self._last_audio_time_s = time.monotonic()
-
-    def _writer_loop(self, proc):
-        while True:
-            with self._iq_cond:
-                while (not self._writer_stop and
-                       self._process is proc and
-                       proc.poll() is None and
-                       not self._iq_queue):
-                    self._iq_cond.wait(timeout=0.2)
-
-                if (self._writer_stop or self._process is not proc or
-                        proc.poll() is not None):
-                    return
-
-                iq_block, sample_rate_hz = self._iq_queue.popleft()
-
-            payload = self._iq_to_cu8(iq_block, sample_rate_hz)
-            if not payload:
-                continue
-
-            stdin = proc.stdin
-            if stdin is None or getattr(stdin, "closed", False):
-                return
-
-            try:
-                stdin.write(payload)
-                stdin.flush()
-                with self._lock:
-                    if self._process is proc:
-                        self._iq_bytes_in_total += int(len(payload))
-            except (BrokenPipeError, OSError, ValueError) as exc:
-                with self._lock:
-                    if self._process is proc and not self.last_error:
-                        self.last_error = f"nrsc5 IQ pipe write failed: {exc}"
-                return
-
     def start(self, frequency_hz):
-        """Start nrsc5 (or retune/restart if already running)."""
+        """Start NRSC5 decoder (or retune/program-switch if already running)."""
         freq_hz = int(round(float(frequency_hz)))
         with self._lock:
-            proc = self._process
-            current_freq = self._frequency_hz
-            active_program = self._active_program
             desired_program = int(self.program)
-            uses_frequency = self._uses_frequency_arg
-
-        if (proc is not None and proc.poll() is None and
-                active_program == desired_program and
-                ((not uses_frequency) or current_freq == freq_hz)):
-            return
+        with self._lock:
+            running_decoder = self._python_decoder
+            running = (
+                running_decoder is not None and
+                not self._writer_stop and
+                not self._python_lost_device
+            )
+            if running:
+                self._frequency_hz = freq_hz
+                self._active_program = desired_program
+                return
 
         self.stop()
-
         if not self.available:
             raise RuntimeError(f"HD Radio unavailable: {self.unavailable_reason}")
 
+        bindings = self._python_bindings
+        decoder = None
         try:
-            cmd, stdin_iq_mode, uses_frequency, audio_stdout_mode = self._build_runtime_command(
-                freq_hz,
-                program=desired_program,
-            )
+            decoder = bindings.NRSC5(self._handle_python_event)
+            decoder.open_pipe()
+            decoder.set_mode(bindings.Mode.FM)
+            decoder.start()
         except Exception as exc:
-            raise RuntimeError(f"Failed to build nrsc5 command: {exc}") from exc
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE if stdin_iq_mode else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-            )
-        except OSError as exc:
-            self.last_error = f"Failed to start nrsc5: {exc}"
+            if decoder is not None:
+                try:
+                    decoder.close()
+                except Exception:
+                    pass
+            self.last_error = f"Failed to start nrsc5 Python backend: {exc}"
             raise RuntimeError(self.last_error) from exc
 
         with self._lock:
-            self._process = proc
+            self._python_decoder = decoder
+            self._process = None
             self._frequency_hz = freq_hz
             self._active_program = desired_program
-            self._stdin_iq_mode = stdin_iq_mode
-            self._audio_stdout_mode = audio_stdout_mode
-            self._uses_frequency_arg = uses_frequency
+            self._stdin_iq_mode = True
+            self._audio_stdout_mode = False
+            self._uses_frequency_arg = False
             self._writer_stop = False
+            self._python_lost_device = False
+            self._python_sync = False
+            self._python_seen_program_zero = False
             self._iq_queue.clear()
             self._audio_queue.clear()
             self._audio_buffer = np.zeros((0, 2), dtype=np.float32)
@@ -800,47 +1017,20 @@ class NRSC5Demodulator:
             self.last_error = ""
             self.last_output_line = ""
             self._reset_metadata_locked()
-
-            self._log_stderr_thread = threading.Thread(
-                target=self._drain_output,
-                args=(proc.stderr,),
+            self._log_stderr_thread = None
+            self._log_stdout_thread = None
+            self._audio_thread = None
+            self._writer_thread = threading.Thread(
+                target=self._python_writer_loop,
+                args=(decoder,),
                 daemon=True,
             )
-            self._log_stderr_thread.start()
-
-            if audio_stdout_mode:
-                self._audio_thread = threading.Thread(
-                    target=self._audio_reader_loop,
-                    args=(proc,),
-                    daemon=True,
-                )
-                self._audio_thread.start()
-                self._log_stdout_thread = None
-            else:
-                self._audio_thread = None
-                self._log_stdout_thread = threading.Thread(
-                    target=self._drain_output,
-                    args=(proc.stdout,),
-                    daemon=True,
-                )
-                self._log_stdout_thread.start()
-
-            if stdin_iq_mode:
-                self._writer_thread = threading.Thread(
-                    target=self._writer_loop,
-                    args=(proc,),
-                    daemon=True,
-                )
-                self._writer_thread.start()
-            else:
-                self._writer_thread = None
+            self._writer_thread.start()
 
     def push_iq(self, iq_block, sample_rate_hz):
-        """Queue IQ samples for nrsc5 when running in '-r -' mode."""
+        """Queue IQ samples for the running NRSC5 decoder."""
         with self._iq_cond:
-            proc = self._process
-            if (proc is None or proc.poll() is not None or
-                    not self._stdin_iq_mode):
+            if self._python_decoder is None or self._writer_stop:
                 return
 
             block = np.asarray(iq_block, dtype=np.complex64)
@@ -889,13 +1079,11 @@ class NRSC5Demodulator:
             return out
 
     def stop(self):
-        """Stop nrsc5 if active."""
+        """Stop NRSC5 if active."""
         with self._iq_cond:
-            proc = self._process
-            log_stderr_thread = self._log_stderr_thread
-            log_stdout_thread = self._log_stdout_thread
+            decoder = self._python_decoder
             writer_thread = self._writer_thread
-            audio_thread = self._audio_thread
+            self._python_decoder = None
             self._process = None
             self._log_stderr_thread = None
             self._log_stdout_thread = None
@@ -916,34 +1104,20 @@ class NRSC5Demodulator:
             self._last_audio_time_s = 0.0
             self._iq_cond.notify_all()
 
-        if proc is None:
+        if decoder is None:
             return
 
         try:
-            if proc.stdin is not None:
-                proc.stdin.close()
+            decoder.stop()
         except Exception:
             pass
-
         try:
-            proc.terminate()
-            proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=1.0)
+            decoder.close()
         except Exception:
             pass
 
-        for stream in (proc.stdout, proc.stderr):
-            try:
-                if stream is not None:
-                    stream.close()
-            except Exception:
-                pass
-
-        for thread in (log_stderr_thread, log_stdout_thread, writer_thread, audio_thread):
-            if thread and thread.is_alive():
-                thread.join(timeout=0.5)
+        if writer_thread and writer_thread.is_alive():
+            writer_thread.join(timeout=0.5)
 
     def poll(self):
         """
@@ -953,57 +1127,19 @@ class NRSC5Demodulator:
             True when running, False when stopped/exited.
         """
         with self._lock:
-            proc = self._process
-        if proc is None:
+            decoder = self._python_decoder
+            writer_thread = self._writer_thread
+            lost_device = self._python_lost_device
+            writer_stop = self._writer_stop
+            has_error = bool(self.last_error)
+        if decoder is None:
             return False
-
-        rc = proc.poll()
-        if rc is None:
-            return True
-
-        with self._iq_cond:
-            if self._process is proc:
-                log_stderr_thread = self._log_stderr_thread
-                log_stdout_thread = self._log_stdout_thread
-                writer_thread = self._writer_thread
-                audio_thread = self._audio_thread
-                self._process = None
-                self._log_stderr_thread = None
-                self._log_stdout_thread = None
-                self._writer_thread = None
-                self._audio_thread = None
-                self._frequency_hz = None
-                self._active_program = None
-                self._stdin_iq_mode = False
-                self._audio_stdout_mode = False
-                self._uses_frequency_arg = True
-                self._writer_stop = True
-                self._iq_queue.clear()
-                self._audio_queue.clear()
-                self._audio_buffer = np.zeros((0, 2), dtype=np.float32)
-                self._reset_iq_resampler_state()
-                self._reset_audio_resampler_state()
-                self._reset_metadata_locked()
-                self._last_audio_time_s = 0.0
-                self._iq_cond.notify_all()
-                if rc != 0:
-                    detail = f" ({self.last_output_line})" if self.last_output_line else ""
-                    self.last_error = f"nrsc5 exited with code {rc}{detail}"
-            else:
-                log_stderr_thread = None
-                log_stdout_thread = None
-                writer_thread = None
-                audio_thread = None
-
-        for stream in (proc.stdin, proc.stdout, proc.stderr):
-            try:
-                if stream is not None:
-                    stream.close()
-            except Exception:
-                pass
-
-        for thread in (log_stderr_thread, log_stdout_thread, writer_thread, audio_thread):
-            if thread and thread.is_alive():
-                thread.join(timeout=0.2)
-
-        return False
+        if lost_device or writer_stop:
+            self.stop()
+            return False
+        if writer_thread and not writer_thread.is_alive():
+            if not has_error:
+                self.last_error = "nrsc5 IQ writer stopped"
+            self.stop()
+            return False
+        return True

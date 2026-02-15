@@ -15,7 +15,7 @@ pjfm is a command-line FM radio application that receives broadcast FM signals (
 - **Real-time FM stereo reception** with automatic mono/stereo switching
 - **NOAA Weather Radio** (NBFM mode for NWS frequencies)
 - **RDS decoding** with station identification, program type, radio text, and clock time
-- **Optional HD Radio decode** via external `nrsc5` with HD1/HD2/HD3 subchannel selection
+- **Optional HD Radio decode** via NRSC5 Python bindings, with HD1/HD2/HD3 subchannel selection
 - **HD metadata display** (station/service plus title/artist/album when broadcast)
 - **AF and RF spectrum analyzers** in the terminal UI
 - **Signal quality metrics** including S-meter, SNR, and pilot detection
@@ -139,12 +139,20 @@ RDS data is organized into 26-bit blocks (16 data + 10 checkword), grouped into 
 
 ### HD Radio (`nrsc5`) Integration
 
-HD Radio decoding is supported through the external `nrsc5` CLI process.
+HD Radio decoding uses NRSC5 Python bindings:
+
+- **Python bindings**: `libnrsc5` + Python wrapper (`nrsc5/support/nrsc5.py`)
 
 - **Subchannels**: `h` cycles HD1/HD2/HD3, `H` toggles HD decode on/off
+- **Fast HD subchannel changes**: in Python backend, `h` switches active program selection without restarting the decoder process
 - **Metadata**: terminal UI displays `HD Station` and `HD Track` rows when available
 - **Retune behavior**: changing channels (left/right tune or preset recall) snaps HD decode off, so it does not carry across stations
-- **Metadata fields parsed** (when broadcast): station/service name, title, artist, album
+- **Metadata fields parsed** (when broadcast): station/service name, title, artist, album, genre, alerts, HERE weather/traffic image timestamps
+
+Environment controls:
+
+- `PJFM_NRSC5_PY_BINDINGS=/path/to/nrsc5.py` (optional explicit binding file)
+- `PJFM_NRSC5_LIB=/path/to/libnrsc5.*` (optional explicit shared library path)
 
 ### Adaptive Rate Control
 
@@ -268,7 +276,7 @@ Settings are saved to `pjfm.cfg`:
 ### Software
 - Python 3.8+
 - Linux with ALSA/PulseAudio
-- Optional: `nrsc5` binary in `PATH` for HD Radio decode/metadata
+- Optional for HD Radio: NRSC5 Python bindings (`nrsc5.py` + `libnrsc5`)
 
 ### Python Dependencies
 

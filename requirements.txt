@@ -1,3 +1,6 @@
 numpy
 scipy
 sounddevice
+# HD Radio dependency note:
+# NRSC5 Python bindings (`nrsc5.py`) and `libnrsc5` are required and are
+# installed outside pip (see README).
