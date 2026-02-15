@@ -714,7 +714,7 @@ class FMRadio:
     FM_STEP_HZ = 200_000
     HD_PROGRAMS = (0, 1, 2)
     USER_PRESET_COUNT = 8
-    HD_SOLID_SYNC_MIN_S = 1.0
+    HD_SOLID_SYNC_MIN_S = 0.1
     HD_SOLID_SYNC_BER_MAX = 5e-2
     HD_BYPASS_MAX_UNDERRUN_BLOCKS = 4
 
@@ -784,6 +784,7 @@ class FMRadio:
         self.hd_auto_arm = False
         self.hd_auto_enabled = False
         self.hd_analog_bypass_active = False
+        self.hd_solid_sync_min_s = self.HD_SOLID_SYNC_MIN_S
 
         # Auto RDS mode (enabled by default, disable with --no-rds)
         self.auto_mode_enabled = rds_enabled
@@ -967,6 +968,13 @@ class FMRadio:
                     self.hd_auto_arm = config.getboolean('radio', 'hd_auto_arm')
                 except ValueError:
                     pass
+            if config.has_option('radio', 'hd_solid_sync_min_s'):
+                try:
+                    value = float(config.get('radio', 'hd_solid_sync_min_s'))
+                    if value >= 0.0:
+                        self.hd_solid_sync_min_s = value
+                except ValueError:
+                    pass
             self.hd_auto_enabled = bool(self.hd_auto_arm and not self.weather_mode)
         except (ValueError, configparser.Error):
             # Ignore invalid config
@@ -991,6 +999,7 @@ class FMRadio:
             'pll_kernel_mode': self.pll_kernel_mode,
             'rds_force_off': str(self.rds_forced_off).lower(),
             'hd_auto_arm': str(self.hd_auto_arm).lower(),
+            'hd_solid_sync_min_s': f'{self.hd_solid_sync_min_s:.3f}',
         }
 
         # Presets section
@@ -1316,10 +1325,10 @@ class FMRadio:
         try:
             hd_solid_sync_min_s = max(
                 0.0,
-                float(os.environ.get("PJFM_HD_SOLID_SYNC_MIN_S", str(self.HD_SOLID_SYNC_MIN_S))),
+                float(os.environ.get("PJFM_HD_SOLID_SYNC_MIN_S", str(self.hd_solid_sync_min_s))),
             )
         except ValueError:
-            hd_solid_sync_min_s = self.HD_SOLID_SYNC_MIN_S
+            hd_solid_sync_min_s = self.hd_solid_sync_min_s
         try:
             hd_solid_sync_ber_max = max(
                 0.0,
@@ -2064,6 +2073,14 @@ class FMRadio:
             self.hd_enabled = False
             self.hd_auto_arm = False
             self.hd_auto_enabled = False
+            self.hd_analog_bypass_active = False
+            stereo_decoder = getattr(self, "stereo_decoder", None)
+            if stereo_decoder:
+                stereo_decoder.reset()
+            rds_decoder = getattr(self, "rds_decoder", None)
+            if rds_decoder:
+                rds_decoder.reset()
+                self.rds_data = {}
             self._save_config()
             return
         try:
