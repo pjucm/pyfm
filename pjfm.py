@@ -39,6 +39,7 @@ import sys
 import threading
 import argparse
 import configparser
+import html
 import os
 import numpy as np
 import time
@@ -1636,6 +1637,14 @@ class FMRadio:
             return "python"
         return mode
 
+    @staticmethod
+    def _normalize_broadcast_text(value):
+        """Decode HTML entities from metadata text and normalize whitespace."""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return html.unescape(text)
+
     @classmethod
     def _should_flush_iq_loss(cls, recent_loss, now_s, last_flush_s, stream_start_s):
         """
@@ -2070,14 +2079,14 @@ class FMRadio:
     def hd_station_summary(self):
         """Best-effort station/service summary for HD metadata."""
         meta = self.hd_metadata
-        station = str(meta.get("station_name", "")).strip()
-        genre = str(meta.get("genre", "")).strip()
-        service = str(
+        station = self._normalize_broadcast_text(meta.get("station_name", ""))
+        genre = self._normalize_broadcast_text(meta.get("genre", ""))
+        service = self._normalize_broadcast_text(
             meta.get("program_name")
             or meta.get("service_name")
             or meta.get("sig_service_name")
             or ""
-        ).strip()
+        )
         if station and genre:
             return f"{station} ({genre})"
         if station:
@@ -2090,9 +2099,9 @@ class FMRadio:
     def hd_now_playing_summary(self):
         """Best-effort now-playing summary for HD metadata."""
         meta = self.hd_metadata
-        title = str(meta.get("title", "")).strip()
-        artist = str(meta.get("artist", "")).strip()
-        album = str(meta.get("album", "")).strip()
+        title = self._normalize_broadcast_text(meta.get("title", ""))
+        artist = self._normalize_broadcast_text(meta.get("artist", ""))
+        album = self._normalize_broadcast_text(meta.get("album", ""))
         if title and artist:
             base = f"{artist} - {title}"
         else:
@@ -2107,17 +2116,17 @@ class FMRadio:
     def hd_genre_summary(self):
         """Genre metadata from HD stream when available."""
         meta = self.hd_metadata
-        return str(meta.get("genre", "")).strip()
+        return self._normalize_broadcast_text(meta.get("genre", ""))
 
     @property
     def hd_info_summary(self):
         """Best-effort station text/alert summary for HD metadata."""
         meta = self.hd_metadata
         hd_label = self.hd_program_label
-        alert = str(meta.get("emergency_alert", "")).strip()
+        alert = self._normalize_broadcast_text(meta.get("emergency_alert", ""))
         payload = ""
-        message = str(meta.get("station_message", "")).strip()
-        slogan = str(meta.get("station_slogan", "")).strip()
+        message = self._normalize_broadcast_text(meta.get("station_message", ""))
+        slogan = self._normalize_broadcast_text(meta.get("station_slogan", ""))
         if alert:
             payload = f"Alert: {alert}"
         elif message:
@@ -2132,8 +2141,8 @@ class FMRadio:
     def hd_weather_summary(self):
         """Best-effort HD weather (HERE image) time/name summary."""
         meta = self.hd_metadata
-        wx_time = str(meta.get("here_weather_time_utc", "")).strip()
-        wx_name = str(meta.get("here_weather_name", "")).strip()
+        wx_time = self._normalize_broadcast_text(meta.get("here_weather_time_utc", ""))
+        wx_name = self._normalize_broadcast_text(meta.get("here_weather_name", ""))
         if wx_time and wx_name:
             return f"{wx_time}  {wx_name}"
         return wx_time or wx_name
@@ -2466,14 +2475,14 @@ def build_display(radio, width=80):
         add_hd_rows()
     elif not radio.weather_mode and not radio.rds_forced_off:
         rds_snapshot = dict(radio.rds_data) if radio.rds_data else {}
-        ps_name = rds_snapshot.get('station_name', '') if radio.rds_enabled else ''
+        ps_name = radio._normalize_broadcast_text(rds_snapshot.get('station_name', '')) if radio.rds_enabled else ''
         pty = rds_snapshot.get('program_type', '') if radio.rds_enabled else ''
         pi_hex = rds_snapshot.get('pi_hex') if radio.rds_enabled else None
-        radio_text_val = rds_snapshot.get('radio_text', '') if radio.rds_enabled else ''
+        radio_text_val = radio._normalize_broadcast_text(rds_snapshot.get('radio_text', '')) if radio.rds_enabled else ''
         clock_time = rds_snapshot.get('clock_time', '') if radio.rds_enabled else ''
-        rtplus_title = (rds_snapshot.get('rtplus_title') or '') if radio.rds_enabled else ''
-        rtplus_artist = (rds_snapshot.get('rtplus_artist') or '') if radio.rds_enabled else ''
-        rtplus_album = (rds_snapshot.get('rtplus_album') or '') if radio.rds_enabled else ''
+        rtplus_title = radio._normalize_broadcast_text(rds_snapshot.get('rtplus_title') or '') if radio.rds_enabled else ''
+        rtplus_artist = radio._normalize_broadcast_text(rds_snapshot.get('rtplus_artist') or '') if radio.rds_enabled else ''
+        rtplus_album = radio._normalize_broadcast_text(rds_snapshot.get('rtplus_album') or '') if radio.rds_enabled else ''
 
         # Station line: Callsign [Genre]
         callsign = pi_to_callsign(pi_hex) if pi_hex else None

@@ -191,6 +191,28 @@ def test_hd_metadata_summaries_include_station_and_track():
     assert radio.hd_now_playing_summary == "Artist B - Song A (Album C)"
 
 
+def test_normalize_broadcast_text_decodes_html_entities():
+    assert FMRadio._normalize_broadcast_text("Song &quot;A&quot;") == 'Song "A"'
+    assert FMRadio._normalize_broadcast_text("AT&amp;T") == "AT&T"
+
+
+def test_hd_now_playing_summary_decodes_html_quote_entities():
+    radio = FMRadio.__new__(FMRadio)
+    radio.hd_decoder = _FakeHDMetadataDecoder({
+        "station_name": "WXYZ-HD",
+        "program_name": "Alt Rock",
+        "service_name": "",
+        "sig_service_name": "",
+        "title": "Song &quot;A&quot;",
+        "artist": "Artist &quot;B&quot;",
+        "album": "Album &quot;C&quot;",
+        "genre": "Classical",
+    })
+    radio.hd_enabled = True
+
+    assert radio.hd_now_playing_summary == 'Artist "B" - Song "A" (Album "C")'
+
+
 def test_hd_metadata_extended_summaries():
     radio = FMRadio.__new__(FMRadio)
     radio.hd_decoder = _FakeHDMetadataDecoder({
