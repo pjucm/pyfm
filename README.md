@@ -15,10 +15,11 @@ pjfm is a command-line FM radio application that receives broadcast FM signals (
 - **Real-time FM stereo reception** with automatic mono/stereo switching
 - **NOAA Weather Radio** (NBFM mode for NWS frequencies)
 - **RDS decoding** with station identification, program type, radio text, and clock time
-- **Optional HD Radio decode** via NRSC5 Python bindings, with HD1/HD2/HD3 subchannel selection
+- **Optional HD Radio decode** via NRSC5 Python bindings (Python backend only), with HD1/HD2/HD3 subchannel selection
 - **HD metadata display** (station/service plus title/artist/album when broadcast)
+- **HD lock optimization**: when HD sync/audio is stable, analog FM demod is bypassed to reduce DSP load
 - **AF and RF spectrum analyzers** in the terminal UI
-- **Signal quality metrics** including S-meter, SNR, and pilot detection
+- **Signal/debug metrics** including S-meter plus `/` debug rows for RF/HD diagnostics
 - **Frequency presets** (8 programmable FM presets, saved to config)
 - **Tone controls** with bass and treble boost
 - **Squelch** for muting weak signals
@@ -142,17 +143,29 @@ RDS data is organized into 26-bit blocks (16 data + 10 checkword), grouped into 
 HD Radio decoding uses NRSC5 Python bindings:
 
 - **Python bindings**: `libnrsc5` + Python wrapper (`nrsc5/support/nrsc5.py`)
-
+- **Backend**: Python binding backend only (NRSC5 CLI fallback removed)
 - **Subchannels**: `h` cycles HD1/HD2/HD3, `H` toggles HD decode on/off
 - **Fast HD subchannel changes**: in Python backend, `h` switches active program selection without restarting the decoder process
 - **Metadata**: terminal UI displays `HD Station` and `HD Track` rows when available
 - **Retune behavior**: changing channels (left/right tune or preset recall) snaps HD decode off, so it does not carry across stations
 - **Metadata fields parsed** (when broadcast): station/service name, title, artist, album, genre, alerts, HERE weather/traffic image timestamps
+- **HD audio path**: when HD is enabled, AF spectrum uses HD output; with sustained HD lock/audio, analog FM demod is bypassed
+- **Safety**: NRSC5 write/stop calls are serialized to avoid stop-time races when toggling HD off
 
 Environment controls:
 
 - `PJFM_NRSC5_PY_BINDINGS=/path/to/nrsc5.py` (optional explicit binding file)
 - `PJFM_NRSC5_LIB=/path/to/libnrsc5.*` (optional explicit shared library path)
+- `PJFM_HD_SOLID_SYNC_MIN_S=1.0` (seconds of good HD sync before analog bypass engages)
+- `PJFM_HD_SOLID_SYNC_BER_MAX=0.05` (BER threshold for bypass gating)
+
+### Debug UI (`/`)
+
+Press `/` to show debug rows, including:
+
+- `Buffer`, `Peak`, and `IQ Loss` counters
+- `RF Stats`: dBm level plus pilot/phase/coherence/SNR analog diagnostics
+- `HD Stats`: sync state/counters, frequency offset, MER, BER, and NRSC5 I/O counters
 
 ### Adaptive Rate Control
 
@@ -258,6 +271,7 @@ output = tanh(input * 1.5) / tanh(1.5)
 | a | Toggle AF spectrum analyzer |
 | s | Toggle RF spectrum analyzer |
 | Q | Toggle squelch |
+| / | Toggle debug stats rows |
 | q | Quit |
 
 ### Configuration
