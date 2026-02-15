@@ -43,6 +43,22 @@ class _FakeRDSDecoder:
         self.reset_calls += 1
 
 
+class _FakeRecorder:
+    def __init__(self, output_dir="/tmp/recordings"):
+        self.output_dir = output_dir
+        self.is_recording = False
+        self.start_calls = []
+
+    def start(self, output_path=None):
+        self.is_recording = True
+        self.start_calls.append(output_path)
+        return output_path
+
+    def stop(self):
+        self.is_recording = False
+        return None
+
+
 def test_rate_adjust_clamp_fm_mode():
     assert FMRadio._clamp_rate_adjust(1.02, weather_mode=False) == FMRadio.RATE_ADJ_MAX
     assert FMRadio._clamp_rate_adjust(0.98, weather_mode=False) == FMRadio.RATE_ADJ_MIN
@@ -268,3 +284,70 @@ def test_hd_status_detail_suppresses_station_repeat_when_metadata_present():
     radio.weather_mode = False
 
     assert radio.hd_status_detail == ""
+
+
+def test_build_recording_output_path_hd_mode_uses_station_track_timestamp(monkeypatch):
+    radio = FMRadio.__new__(FMRadio)
+    radio.recorder = _FakeRecorder(output_dir="/tmp/recordings")
+    radio.weather_mode = False
+    radio.hd_enabled = True
+    radio.hd_decoder = _FakeHDMetadataDecoder({
+        "station_name": "WDAV",
+        "title": "Overture in F",
+        "artist": "Genevieve Soly",
+    })
+
+    monkeypatch.setattr("pjfm.time.strftime", lambda _fmt: "260215101530")
+    path = FMRadio._build_recording_output_path(radio)
+
+    assert path == "/tmp/recordings/WDAV - Genevieve Soly - Overture in F - 260215101530.opus"
+
+
+def test_build_recording_output_path_sanitizes_filename_components(monkeypatch):
+    radio = FMRadio.__new__(FMRadio)
+    radio.recorder = _FakeRecorder(output_dir="/tmp/recordings")
+    radio.weather_mode = False
+    radio.hd_enabled = True
+    radio.hd_decoder = _FakeHDMetadataDecoder({
+        "station_name": "W/DA:V*?",
+        "title": "Song <One>",
+        "artist": "A|B",
+    })
+
+    monkeypatch.setattr("pjfm.time.strftime", lambda _fmt: "260215101530")
+    path = FMRadio._build_recording_output_path(radio)
+
+    assert path == "/tmp/recordings/W DA V - A B - Song One - 260215101530.opus"
+
+
+def test_toggle_recording_passes_hd_output_path(monkeypatch):
+    radio = FMRadio.__new__(FMRadio)
+    radio.recorder = _FakeRecorder(output_dir="/tmp/recordings")
+    radio.weather_mode = False
+    radio.hd_enabled = True
+    radio.hd_decoder = _FakeHDMetadataDecoder({
+        "station_name": "WDAV",
+        "title": "Overture in F",
+        "artist": "Genevieve Soly",
+    })
+    radio.error_message = None
+
+    monkeypatch.setattr("pjfm.time.strftime", lambda _fmt: "260215101530")
+    out = FMRadio.toggle_recording(radio)
+
+    assert out == "/tmp/recordings/WDAV - Genevieve Soly - Overture in F - 260215101530.opus"
+    assert radio.recorder.start_calls == [out]
+
+
+def test_toggle_recording_non_hd_uses_recorder_default_path():
+    radio = FMRadio.__new__(FMRadio)
+    radio.recorder = _FakeRecorder(output_dir="/tmp/recordings")
+    radio.weather_mode = False
+    radio.hd_enabled = False
+    radio.hd_decoder = _FakeHDMetadataDecoder({})
+    radio.error_message = None
+
+    out = FMRadio.toggle_recording(radio)
+
+    assert out is None
+    assert radio.recorder.start_calls == [None]

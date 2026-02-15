@@ -41,6 +41,7 @@ import argparse
 import configparser
 import html
 import os
+import re
 import numpy as np
 import time
 from collections import deque
@@ -1740,6 +1741,48 @@ class FMRadio:
             return ""
         return html.unescape(text)
 
+    @staticmethod
+    def _sanitize_recording_filename_component(value, fallback):
+        """Sanitize metadata text for safe use in output filenames."""
+        text = FMRadio._normalize_broadcast_text(value)
+        # Replace filesystem-invalid characters and control bytes.
+        text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", text)
+        text = " ".join(text.split())
+        text = text.strip(" .-_")
+        if not text:
+            text = str(fallback)
+        return text[:96]
+
+    def _build_recording_output_path(self):
+        """Build HD-aware recording output path when HD mode is active."""
+        if not self.recorder:
+            return None
+        if self.weather_mode or not self.hd_enabled or not self.hd_decoder:
+            return None
+
+        meta = self.hd_metadata
+        station = (
+            meta.get("station_name")
+            or meta.get("program_name")
+            or meta.get("service_name")
+            or meta.get("sig_service_name")
+            or self.hd_program_label
+            or f"{self.frequency_mhz:.1f}MHz"
+        )
+
+        title = self._normalize_broadcast_text(meta.get("title", ""))
+        artist = self._normalize_broadcast_text(meta.get("artist", ""))
+        if title and artist:
+            track = f"{artist} - {title}"
+        else:
+            track = title or artist or self.hd_now_playing_summary or ""
+
+        station_part = self._sanitize_recording_filename_component(station, "HD Station")
+        track_part = self._sanitize_recording_filename_component(track, "HD Track")
+        stamp = time.strftime("%y%m%d%H%M%S")
+        filename = f"{station_part} - {track_part} - {stamp}.opus"
+        return os.path.join(self.recorder.output_dir, filename)
+
     @classmethod
     def _should_flush_iq_loss(cls, recent_loss, now_s, last_flush_s, stream_start_s):
         """
@@ -1997,7 +2040,7 @@ class FMRadio:
         try:
             if self.recorder.is_recording:
                 return self.recorder.stop()
-            return self.recorder.start()
+            return self.recorder.start(output_path=self._build_recording_output_path())
         except Exception as exc:
             self.error_message = str(exc)
             return None
