@@ -12,15 +12,27 @@ from pjfm import FMRadio
 class _FakeHDDecoder:
     def __init__(self):
         self.stop_calls = 0
+        self.start_calls = []
         self.program = 2
         self.set_program_calls = []
 
     def stop(self):
         self.stop_calls += 1
 
+    def start(self, frequency_hz):
+        self.start_calls.append(int(frequency_hz))
+
     def set_program(self, program):
         self.program = int(program)
         self.set_program_calls.append(self.program)
+
+    def poll(self):
+        return True
+
+
+class _FakeDevice:
+    def __init__(self, frequency=99_900_000):
+        self.frequency = frequency
 
 
 class _FakeHDMetadataDecoder:
@@ -128,10 +140,13 @@ def test_snap_hd_decoder_off_stops_running_decoder():
     radio = FMRadio.__new__(FMRadio)
     radio.hd_decoder = _FakeHDDecoder()
     radio.hd_enabled = True
+    radio.hd_auto_arm = False
+    radio.weather_mode = False
 
     FMRadio._snap_hd_decoder_off(radio)
 
     assert radio.hd_enabled is False
+    assert radio.hd_auto_enabled is False
     assert radio.hd_decoder.stop_calls == 1
     assert radio.hd_decoder.program == 0
     assert radio.hd_decoder.set_program_calls == [0]
@@ -141,20 +156,26 @@ def test_snap_hd_decoder_off_handles_missing_decoder():
     radio = FMRadio.__new__(FMRadio)
     radio.hd_decoder = None
     radio.hd_enabled = True
+    radio.hd_auto_arm = True
+    radio.weather_mode = False
 
     FMRadio._snap_hd_decoder_off(radio)
 
     assert radio.hd_enabled is False
+    assert radio.hd_auto_enabled is True
 
 
 def test_snap_hd_decoder_off_resets_program_when_already_off():
     radio = FMRadio.__new__(FMRadio)
     radio.hd_decoder = _FakeHDDecoder()
     radio.hd_enabled = False
+    radio.hd_auto_arm = True
+    radio.weather_mode = False
 
     FMRadio._snap_hd_decoder_off(radio)
 
     assert radio.hd_enabled is False
+    assert radio.hd_auto_enabled is True
     assert radio.hd_decoder.stop_calls == 0
     assert radio.hd_decoder.program == 0
     assert radio.hd_decoder.set_program_calls == [0]
@@ -351,3 +372,131 @@ def test_toggle_recording_non_hd_uses_recorder_default_path():
 
     assert out is None
     assert radio.recorder.start_calls == [None]
+
+
+def test_toggle_hd_radio_arms_background_decode_without_immediate_audio_switch():
+    radio = FMRadio.__new__(FMRadio)
+    radio.weather_mode = False
+    radio.hd_decoder = _FakeHDDecoder()
+    radio.hd_enabled = False
+    radio.hd_auto_arm = False
+    radio.hd_auto_enabled = False
+    radio.device = _FakeDevice()
+    radio.error_message = None
+    radio._save_config = lambda: None
+
+    FMRadio.toggle_hd_radio(radio)
+
+    assert radio.hd_auto_arm is True
+    assert radio.hd_auto_enabled is True
+    assert radio.hd_enabled is False
+    assert len(radio.hd_decoder.start_calls) == 1
+
+
+def test_start_hd_background_decode_starts_when_auto_enabled():
+    radio = FMRadio.__new__(FMRadio)
+    radio.weather_mode = False
+    radio.hd_auto_enabled = True
+    radio.hd_enabled = False
+    radio.hd_decoder = _FakeHDDecoder()
+    radio.device = _FakeDevice()
+    radio.error_message = None
+
+    FMRadio._start_hd_background_decode(radio)
+
+    assert radio.hd_decoder.start_calls == [99_900_000]
+    assert radio.error_message is None
+
+
+def test_toggle_hd_radio_disarms_auto_arm_and_persists():
+    radio = FMRadio.__new__(FMRadio)
+    radio.weather_mode = False
+    radio.hd_decoder = _FakeHDDecoder()
+    radio.hd_enabled = False
+    radio.hd_auto_arm = True
+    radio.hd_auto_enabled = True
+    radio.device = _FakeDevice()
+    radio.error_message = None
+    save_calls = []
+    radio._save_config = lambda: save_calls.append(True)
+
+    FMRadio.toggle_hd_radio(radio)
+
+    assert radio.hd_auto_arm is False
+    assert radio.hd_auto_enabled is False
+    assert save_calls == [True]
+
+
+def test_load_config_reads_hd_auto_arm(tmp_path):
+    cfg = tmp_path / "pjfm.cfg"
+    cfg.write_text(
+        "[radio]\n"
+        "hd_auto_arm = true\n"
+        "squelch_threshold = -100.0\n"
+        "stereo_lpf_taps = 255\n"
+        "stereo_lpf_beta = 6.0\n"
+        "stereo_blend_low_db = 5.0\n"
+        "stereo_blend_high_db = 25.0\n",
+        encoding="utf-8",
+    )
+    radio = FMRadio.__new__(FMRadio)
+    radio.CONFIG_FILE = str(cfg)
+    radio.USER_PRESET_COUNT = 8
+    radio.presets = [None] * 8
+    radio._initial_bass_boost = False
+    radio._initial_treble_boost = False
+    radio.force_mono = False
+    radio.squelch_threshold = -100.0
+    radio.stereo_lpf_taps = 255
+    radio.stereo_lpf_beta = 6.0
+    radio.stereo_blend_low_db = 5.0
+    radio.stereo_blend_high_db = 25.0
+    radio.STEREO_BLEND_LOW_DB_DEFAULT = 5.0
+    radio.STEREO_BLEND_HIGH_DB_DEFAULT = 25.0
+    radio._pll_kernel_mode_from_env = False
+    radio.pll_kernel_mode = "auto"
+    radio.rds_forced_off = False
+    radio.hd_auto_arm = False
+    radio.hd_auto_enabled = False
+    radio.weather_mode = False
+
+    FMRadio._load_config(radio)
+
+    assert radio.hd_auto_arm is True
+    assert radio.hd_auto_enabled is True
+
+
+def test_save_config_writes_hd_auto_arm(tmp_path):
+    class _FakeSaveDevice:
+        frequency = 89_900_000
+
+    class _FakeStereoDecoder:
+        bass_boost_enabled = False
+        treble_boost_enabled = False
+
+    cfg = tmp_path / "pjfm.cfg"
+    radio = FMRadio.__new__(FMRadio)
+    radio.CONFIG_FILE = str(cfg)
+    radio.device = _FakeSaveDevice()
+    radio.weather_mode = False
+    radio.stereo_decoder = _FakeStereoDecoder()
+    radio.nbfm_decoder = None
+    radio.use_icom = True
+    radio.use_24bit = True
+    radio.use_realtime = True
+    radio.iq_sample_rate = 480000
+    radio.squelch_threshold = -100.0
+    radio.stereo_lpf_taps = 255
+    radio.stereo_lpf_beta = 6.0
+    radio.stereo_blend_low_db = 5.0
+    radio.stereo_blend_high_db = 25.0
+    radio.pll_kernel_mode = "auto"
+    radio.rds_forced_off = False
+    radio.hd_auto_arm = True
+    radio.presets = [None] * 8
+    radio.force_mono = False
+
+    FMRadio._save_config(radio)
+
+    text = cfg.read_text(encoding="utf-8")
+    assert "hd_auto_arm = true" in text

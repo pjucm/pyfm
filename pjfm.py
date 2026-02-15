@@ -781,6 +781,8 @@ class FMRadio:
         # Optional HD Radio decoder hooks (nrsc5 external process)
         self.hd_decoder = NRSC5Demodulator() if NRSC5Demodulator else None
         self.hd_enabled = False
+        self.hd_auto_arm = False
+        self.hd_auto_enabled = False
         self.hd_analog_bypass_active = False
 
         # Auto RDS mode (enabled by default, disable with --no-rds)
@@ -960,6 +962,12 @@ class FMRadio:
                     self.rds_forced_off = config.getboolean('radio', 'rds_force_off')
                 except ValueError:
                     pass
+            if config.has_option('radio', 'hd_auto_arm'):
+                try:
+                    self.hd_auto_arm = config.getboolean('radio', 'hd_auto_arm')
+                except ValueError:
+                    pass
+            self.hd_auto_enabled = bool(self.hd_auto_arm and not self.weather_mode)
         except (ValueError, configparser.Error):
             # Ignore invalid config
             pass
@@ -982,6 +990,7 @@ class FMRadio:
             'stereo_blend_high_db': f'{self.stereo_blend_high_db:.1f}',
             'pll_kernel_mode': self.pll_kernel_mode,
             'rds_force_off': str(self.rds_forced_off).lower(),
+            'hd_auto_arm': str(self.hd_auto_arm).lower(),
         }
 
         # Presets section
@@ -1088,6 +1097,8 @@ class FMRadio:
             self._open_startup_prefill_log()
             self._log_startup_prefill(applied_rate_adj=1.0, loss_now=False, stage="start")
             self.running = True
+            self.hd_auto_enabled = bool(self.hd_auto_arm and not self.weather_mode)
+            self._start_hd_background_decode()
 
             # Start audio processing thread (also handles RDS inline)
             self.audio_thread = threading.Thread(target=self._audio_loop, daemon=True)
@@ -1121,6 +1132,8 @@ class FMRadio:
         if self.hd_decoder:
             self.hd_decoder.stop()
             self.hd_enabled = False
+            self.hd_auto_enabled = False
+            self.hd_analog_bypass_active = False
         self.audio_player.stop()
         self.device.close()
 
@@ -1387,7 +1400,7 @@ class FMRadio:
                 # Feed optional HD decoder with raw IQ stream.
                 if (not self.weather_mode and
                         not loss_now and
-                        self.hd_enabled and
+                        (self.hd_enabled or self.hd_auto_enabled) and
                         self.hd_decoder):
                     self.hd_decoder.push_iq(iq, getattr(self.device, 'iq_sample_rate', self.iq_sample_rate))
 
@@ -1445,7 +1458,7 @@ class FMRadio:
                 hd_sync_solid = False
                 if (not self.weather_mode and
                         not loss_now and
-                        self.hd_enabled and
+                        (self.hd_enabled or self.hd_auto_enabled) and
                         self.hd_decoder):
                     hd_stats = getattr(self.hd_decoder, "stats_snapshot", {}) or {}
                     hd_sync = bool(hd_stats.get("sync", False))
@@ -1466,7 +1479,10 @@ class FMRadio:
                     if hd_sync_good_since_s <= 0.0:
                         hd_sync_good_since_s = loop_now_s
                     if (loop_now_s - hd_sync_good_since_s) >= hd_solid_sync_min_s:
-                        hd_bypass_active = True
+                        hd_bypass_active = bool(self.hd_auto_enabled or self.hd_enabled)
+                        if self.hd_auto_enabled:
+                            self.hd_enabled = True
+                            self._suspend_rds_for_hd()
                 else:
                     hd_sync_good_since_s = 0.0
                     hd_bypass_active = False
@@ -1801,8 +1817,11 @@ class FMRadio:
 
     def _sync_hd_decoder_state(self):
         """Update HD decoder state when the external process exits."""
-        if self.hd_decoder and self.hd_enabled and not self.hd_decoder.poll():
+        if (self.hd_decoder and
+                (getattr(self, "hd_enabled", False) or getattr(self, "hd_auto_enabled", False)) and
+                not self.hd_decoder.poll()):
             self.hd_enabled = False
+            self.hd_auto_enabled = False
             self.hd_analog_bypass_active = False
             if self.hd_decoder.last_error:
                 self.error_message = self.hd_decoder.last_error
@@ -1822,8 +1841,9 @@ class FMRadio:
         """Stop HD decoding after channel/mode changes and reset to HD1."""
         if not self.hd_decoder:
             self.hd_enabled = False
+            self.hd_auto_enabled = bool(getattr(self, "hd_auto_arm", False) and not self.weather_mode)
             return
-        if self.hd_enabled:
+        if self.hd_enabled or getattr(self, "hd_auto_enabled", False):
             self.hd_decoder.stop()
         if hasattr(self.hd_decoder, "set_program"):
             try:
@@ -1836,7 +1856,19 @@ class FMRadio:
             except Exception:
                 pass
         self.hd_enabled = False
+        self.hd_auto_enabled = bool(getattr(self, "hd_auto_arm", False) and not self.weather_mode)
         self.hd_analog_bypass_active = False
+
+    def _start_hd_background_decode(self):
+        """Start HD decoder in background without switching audio immediately."""
+        if self.weather_mode or not self.hd_auto_enabled or not self.hd_decoder:
+            return
+        try:
+            self.hd_decoder.start(self.device.frequency)
+            self.error_message = None
+        except RuntimeError as exc:
+            self.hd_auto_enabled = False
+            self.error_message = str(exc)
 
     def tune_up(self):
         """Tune up by 200 kHz (FM) or 25 kHz (Weather)."""
@@ -1860,6 +1892,7 @@ class FMRadio:
                 self.rds_decoder.reset()
                 self.rds_data = {}
             self._snap_hd_decoder_off()
+            self._start_hd_background_decode()
         self._clear_iq_queue()
         self.audio_player.reset()
         self.is_tuning = False
@@ -1888,6 +1921,7 @@ class FMRadio:
                 self.rds_decoder.reset()
                 self.rds_data = {}
             self._snap_hd_decoder_off()
+            self._start_hd_background_decode()
         self._clear_iq_queue()
         self.audio_player.reset()
         self.is_tuning = False
@@ -1916,6 +1950,7 @@ class FMRadio:
                 self.rds_decoder.reset()
                 self.rds_data = {}
             self._snap_hd_decoder_off()
+            self._start_hd_background_decode()
         self._clear_iq_queue()
         self.audio_player.reset()
         self.is_tuning = False
@@ -2006,10 +2041,14 @@ class FMRadio:
             self.hd_decoder.set_program(target_program)
             self.hd_decoder.start(self.device.frequency)
             self.hd_enabled = True
+            self.hd_auto_arm = True
+            self.hd_auto_enabled = True
             self._suspend_rds_for_hd()
             self.error_message = None
         except (RuntimeError, ValueError) as exc:
             self.hd_enabled = False
+            self.hd_auto_arm = False
+            self.hd_auto_enabled = False
             self.error_message = str(exc)
 
     def toggle_hd_radio(self):
@@ -2020,17 +2059,24 @@ class FMRadio:
             self.error_message = "HD Radio unavailable: nrsc5 hooks are disabled"
             return
         self._sync_hd_decoder_state()
-        if self.hd_enabled:
+        if self.hd_enabled or self.hd_auto_enabled:
             self.hd_decoder.stop()
             self.hd_enabled = False
+            self.hd_auto_arm = False
+            self.hd_auto_enabled = False
+            self._save_config()
             return
         try:
+            self.hd_auto_arm = True
+            self.hd_auto_enabled = True
             self.hd_decoder.start(self.device.frequency)
-            self.hd_enabled = True
-            self._suspend_rds_for_hd()
+            self.hd_enabled = False
             self.error_message = None
+            self._save_config()
         except RuntimeError as exc:
             self.hd_enabled = False
+            self.hd_auto_arm = False
+            self.hd_auto_enabled = False
             self.error_message = str(exc)
 
     def toggle_recording(self):
