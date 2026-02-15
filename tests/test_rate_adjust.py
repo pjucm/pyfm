@@ -55,6 +55,14 @@ class _FakeRDSDecoder:
         self.reset_calls += 1
 
 
+class _FakeStereoDecoder:
+    def __init__(self):
+        self.reset_calls = 0
+
+    def reset(self):
+        self.reset_calls += 1
+
+
 class _FakeRecorder:
     def __init__(self, output_dir="/tmp/recordings"):
         self.output_dir = output_dir
@@ -424,6 +432,34 @@ def test_toggle_hd_radio_disarms_auto_arm_and_persists():
 
     assert radio.hd_auto_arm is False
     assert radio.hd_auto_enabled is False
+    assert save_calls == [True]
+
+
+def test_toggle_hd_radio_off_resets_analog_decoders():
+    radio = FMRadio.__new__(FMRadio)
+    radio.weather_mode = False
+    radio.hd_decoder = _FakeHDDecoder()
+    radio.hd_enabled = True
+    radio.hd_auto_arm = True
+    radio.hd_auto_enabled = True
+    radio.hd_analog_bypass_active = True
+    radio.stereo_decoder = _FakeStereoDecoder()
+    radio.rds_decoder = _FakeRDSDecoder()
+    radio.rds_data = {"station_name": "WDAV"}
+    radio.error_message = None
+    save_calls = []
+    radio._save_config = lambda: save_calls.append(True)
+    radio._sync_hd_decoder_state = lambda: None
+
+    FMRadio.toggle_hd_radio(radio)
+
+    assert radio.hd_enabled is False
+    assert radio.hd_auto_arm is False
+    assert radio.hd_auto_enabled is False
+    assert radio.hd_analog_bypass_active is False
+    assert radio.stereo_decoder.reset_calls == 1
+    assert radio.rds_decoder.reset_calls == 1
+    assert radio.rds_data == {}
     assert save_calls == [True]
 
 
