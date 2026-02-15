@@ -318,7 +318,7 @@ pip install PyQt5 pyqtgraph
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        Quadrature Discriminator                          │
+│                        Quadrature Discriminator                         │
 │                   baseband = angle(s[n] * conj(s[n-1]))                 │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
