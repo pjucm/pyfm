@@ -1493,6 +1493,7 @@ class FMRadio:
                         self.stereo_decoder.last_baseband
                     )
 
+                hd_audio_used = False
                 # If HD decode is active and audio is available, prefer digital audio.
                 if (not self.weather_mode and
                         self.hd_enabled and
@@ -1500,6 +1501,7 @@ class FMRadio:
                     hd_audio = self.hd_decoder.pull_audio(len(audio))
                     if hd_audio is not None:
                         audio = hd_audio
+                        hd_audio_used = True
 
                 # Apply squelch (mute if signal below threshold)
                 if squelched:
@@ -1520,9 +1522,16 @@ class FMRadio:
                 if self.rf_spectrum_enabled:
                     self.rf_spectrum_analyzer.update(iq)
 
-                # Update AF spectrum analyzer from demodulated audio
+                # Update AF spectrum analyzer from post-squelch audio.
+                # In HD mode, show only HD audio path (not analog fallback).
                 if self.spectrum_enabled:
-                    self.spectrum_analyzer.update(audio)
+                    if (not self.weather_mode and
+                            self.hd_enabled and
+                            self.hd_decoder and
+                            not hd_audio_used):
+                        self.spectrum_analyzer.update(np.zeros_like(audio))
+                    else:
+                        self.spectrum_analyzer.update(audio)
 
                 # Queue audio for playback
                 self.audio_player.queue_audio(audio)
@@ -2354,11 +2363,11 @@ def build_display(radio, width=80):
 
     # Signal row
     signal_text = Text()
-    signal_text.append(f"{s_reading:<8}", style="green bold")
-    signal_text.append(f"  ({signal_dbm:6.1f} dBm)", style="yellow")
+    signal_text.append(render_s_meter_rich(signal_dbm, width=30))
+    signal_text.append(f"  {s_reading}", style="green bold")
     table.add_row("Signal:", signal_text)
 
-    # SNR row - different thresholds for NBFM vs WBFM
+    # SNR row (weather mode only)
     snr = radio.snr_db
     snr_text = Text()
     if radio.weather_mode:
@@ -2380,53 +2389,10 @@ def build_display(radio, width=80):
             snr_text.append("  (Very Poor)", style="red")
         snr_text.append("  [3kHz]", style="dim")
         table.add_row("SNR:", snr_text)
-    else:
-        # WBFM: composite stereo quality + three contributing factors
-        dec = radio.stereo_decoder
-        quality = getattr(dec, "stereo_quality_db", snr) if dec else snr
-        if quality > 35:
-            snr_text.append(f"{quality:.1f} dB", style="green bold")
-            snr_text.append("  (Excellent)", style="green")
-        elif quality > 25:
-            snr_text.append(f"{quality:.1f} dB", style="green bold")
-            snr_text.append("  (Good)", style="green")
-        elif quality > 15:
-            snr_text.append(f"{quality:.1f} dB", style="yellow bold")
-            snr_text.append("  (Fair)", style="yellow")
-        elif quality > 10:
-            snr_text.append(f"{quality:.1f} dB", style="yellow bold")
-            snr_text.append("  (Poor)", style="yellow")
-        else:
-            snr_text.append(f"{quality:.1f} dB", style="red bold")
-            snr_text.append("  (Very Poor)", style="red")
-        bw_label = "53kHz" if radio.pilot_detected else "15kHz"
-        snr_text.append(f"  [{bw_label}]", style="dim")
-        table.add_row("Quality:", snr_text)
 
-        # Three quality components (toggle with '.')
-        if dec and radio.show_quality_detail:
-            comp_text = Text()
-            pilot = getattr(dec, "pilot_metric_db", 0.0)
-            phase = getattr(dec, "phase_penalty_db", 0.0)
-            coher = getattr(dec, "coherence_penalty_db", 0.0)
-            comp_text.append(f"Pilot {pilot:+.1f}", style="cyan")
-            comp_text.append("  Phase ", style="dim")
-            comp_text.append(f"{phase:+.1f}", style="cyan" if phase > -3 else "yellow")
-            comp_text.append("  Coher ", style="dim")
-            comp_text.append(f"{coher:+.1f}", style="cyan" if coher > -3 else "yellow")
-            comp_text.append(f"  SNR {snr:.1f}", style="dim")
-            table.add_row("", comp_text)
-
-    # S-meter row
-    s_meter = Text()
-    s_meter.append("S: ", style="cyan")
-    s_meter.append(render_s_meter_rich(signal_dbm, width=30))
-    table.add_row("", s_meter)
-
-    # S-meter scale (aligned to 30-char bar: S9 at pos 21, S9+20 at pos 30)
-    # Bar: |----S1 to S9 (21 chars)----|--S9+ (9 chars)--|
+    # S-meter scale aligned to the 30-char signal bar (S9 at pos 21, S9+20 at pos 30)
     scale = Text()
-    scale.append("   1    3    5    7    9      +20", style="dim")
+    scale.append("1    3    5    7    9      +20", style="dim")
     table.add_row("", scale)
 
     # Band position
@@ -2729,6 +2695,77 @@ def build_display(radio, width=80):
 
         table.add_row("IQ Loss:", loss_text)
 
+        analog_text = Text()
+        if radio.weather_mode:
+            analog_text.append(f"{signal_dbm:6.1f} dBm", style="yellow")
+            analog_text.append("  N/A", style="dim")
+        else:
+            dec = radio.stereo_decoder
+            if not dec:
+                analog_text.append(f"{signal_dbm:6.1f} dBm", style="yellow")
+                analog_text.append("  N/A", style="dim")
+            else:
+                pilot = getattr(dec, "pilot_metric_db", 0.0)
+                phase = getattr(dec, "phase_penalty_db", 0.0)
+                coher = getattr(dec, "coherence_penalty_db", 0.0)
+                analog_snr = getattr(dec, "snr_db", snr)
+                analog_text.append(f"{signal_dbm:6.1f} dBm", style="yellow")
+                analog_text.append(f"  pilot:{pilot:+.1f}", style="cyan")
+                analog_text.append(f"  phase:{phase:+.1f}", style="cyan" if phase > -3 else "yellow")
+                analog_text.append(f"  coher:{coher:+.1f}", style="cyan" if coher > -3 else "yellow")
+                analog_text.append(f"  snr:{analog_snr:.1f}dB", style="dim")
+        table.add_row("RF Stats:", analog_text)
+
+        hd_stats_text = Text()
+        hd_decoder = getattr(radio, "hd_decoder", None)
+        if not hd_decoder:
+            hd_stats_text.append("N/A", style="dim")
+        else:
+            hd_stats = getattr(hd_decoder, "stats_snapshot", {}) or {}
+
+            sync_active = bool(hd_stats.get("sync", False))
+            sync_count = int(hd_stats.get("sync_count", 0) or 0)
+            lost_sync_count = int(hd_stats.get("lost_sync_count", 0) or 0)
+            sync_style = "green bold" if sync_active else "yellow bold"
+            sync_text = "LOCK" if sync_active else "SRCH"
+
+            freq_offset = hd_stats.get("last_sync_freq_offset_hz")
+            try:
+                freq_text = f"{float(freq_offset):+.1f}Hz"
+            except (TypeError, ValueError):
+                freq_text = "--"
+
+            mer_lower = hd_stats.get("mer_lower_db")
+            mer_upper = hd_stats.get("mer_upper_db")
+            try:
+                mer_lower_text = f"{float(mer_lower):.1f}"
+            except (TypeError, ValueError):
+                mer_lower_text = "--"
+            try:
+                mer_upper_text = f"{float(mer_upper):.1f}"
+            except (TypeError, ValueError):
+                mer_upper_text = "--"
+
+            ber_cber = hd_stats.get("ber_cber")
+            try:
+                ber_text = f"{float(ber_cber):.2e}"
+            except (TypeError, ValueError):
+                ber_text = "--"
+
+            iq_mb = float(getattr(hd_decoder, "iq_bytes_in_total", 0) or 0) / 1e6
+            audio_mb = float(getattr(hd_decoder, "audio_bytes_out_total", 0) or 0) / 1e6
+
+            hd_stats_text.append("ON" if radio.hd_enabled else "OFF", style="green bold" if radio.hd_enabled else "dim")
+            hd_stats_text.append("  sync:", style="dim")
+            hd_stats_text.append(sync_text, style=sync_style)
+            hd_stats_text.append(f"({sync_count}/{lost_sync_count})", style="cyan")
+            hd_stats_text.append(f"  df:{freq_text}", style="dim")
+            hd_stats_text.append(f"  mer:{mer_lower_text}/{mer_upper_text}dB", style="dim")
+            hd_stats_text.append(f"  ber:{ber_text}", style="dim")
+            hd_stats_text.append(f"  io:{iq_mb:.1f}/{audio_mb:.1f}MB", style="dim")
+
+        table.add_row("HD Stats:", hd_stats_text)
+
         # RDS coherent demod diagnostics (when enabled)
         if (not radio.weather_mode and
                 not radio.rds_forced_off and
@@ -2818,36 +2855,37 @@ def build_display(radio, width=80):
             total_text.append(f" ({budget_pct:.0f}% of {budget_us/1000:.1f}ms budget)", style=budget_style)
             table.add_row("", total_text)
 
-    # Controls section
-    controls = Text()
-    controls.append("\n")
-    controls.append("←/→ ", style="cyan bold")
-    controls.append("Tune  ", style="dim")
-    controls.append("↑/↓ ", style="cyan bold")
-    controls.append("Vol  ", style="dim")
-    controls.append("w ", style="cyan bold")
-    controls.append("WX  ", style="dim")
+    # Controls section (two centered lines)
+    controls_line1 = Text()
+    controls_line1.append("←/→ ", style="cyan bold")
+    controls_line1.append("Tune  ", style="dim")
+    controls_line1.append("↑/↓ ", style="cyan bold")
+    controls_line1.append("Vol  ", style="dim")
+    controls_line1.append("w ", style="cyan bold")
+    controls_line1.append("WX  ", style="dim")
     if not radio.weather_mode:
-        controls.append("r ", style="cyan bold")
-        controls.append("RDS  ", style="dim")
-        controls.append("h ", style="cyan bold")
-        controls.append("HD Ch  ", style="dim")
-        controls.append("H ", style="cyan bold")
-        controls.append("HD On/Off  ", style="dim")
-    controls.append("R ", style="cyan bold")
-    controls.append("Record  ", style="dim")
-    controls.append("b ", style="cyan bold")
-    controls.append("Bass  ", style="dim")
-    controls.append("t ", style="cyan bold")
-    controls.append("Treble  ", style="dim")
-    controls.append("a ", style="cyan bold")
-    controls.append("AF Spect  ", style="dim")
-    controls.append("s ", style="cyan bold")
-    controls.append("RF Spect  ", style="dim")
-    controls.append("Q ", style="cyan bold")
-    controls.append("Squelch  ", style="dim")
-    controls.append("q ", style="cyan bold")
-    controls.append("Quit", style="dim")
+        controls_line1.append("r ", style="cyan bold")
+        controls_line1.append("RDS  ", style="dim")
+        controls_line1.append("h ", style="cyan bold")
+        controls_line1.append("HD Ch  ", style="dim")
+        controls_line1.append("H ", style="cyan bold")
+        controls_line1.append("HD On/Off  ", style="dim")
+    controls_line1.append("R ", style="cyan bold")
+    controls_line1.append("Record", style="dim")
+
+    controls_line2 = Text()
+    controls_line2.append("b ", style="cyan bold")
+    controls_line2.append("Bass  ", style="dim")
+    controls_line2.append("t ", style="cyan bold")
+    controls_line2.append("Treble  ", style="dim")
+    controls_line2.append("a ", style="cyan bold")
+    controls_line2.append("AF Spect  ", style="dim")
+    controls_line2.append("s ", style="cyan bold")
+    controls_line2.append("RF Spect  ", style="dim")
+    controls_line2.append("Q ", style="cyan bold")
+    controls_line2.append("Squelch  ", style="dim")
+    controls_line2.append("q ", style="cyan bold")
+    controls_line2.append("Quit", style="dim")
 
     # Presets section
     presets = Text()
@@ -2926,7 +2964,9 @@ def build_display(radio, width=80):
         else:
             content.add_row(Align.center(af_spectrum_table))
 
-    content.add_row(Align.center(controls))
+    content.add_row(Text(""))  # Spacer
+    content.add_row(Align.center(controls_line1))
+    content.add_row(Align.center(controls_line2))
     content.add_row(Align.center(presets))
 
     if radio.weather_mode:

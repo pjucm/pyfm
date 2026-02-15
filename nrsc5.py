@@ -180,7 +180,9 @@ class NRSC5Demodulator:
         self.last_error = ""
         self.last_output_line = ""
         self._metadata = {}
+        self._stats = {}
         self._reset_metadata_locked()
+        self._reset_stats_locked()
 
     @property
     def available(self):
@@ -252,6 +254,12 @@ class NRSC5Demodulator:
         with self._lock:
             return dict(self._metadata)
 
+    @property
+    def stats_snapshot(self):
+        """Latest decoder/sync diagnostics from NRSC5 events."""
+        with self._lock:
+            return dict(self._stats)
+
     def _reset_metadata_locked(self):
         """Reset cached metadata state. Caller must hold `_lock`."""
         self._metadata = {
@@ -273,6 +281,23 @@ class NRSC5Demodulator:
             "here_weather_name": "",
             "here_traffic_time_utc": "",
             "here_traffic_name": "",
+            "updated_at_s": 0.0,
+        }
+
+    def _reset_stats_locked(self):
+        """Reset cached decoder diagnostics. Caller must hold `_lock`."""
+        self._stats = {
+            "sync": False,
+            "sync_count": 0,
+            "lost_sync_count": 0,
+            "last_sync_freq_offset_hz": None,
+            "last_sync_psmi": None,
+            "mer_lower_db": None,
+            "mer_upper_db": None,
+            "ber_cber": None,
+            "agc_gain_db": None,
+            "agc_peak_dbfs": None,
+            "agc_is_final": None,
             "updated_at_s": 0.0,
         }
 
@@ -643,19 +668,87 @@ class NRSC5Demodulator:
                 self.last_error = "nrsc5 lost input device"
                 self._set_last_output_line_locked("Lost input device")
                 self._python_lost_device = True
+                self._stats["sync"] = False
+                self._stats["updated_at_s"] = now
             return
 
         if event_name == "SYNC":
             with self._lock:
                 freq_offset = getattr(evt, "freq_offset", 0.0)
-                self._set_last_output_line_locked(f"SYNC lock (offset {freq_offset:.1f} Hz)")
+                psmi = getattr(evt, "psmi", None)
+                try:
+                    freq_offset_val = float(freq_offset)
+                except (TypeError, ValueError):
+                    freq_offset_val = None
+                try:
+                    psmi_val = int(psmi)
+                except (TypeError, ValueError):
+                    psmi_val = None
+                display_offset = 0.0 if freq_offset_val is None else freq_offset_val
+                self._set_last_output_line_locked(f"SYNC lock (offset {display_offset:.1f} Hz)")
                 self._python_sync = True
+                self._stats["sync"] = True
+                self._stats["sync_count"] = int(self._stats.get("sync_count", 0)) + 1
+                self._stats["last_sync_freq_offset_hz"] = freq_offset_val
+                self._stats["last_sync_psmi"] = psmi_val
+                self._stats["updated_at_s"] = now
             return
 
         if event_name == "LOST_SYNC":
             with self._lock:
                 self._set_last_output_line_locked("SYNC lost")
                 self._python_sync = False
+                self._stats["sync"] = False
+                self._stats["lost_sync_count"] = int(self._stats.get("lost_sync_count", 0)) + 1
+                self._stats["updated_at_s"] = now
+            return
+
+        if event_name == "MER":
+            with self._lock:
+                lower = getattr(evt, "lower", None)
+                upper = getattr(evt, "upper", None)
+                try:
+                    lower_val = float(lower)
+                except (TypeError, ValueError):
+                    lower_val = None
+                try:
+                    upper_val = float(upper)
+                except (TypeError, ValueError):
+                    upper_val = None
+                self._stats["mer_lower_db"] = lower_val
+                self._stats["mer_upper_db"] = upper_val
+                self._stats["updated_at_s"] = now
+            return
+
+        if event_name == "BER":
+            with self._lock:
+                cber = getattr(evt, "cber", None)
+                try:
+                    cber_val = float(cber)
+                except (TypeError, ValueError):
+                    cber_val = None
+                self._stats["ber_cber"] = cber_val
+                self._stats["updated_at_s"] = now
+            return
+
+        if event_name == "AGC":
+            with self._lock:
+                gain_db = getattr(evt, "gain_db", None)
+                peak_dbfs = getattr(evt, "peak_dbfs", None)
+                is_final = getattr(evt, "is_final", None)
+                try:
+                    gain_db_val = float(gain_db)
+                except (TypeError, ValueError):
+                    gain_db_val = None
+                try:
+                    peak_dbfs_val = float(peak_dbfs)
+                except (TypeError, ValueError):
+                    peak_dbfs_val = None
+                is_final_val = None if is_final is None else bool(is_final)
+                self._stats["agc_gain_db"] = gain_db_val
+                self._stats["agc_peak_dbfs"] = peak_dbfs_val
+                self._stats["agc_is_final"] = is_final_val
+                self._stats["updated_at_s"] = now
             return
 
         if event_name == "STATION_NAME":
@@ -1017,6 +1110,7 @@ class NRSC5Demodulator:
             self.last_error = ""
             self.last_output_line = ""
             self._reset_metadata_locked()
+            self._reset_stats_locked()
             self._log_stderr_thread = None
             self._log_stdout_thread = None
             self._audio_thread = None
@@ -1101,6 +1195,7 @@ class NRSC5Demodulator:
             self._reset_iq_resampler_state()
             self._reset_audio_resampler_state()
             self._reset_metadata_locked()
+            self._reset_stats_locked()
             self._last_audio_time_s = 0.0
             self._iq_cond.notify_all()
 

@@ -345,3 +345,65 @@ def test_nrsc5_stop_clears_metadata():
     meta = demod.metadata_snapshot
     assert meta["station_name"] == ""
     assert meta["title"] == ""
+
+
+def test_nrsc5_stats_snapshot_tracks_python_events():
+    demod = NRSC5Demodulator(program=0)
+
+    demod._handle_python_event(
+        SimpleNamespace(name="SYNC"),
+        SimpleNamespace(freq_offset=1.25, psmi=7),
+    )
+    demod._handle_python_event(
+        SimpleNamespace(name="MER"),
+        SimpleNamespace(lower=12.5, upper=11.8),
+    )
+    demod._handle_python_event(
+        SimpleNamespace(name="BER"),
+        SimpleNamespace(cber=3.2e-4),
+    )
+    demod._handle_python_event(
+        SimpleNamespace(name="AGC"),
+        SimpleNamespace(gain_db=-2.1, peak_dbfs=-0.4, is_final=True),
+    )
+    demod._handle_python_event(
+        SimpleNamespace(name="LOST_SYNC"),
+        SimpleNamespace(),
+    )
+
+    stats = demod.stats_snapshot
+    assert stats["sync"] is False
+    assert stats["sync_count"] == 1
+    assert stats["lost_sync_count"] == 1
+    assert stats["last_sync_freq_offset_hz"] == pytest.approx(1.25)
+    assert stats["last_sync_psmi"] == 7
+    assert stats["mer_lower_db"] == pytest.approx(12.5)
+    assert stats["mer_upper_db"] == pytest.approx(11.8)
+    assert stats["ber_cber"] == pytest.approx(3.2e-4)
+    assert stats["agc_gain_db"] == pytest.approx(-2.1)
+    assert stats["agc_peak_dbfs"] == pytest.approx(-0.4)
+    assert stats["agc_is_final"] is True
+    assert stats["updated_at_s"] > 0.0
+
+
+def test_nrsc5_stop_clears_stats():
+    demod = NRSC5Demodulator(program=0)
+    demod._handle_python_event(
+        SimpleNamespace(name="SYNC"),
+        SimpleNamespace(freq_offset=0.5, psmi=2),
+    )
+    assert demod.stats_snapshot["sync_count"] == 1
+
+    demod.stop()
+    stats = demod.stats_snapshot
+    assert stats["sync"] is False
+    assert stats["sync_count"] == 0
+    assert stats["lost_sync_count"] == 0
+    assert stats["last_sync_freq_offset_hz"] is None
+    assert stats["last_sync_psmi"] is None
+    assert stats["mer_lower_db"] is None
+    assert stats["mer_upper_db"] is None
+    assert stats["ber_cber"] is None
+    assert stats["agc_gain_db"] is None
+    assert stats["agc_peak_dbfs"] is None
+    assert stats["agc_is_final"] is None
