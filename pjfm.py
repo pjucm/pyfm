@@ -157,12 +157,12 @@ def dbm_to_s_meter(dbm):
     """
     Convert dBm to S-meter reading (VHF/UHF standard).
 
-    VHF/UHF standard: S9 = -93 dBm, 6 dB per S-unit.
+    VHF/UHF standard: S9 = -73 dBm, 6 dB per S-unit.
 
     Returns:
         tuple: (s_units, db_over_s9) where s_units is 1-9 and db_over_s9 is dB above S9
     """
-    S9_DBM = -93.0  # S9 reference for VHF/UHF
+    S9_DBM = -73.0  # S9 reference for VHF/UHF
     DB_PER_S = 6.0  # 6 dB per S-unit
 
     if dbm >= S9_DBM:
@@ -2215,7 +2215,7 @@ class FMRadio:
 
 def render_s_meter_rich(dbm, width=30):
     """Render S-meter as rich Text with colors."""
-    S9_DBM = -93.0
+    S9_DBM = -73.0
     S1_DBM = S9_DBM - (8 * 6)  # S1 = -141 dBm
     S9_PLUS_20 = S9_DBM + 20   # S9+20 = -73 dBm
 
@@ -2993,6 +2993,7 @@ def run_rich_ui(radio):
     import select
 
     console = Console()
+    console.set_window_title("pjfm")
 
     try:
         radio.start()

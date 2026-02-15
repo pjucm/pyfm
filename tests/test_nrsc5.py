@@ -201,6 +201,18 @@ def test_nrsc5_metadata_parses_prefixed_log_lines():
     assert meta["artist"] == "Prefixed Artist"
 
 
+def test_nrsc5_metadata_strips_terminal_title_escape_sequences():
+    demod = NRSC5Demodulator(binary_name="python3", program=0)
+    demod._drain_output(io.StringIO(
+        "\x1b]0;nrsc5\x07Station name: CLEAN-HD\n"
+        "\x1b]0;nrsc5\x07Title: Clean Song\n"
+    ))
+    meta = demod.metadata_snapshot
+    assert meta["station_name"] == "CLEAN-HD"
+    assert meta["title"] == "Clean Song"
+    assert "\x1b" not in demod.last_output_line
+
+
 def test_nrsc5_metadata_alert_ended_clears_alert():
     demod = NRSC5Demodulator(binary_name="python3", program=0)
     demod._drain_output(io.StringIO(

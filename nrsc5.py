@@ -102,6 +102,10 @@ class NRSC5Demodulator:
         r"HERE Image:\s*type=(?P<type>[A-Z]+),.*?time=(?P<time>[^,]+),.*?name=(?P<name>.+?),\s*size=",
         re.IGNORECASE,
     )
+    _RE_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+    _RE_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    _RE_ESC_SINGLE = re.compile(r"\x1b[@-_]")
+    _RE_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
     def __init__(self, program=0, binary_name=None, extra_args=None):
         self.binary_name = (
@@ -547,15 +551,28 @@ class NRSC5Demodulator:
         cmd, _, _, _ = self._build_runtime_command(frequency_hz)
         return cmd
 
+    @classmethod
+    def _sanitize_output_line(cls, line):
+        text = str(line or "")
+        if not text:
+            return ""
+        text = text.replace("\r", "").replace("\n", "")
+        text = cls._RE_OSC.sub("", text)
+        text = cls._RE_CSI.sub("", text)
+        text = cls._RE_ESC_SINGLE.sub("", text)
+        text = cls._RE_CONTROL.sub("", text)
+        return text.strip()
+
     def _drain_output(self, stream):
         if stream is None:
             return
         try:
             for raw_line in stream:
                 if isinstance(raw_line, bytes):
-                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    line = raw_line.decode("utf-8", errors="ignore")
                 else:
-                    line = raw_line.strip()
+                    line = raw_line
+                line = self._sanitize_output_line(line)
                 if not line:
                     continue
                 with self._lock:
