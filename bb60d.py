@@ -219,10 +219,11 @@ class BB60D:
         # Round to nearest power of 2
         decimation = max(1, min(8192, 2 ** int(np.log2(decimation) + 0.5)))
         actual_rate = base_rate / decimation
-        # Bandwidth should be <= 0.5 * sample_rate for the API
-        # Use 0.48 to maximize bandwidth while staying within Nyquist
-        # FM needs at least ±75kHz for full deviation, ±60kHz minimum for RDS at 57kHz
-        bandwidth = actual_rate * 0.48  # ~150 kHz at 312.5kHz sample rate
+        # HD Radio sidebands extend to ±198 kHz, so we need at least ±200 kHz
+        # capture bandwidth. Use 0.80 × sample_rate to get ±250 kHz at 625 kHz,
+        # which captures the full HD primary sidebands with ~52 kHz of margin.
+        # FM demodulation only needs ±75 kHz so this is fine for both.
+        bandwidth = actual_rate * 0.80
 
         # Configure
         # RefLevel was c_double(-20.0)
