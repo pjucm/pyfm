@@ -321,7 +321,7 @@ def _signal_bar(dbm, width=24):
 
 
 def _build_client_display(control, audio, server_addr, buffer_s,
-                          freq_input=None, spectrum_enabled=False):
+                          freq_input=None, spectrum_enabled=False, stats=None):
     """Build the Rich Panel shown in the client interactive UI."""
     s = control.status if control else {}
 
@@ -413,8 +413,16 @@ def _build_client_display(control, audio, server_addr, buffer_s,
 
         table.add_row("", "")
 
-    # ── Local audio stats ──────────────────────────────────────
-    buf_ms = audio._buf.level_ms if audio._buf else 0.0
+    # ── Local audio stats (throttled to 5 fps via caller-supplied snapshot) ──
+    st = stats or {}
+    buf_ms   = st.get("buf_ms", 0.0)
+    playing  = st.get("playing", False)
+    has_buf  = st.get("has_buf", False)
+    rate     = st.get("sample_rate")
+    channels = st.get("channels")
+    received = st.get("received", 0)
+    dropped  = st.get("dropped", 0)
+
     capacity_ms = buffer_s * 2500.0
     filled = int((buf_ms / capacity_ms) * 24) if capacity_ms > 0 else 0
     filled = max(0, min(24, filled))
@@ -422,27 +430,26 @@ def _build_client_display(control, audio, server_addr, buffer_s,
     buf_text.append("█" * filled, style="green")
     buf_text.append("░" * (24 - filled), style="dim")
     buf_text.append(f"  {buf_ms:.0f} ms", style="yellow")
-    if audio._buf is None:
+    if not has_buf:
         buf_text.append("  waiting for stream", style="dim")
-    elif audio._playing:
+    elif playing:
         buf_text.append("  playing", style="green bold")
     else:
         buf_text.append("  buffering", style="yellow")
     table.add_row("Buffer:", buf_text)
 
-    if audio._buf:
+    if rate is not None:
         stream_text = Text(
-            f"{audio._buf.sample_rate} Hz · {audio._buf.channels} ch"
-            f"  (target {buffer_s:.1f} s)",
+            f"{rate} Hz · {channels} ch  (target {buffer_s:.1f} s)",
             style="white",
         )
         table.add_row("Stream:", stream_text)
 
     pkt_text = Text()
-    pkt_text.append(f"rx {audio._received}", style="green")
+    pkt_text.append(f"rx {received}", style="green")
     pkt_text.append("  dropped ", style="dim")
-    if audio._dropped > 0:
-        pkt_text.append(str(audio._dropped), style="red bold")
+    if dropped > 0:
+        pkt_text.append(str(dropped), style="red bold")
     else:
         pkt_text.append("0", style="dim")
     table.add_row("Packets:", pkt_text)
@@ -600,6 +607,8 @@ class UDPAudioClient:
             tty.setcbreak(fd)
             input_buf = ''
             freq_input = None   # None = normal mode; str = collecting frequency
+            stats = {}
+            last_stats_time = 0.0
             with Live(
                 _build_client_display(control, self, self.server_addr, self.buffer_s),
                 console=console,
@@ -607,10 +616,25 @@ class UDPAudioClient:
                 screen=True,
             ) as live:
                 while True:
+                    # Snapshot buffer/packet stats at 5 fps
+                    now = time.monotonic()
+                    if now - last_stats_time >= 0.2:
+                        stats = {
+                            "has_buf":     self._buf is not None,
+                            "buf_ms":      self._buf.level_ms if self._buf else 0.0,
+                            "playing":     self._playing,
+                            "sample_rate": self._buf.sample_rate if self._buf else None,
+                            "channels":    self._buf.channels   if self._buf else None,
+                            "received":    self._received,
+                            "dropped":     self._dropped,
+                        }
+                        last_stats_time = now
+
                     live.update(
                         _build_client_display(control, self, self.server_addr,
                                               self.buffer_s, freq_input=freq_input,
-                                              spectrum_enabled=self.spectrum_enabled)
+                                              spectrum_enabled=self.spectrum_enabled,
+                                              stats=stats)
                     )
 
                     # Non-blocking drain of all available stdin bytes
