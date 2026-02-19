@@ -32,6 +32,18 @@ except ImportError:
     print("Error: sounddevice not installed. Run: pip install sounddevice")
     sys.exit(1)
 
+try:
+    from rich.align import Align
+    from rich import box as rich_box
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    _rich_available = True
+except ImportError:
+    _rich_available = False
+
 # Must match pjfm.py
 _MAGIC = b'PJ'
 _VERSION = 1
@@ -115,7 +127,7 @@ class TCPControlClient:
         self._addr = (host, port)
         self._sock = None
         self._lock = threading.Lock()
-        self.status_line = ""        # latest status string from server
+        self.status = {}             # latest parsed status dict from server
         self._running = False
         self._thread = None
 
@@ -182,7 +194,169 @@ class TCPControlClient:
                 raw, buf = buf.split(b"\n", 1)
                 line = raw.decode("utf-8", errors="replace").strip()
                 if line:
-                    self.status_line = line
+                    try:
+                        self.status = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+
+def _signal_bar(dbm, width=24):
+    """Colored signal strength bar mapped to [-100, -20] dBm."""
+    normalized = (dbm - (-100.0)) / 80.0
+    normalized = max(0.0, min(1.0, normalized))
+    filled = int(normalized * width)
+    t = Text()
+    style = "green" if dbm > -60 else ("yellow" if dbm > -75 else "red")
+    t.append("█" * filled, style=style)
+    t.append("░" * (width - filled), style="dim")
+    return t
+
+
+def _build_client_display(control, audio, server_addr, buffer_s):
+    """Build the Rich Panel shown in the client interactive UI."""
+    s = control.status if control else {}
+
+    table = Table(show_header=False, box=None, padding=(0, 1), expand=False)
+    table.add_column("Label", style="cyan", width=12, justify="right")
+    table.add_column("Value")
+
+    # ── Server connection ──────────────────────────────────────
+    addr_str = f"{server_addr[0]}:{server_addr[1]}"
+    if s:
+        addr_style = "white"
+    else:
+        addr_str += "  (connecting…)"
+        addr_style = "dim"
+    table.add_row("Server:", Text(addr_str, style=addr_style))
+    table.add_row("", "")
+
+    if s:
+        # Frequency
+        freq = s.get("freq_mhz", 0.0)
+        table.add_row("Frequency:", Text(f"{freq:.3f} MHz", style="green bold"))
+
+        # Signal
+        dbm = s.get("signal_dbm", -100.0)
+        sig_text = _signal_bar(dbm)
+        sig_text.append(f"  {dbm:.1f} dBm", style="green bold")
+        table.add_row("Signal:", sig_text)
+
+        # Mode
+        mode = s.get("mode", "")
+        blend = s.get("stereo_blend_pct")
+        mode_text = Text()
+        if mode == "Stereo":
+            if blend is not None and blend < 99:
+                mode_text.append(f"Stereo ({blend}%)", style="yellow bold")
+            else:
+                mode_text.append("Stereo", style="green bold")
+        elif mode == "Mono":
+            mode_text.append("Mono", style="yellow")
+        elif mode == "NBFM":
+            mode_text.append("NBFM", style="cyan bold")
+        elif mode == "HD":
+            mode_text.append("HD", style="green bold")
+        else:
+            mode_text.append(mode, style="white")
+        table.add_row("Mode:", mode_text)
+
+        # HD status (only when not OFF)
+        hd_status = s.get("hd_status", "OFF")
+        if hd_status != "OFF":
+            hd_text = Text()
+            hd_label = s.get("hd_label")
+            hd_ber = s.get("hd_ber_pct")
+            if hd_status == "ON":
+                hd_text.append("ON", style="green bold")
+                if hd_label:
+                    hd_text.append(f"  {hd_label}", style="cyan")
+                if hd_ber is not None:
+                    hd_text.append(f"  BER {hd_ber:.2f}%", style="dim")
+            elif hd_status == "synced":
+                hd_text.append("synced", style="green")
+                if hd_ber is not None:
+                    hd_text.append(f"  BER {hd_ber:.2e}", style="dim")
+            elif hd_status == "seeking":
+                hd_text.append("seeking…", style="yellow")
+            elif hd_status == "error":
+                hd_text.append("error", style="red bold")
+            else:
+                hd_text.append(hd_status, style="dim")
+            table.add_row("HD:", hd_text)
+
+        # Metadata
+        station = s.get("station")
+        ps_name = s.get("ps_name")
+        radio_text = s.get("radio_text")
+        artist = s.get("artist")
+        title = s.get("title")
+        if station:
+            table.add_row("Station:", Text(station, style="cyan bold"))
+        if ps_name:
+            table.add_row("Name:", Text(ps_name, style="green bold"))
+        if artist and title:
+            table.add_row("Now Playing:",
+                          Text(f"{artist}  —  {title}", style="green"))
+        elif title:
+            table.add_row("Title:", Text(title, style="green"))
+        elif radio_text:
+            table.add_row("Text:", Text(radio_text[:72], style="green"))
+
+        table.add_row("", "")
+
+    # ── Local audio stats ──────────────────────────────────────
+    buf_ms = audio._buf.level_ms if audio._buf else 0.0
+    capacity_ms = buffer_s * 2500.0
+    filled = int((buf_ms / capacity_ms) * 24) if capacity_ms > 0 else 0
+    filled = max(0, min(24, filled))
+    buf_text = Text()
+    buf_text.append("█" * filled, style="green")
+    buf_text.append("░" * (24 - filled), style="dim")
+    buf_text.append(f"  {buf_ms:.0f} ms", style="yellow")
+    if audio._buf is None:
+        buf_text.append("  waiting for stream", style="dim")
+    elif audio._playing:
+        buf_text.append("  playing", style="green bold")
+    else:
+        buf_text.append("  buffering", style="yellow")
+    table.add_row("Buffer:", buf_text)
+
+    if audio._buf:
+        stream_text = Text(
+            f"{audio._buf.sample_rate} Hz · {audio._buf.channels} ch"
+            f"  (target {buffer_s:.1f} s)",
+            style="white",
+        )
+        table.add_row("Stream:", stream_text)
+
+    pkt_text = Text()
+    pkt_text.append(f"rx {audio._received}", style="green")
+    pkt_text.append("  dropped ", style="dim")
+    if audio._dropped > 0:
+        pkt_text.append(str(audio._dropped), style="red bold")
+    else:
+        pkt_text.append("0", style="dim")
+    table.add_row("Packets:", pkt_text)
+
+    table.add_row("", "")
+
+    # ── Key hints ──────────────────────────────────────────────
+    hints = Text()
+    hints.append("← →", style="yellow")
+    hints.append(" Tune  ", style="dim")
+    hints.append("↑ ↓", style="yellow")
+    hints.append(" Volume  ", style="dim")
+    hints.append("q", style="yellow")
+    hints.append(" Quit", style="dim")
+    table.add_row("", Align.center(hints))
+
+    return Panel(
+        Align.center(table),
+        title="[bold cyan]📻 pjfm client[/]",
+        border_style="cyan",
+        box=rich_box.ROUNDED,
+        padding=(1, 2),
+    )
 
 
 class UDPAudioClient:
@@ -235,19 +409,22 @@ class UDPAudioClient:
                 pass
 
     def run(self, control=None):
-        """Block until Ctrl-C.  If control is a TCPControlClient, display its
-        status line and process arrow-key commands in raw terminal mode."""
+        """Block until Ctrl-C.  Uses Rich UI on a TTY, plain print otherwise."""
         self.start()
         is_tty = sys.stdout.isatty() and sys.stdin.isatty()
 
-        if not is_tty or control is None:
+        if not is_tty or not _rich_available:
             # Fallback: plain periodic print, no raw mode
             try:
                 while True:
                     time.sleep(5.0)
-                    if control and control.status_line:
+                    s = control.status if control else {}
+                    if s:
                         buf_ms = self._buf.level_ms if self._buf else 0
-                        print(f"{control.status_line}  [buf {buf_ms:.0f}ms]")
+                        freq = s.get("freq_mhz", "?")
+                        dbm = s.get("signal_dbm", "?")
+                        mode = s.get("mode", "")
+                        print(f"{freq} MHz  {dbm} dBm  {mode}  [buf {buf_ms:.0f}ms]")
                     elif self._buf:
                         state = "playing" if self._playing else "buffering"
                         print(f"[{state}]  buffer {self._buf.level_ms:.0f} ms  "
@@ -260,67 +437,69 @@ class UDPAudioClient:
                 self.stop()
             return
 
-        # Interactive raw-terminal mode
+        # Rich interactive mode
+        console = Console()
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
             tty.setcbreak(fd)
             input_buf = ''
-            last_display = 0.0
-            while True:
-                now = time.monotonic()
-                # Refresh display ~5 times per second
-                if now - last_display >= 0.2:
-                    buf_ms = self._buf.level_ms if self._buf else 0
-                    status = control.status_line or "Connecting to control port…"
-                    line = f"\r{status}  [buf {buf_ms:.0f}ms]"
-                    sys.stdout.write(f"{line:<120}")
-                    sys.stdout.flush()
-                    last_display = now
+            with Live(
+                _build_client_display(control, self, self.server_addr, self.buffer_s),
+                console=console,
+                refresh_per_second=5,
+                screen=True,
+            ) as live:
+                while True:
+                    live.update(
+                        _build_client_display(control, self, self.server_addr, self.buffer_s)
+                    )
 
-                # Non-blocking drain of all available stdin bytes into input_buf
-                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if ready:
-                    try:
-                        chunk = os.read(fd, 32)
-                        if chunk:
-                            input_buf += chunk.decode('utf-8', errors='ignore')
-                    except (BlockingIOError, IOError):
-                        pass
+                    # Non-blocking drain of all available stdin bytes
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if ready:
+                        try:
+                            chunk = os.read(fd, 32)
+                            if chunk:
+                                input_buf += chunk.decode('utf-8', errors='ignore')
+                        except (BlockingIOError, IOError):
+                            pass
 
-                # Process accumulated input
-                while input_buf:
-                    if input_buf[0] in ('q', 'Q', '\x03'):
-                        input_buf = ''
-                        raise KeyboardInterrupt
-                    elif input_buf.startswith('\x1b[C') or input_buf.startswith('\x1bOC'):
-                        control.send_command({"cmd": "tune", "dir": "up"})
-                        input_buf = input_buf[3:]
-                    elif input_buf.startswith('\x1b[D') or input_buf.startswith('\x1bOD'):
-                        control.send_command({"cmd": "tune", "dir": "down"})
-                        input_buf = input_buf[3:]
-                    elif input_buf.startswith('\x1b[A') or input_buf.startswith('\x1bOA'):
-                        control.send_command({"cmd": "volume", "dir": "up"})
-                        input_buf = input_buf[3:]
-                    elif input_buf.startswith('\x1b[B') or input_buf.startswith('\x1bOB'):
-                        control.send_command({"cmd": "volume", "dir": "down"})
-                        input_buf = input_buf[3:]
-                    elif input_buf.startswith('\x1b[') or input_buf.startswith('\x1bO'):
-                        if len(input_buf) < 3:
-                            break   # wait for rest of sequence
-                        input_buf = input_buf[3:]   # skip unknown sequence
-                    elif input_buf[0] == '\x1b':
-                        if len(input_buf) == 1:
-                            break   # might be start of sequence
-                        input_buf = input_buf[1:]
-                    else:
-                        input_buf = input_buf[1:]
+                    # Process accumulated input
+                    while input_buf:
+                        if input_buf[0] in ('q', 'Q', '\x03'):
+                            input_buf = ''
+                            raise KeyboardInterrupt
+                        elif input_buf.startswith('\x1b[C') or input_buf.startswith('\x1bOC'):
+                            if control:
+                                control.send_command({"cmd": "tune", "dir": "up"})
+                            input_buf = input_buf[3:]
+                        elif input_buf.startswith('\x1b[D') or input_buf.startswith('\x1bOD'):
+                            if control:
+                                control.send_command({"cmd": "tune", "dir": "down"})
+                            input_buf = input_buf[3:]
+                        elif input_buf.startswith('\x1b[A') or input_buf.startswith('\x1bOA'):
+                            if control:
+                                control.send_command({"cmd": "volume", "dir": "up"})
+                            input_buf = input_buf[3:]
+                        elif input_buf.startswith('\x1b[B') or input_buf.startswith('\x1bOB'):
+                            if control:
+                                control.send_command({"cmd": "volume", "dir": "down"})
+                            input_buf = input_buf[3:]
+                        elif input_buf.startswith('\x1b[') or input_buf.startswith('\x1bO'):
+                            if len(input_buf) < 3:
+                                break   # wait for rest of sequence
+                            input_buf = input_buf[3:]
+                        elif input_buf[0] == '\x1b':
+                            if len(input_buf) == 1:
+                                break
+                            input_buf = input_buf[1:]
+                        else:
+                            input_buf = input_buf[1:]
         except KeyboardInterrupt:
             pass
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-            sys.stdout.write("\n")
-            sys.stdout.flush()
             self.stop()
 
     # ------------------------------------------------------------------ #

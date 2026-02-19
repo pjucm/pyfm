@@ -870,7 +870,7 @@ class TCPControlServer:
                 # Send status every 1 second
                 now = time.monotonic()
                 if now - last_status >= 1.0:
-                    line = _format_server_status(self._radio) + "\n"
+                    line = json.dumps(_build_status_dict(self._radio)) + "\n"
                     try:
                         conn.sendall(line.encode())
                     except OSError:
@@ -3512,6 +3512,93 @@ def _format_server_status(radio):
             parts.append(radio_text.strip())
 
     return "  |  ".join(parts)
+
+
+def _build_status_dict(radio):
+    """Build a structured status dict for the TCP control channel."""
+    dbm = radio.get_signal_strength()
+
+    # Mode and stereo blend
+    stereo_blend_pct = None
+    if radio.weather_mode:
+        mode = "NBFM"
+    elif radio.hd_analog_bypass_active:
+        mode = "HD"
+    elif radio.pilot_detected:
+        mode = "Stereo"
+        stereo_blend_pct = int(radio.stereo_blend_factor * 100)
+    else:
+        mode = "Mono"
+
+    # HD pipeline state
+    hd_status = "OFF"
+    hd_label = None
+    hd_ber_pct = None
+    if not radio.weather_mode:
+        if radio.hd_analog_bypass_active:
+            hd_status = "ON"
+            hd_label = radio.hd_program_label
+            if radio.hd_decoder:
+                stats = radio.hd_decoder.stats_snapshot or {}
+                ber = stats.get("ber_cber")
+                if ber is not None:
+                    hd_ber_pct = round(ber * 100, 4)
+        elif (radio.hd_auto_enabled or radio.hd_enabled) and radio.hd_decoder:
+            hd = radio.hd_decoder
+            if hd.poll():
+                stats = hd.stats_snapshot or {}
+                if bool(stats.get("sync", False)):
+                    hd_status = "synced"
+                    ber = stats.get("ber_cber")
+                    if ber is not None:
+                        hd_ber_pct = round(ber * 100, 4)
+                else:
+                    hd_status = "seeking"
+            elif hd.last_error:
+                hd_status = "error"
+            else:
+                hd_status = "stopped"
+        elif radio.hd_decoder and not radio.hd_decoder.available:
+            hd_status = "unavail"
+
+    client_count = radio.udp_sender.client_count if radio.udp_sender else 0
+
+    # Metadata
+    station = None
+    ps_name = None
+    radio_text = None
+    artist = None
+    title = None
+    if not radio.weather_mode:
+        if radio.hd_enabled or radio.hd_analog_bypass_active:
+            station = radio.hd_station_summary or None
+            radio_text = radio.hd_now_playing_summary or None
+        elif radio.rds_enabled and radio.rds_data:
+            rds = radio.rds_data
+            pi_hex = rds.get('pi_hex')
+            callsign = pi_to_callsign(pi_hex) if pi_hex else None
+            ps = radio._normalize_broadcast_text(rds.get('station_name', ''))
+            station = callsign or None
+            ps_name = ps or None
+            radio_text = radio._normalize_broadcast_text(rds.get('radio_text', '')) or None
+            artist = radio._normalize_broadcast_text(rds.get('rtplus_artist') or '') or None
+            title = radio._normalize_broadcast_text(rds.get('rtplus_title') or '') or None
+
+    return {
+        "freq_mhz": round(radio.frequency_mhz, 3),
+        "signal_dbm": round(dbm, 1),
+        "mode": mode,
+        "stereo_blend_pct": stereo_blend_pct,
+        "hd_status": hd_status,
+        "hd_label": hd_label,
+        "hd_ber_pct": hd_ber_pct,
+        "client_count": client_count,
+        "station": station,
+        "ps_name": ps_name,
+        "radio_text": radio_text,
+        "artist": artist,
+        "title": title,
+    }
 
 
 def run_server(radio, port=14550, control_port=None):
