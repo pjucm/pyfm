@@ -13,11 +13,16 @@ Controls:
 """
 
 import argparse
+import json
+import os
+import select
 import socket
 import struct
 import sys
+import termios
 import threading
 import time
+import tty
 
 import numpy as np
 
@@ -101,6 +106,85 @@ class _RingBuffer:
         return self.level_s * 1000.0
 
 
+class TCPControlClient:
+    """Connects to pjfm server control port; receives status, sends commands."""
+
+    RECONNECT_INTERVAL_S = 5.0
+
+    def __init__(self, host, port=14551):
+        self._addr = (host, port)
+        self._sock = None
+        self._lock = threading.Lock()
+        self.status_line = ""        # latest status string from server
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._connect_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        with self._lock:
+            if self._sock:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+                self._sock = None
+
+    def send_command(self, cmd_dict):
+        """Send a JSON command to the server (best-effort)."""
+        with self._lock:
+            sock = self._sock
+        if sock is None:
+            return
+        try:
+            sock.sendall((json.dumps(cmd_dict) + "\n").encode())
+        except OSError:
+            pass
+
+    def _connect_loop(self):
+        while self._running:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(5.0)
+                sock.connect(self._addr)
+                sock.settimeout(None)
+                with self._lock:
+                    self._sock = sock
+                self._recv_loop(sock)
+            except OSError:
+                pass
+            finally:
+                with self._lock:
+                    if self._sock is sock:
+                        self._sock = None
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            if self._running:
+                time.sleep(self.RECONNECT_INTERVAL_S)
+
+    def _recv_loop(self, sock):
+        buf = b""
+        while self._running:
+            try:
+                data = sock.recv(4096)
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line:
+                    self.status_line = line
+
+
 class UDPAudioClient:
     """Receives pjfm UDP audio stream and plays it via sounddevice."""
 
@@ -150,21 +234,81 @@ class UDPAudioClient:
             except Exception:
                 pass
 
-    def run(self):
-        """Block until Ctrl-C, printing periodic status."""
+    def run(self, control=None):
+        """Block until Ctrl-C.  If control is a TCPControlClient, display its
+        status line and process arrow-key commands in raw terminal mode."""
         self.start()
+        is_tty = sys.stdout.isatty() and sys.stdin.isatty()
+
+        if not is_tty or control is None:
+            # Fallback: plain periodic print, no raw mode
+            try:
+                while True:
+                    time.sleep(5.0)
+                    if control and control.status_line:
+                        buf_ms = self._buf.level_ms if self._buf else 0
+                        print(f"{control.status_line}  [buf {buf_ms:.0f}ms]")
+                    elif self._buf:
+                        state = "playing" if self._playing else "buffering"
+                        print(f"[{state}]  buffer {self._buf.level_ms:.0f} ms  "
+                              f"rx {self._received}  dropped {self._dropped}")
+                    else:
+                        print("Waiting for server …")
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self.stop()
+            return
+
+        # Interactive raw-terminal mode
+        old_settings = termios.tcgetattr(sys.stdin)
         try:
+            tty.setcbreak(sys.stdin.fileno())
+            last_display = 0.0
             while True:
-                time.sleep(5.0)
-                if self._buf:
-                    state = "playing" if self._playing else "buffering"
-                    print(f"[{state}]  buffer {self._buf.level_ms:.0f} ms  "
-                          f"rx {self._received}  dropped {self._dropped}")
-                else:
-                    print("Waiting for server …")
+                now = time.monotonic()
+                # Refresh display ~5 times per second
+                if now - last_display >= 0.2:
+                    buf_ms = self._buf.level_ms if self._buf else 0
+                    status = control.status_line or "Connecting to control port…"
+                    line = f"\r{status}  [buf {buf_ms:.0f}ms]"
+                    # Pad to clear previous longer lines
+                    line = f"{line:<120}"
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    last_display = now
+
+                # Poll stdin for keypresses (0.1 s timeout)
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if not ready:
+                    continue
+
+                ch = sys.stdin.read(1)
+                if ch in ('q', 'Q', '\x03'):   # q or Ctrl-C
+                    break
+                if ch == '\x1b':
+                    # Escape sequence — read up to 2 more bytes non-blocking
+                    seq = ch
+                    for _ in range(2):
+                        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                        if r:
+                            seq += sys.stdin.read(1)
+                        else:
+                            break
+                    if seq in ('\x1b[C', '\x1bOC'):
+                        control.send_command({"cmd": "tune", "dir": "up"})
+                    elif seq in ('\x1b[D', '\x1bOD'):
+                        control.send_command({"cmd": "tune", "dir": "down"})
+                    elif seq in ('\x1b[A', '\x1bOA'):
+                        control.send_command({"cmd": "volume", "dir": "up"})
+                    elif seq in ('\x1b[B', '\x1bOB'):
+                        control.send_command({"cmd": "volume", "dir": "down"})
         except KeyboardInterrupt:
             pass
         finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
             self.stop()
 
     # ------------------------------------------------------------------ #
@@ -277,10 +421,21 @@ def main():
         "--buffer", type=float, default=1.0, metavar="SECONDS",
         help="Jitter buffer size in seconds (default: 1.0)"
     )
+    parser.add_argument(
+        "--control-port", type=int, default=None, metavar="PORT",
+        help="TCP control port (default: audio-port + 1)"
+    )
     args = parser.parse_args()
 
+    ctrl_port = args.control_port if args.control_port else args.port + 1
+    control = TCPControlClient(args.server, ctrl_port)
+    control.start()
+
     client = UDPAudioClient(args.server, server_port=args.port, buffer_s=args.buffer)
-    client.run()
+    try:
+        client.run(control=control)
+    finally:
+        control.stop()
     print("Goodbye.")
 
 

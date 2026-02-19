@@ -40,8 +40,10 @@ import threading
 import argparse
 import configparser
 import html
+import json
 import os
 import re
+import select
 import socket
 import struct
 import numpy as np
@@ -815,6 +817,97 @@ class UDPAudioSender:
             for addr in stale:
                 print(f"UDP client timed out: {addr[0]}:{addr[1]}")
                 del self._clients[addr]
+
+
+class TCPControlServer:
+    """Streams server status to TCP clients and accepts control commands."""
+
+    def __init__(self, radio, port=14551):
+        self._radio = radio
+        self.port = port
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(('', port))
+        self._sock.listen(8)
+        self._sock.settimeout(1.0)
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        print(f"TCP control server listening on port {self.port}")
+
+    def stop(self):
+        self._running = False
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    def _accept_loop(self):
+        while self._running:
+            try:
+                conn, addr = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            print(f"Control client connected: {addr[0]}:{addr[1]}")
+            t = threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True)
+            t.start()
+
+    def _handle_client(self, conn, addr):
+        conn.settimeout(0)   # non-blocking; we use select
+        buf = b""
+        last_status = 0.0
+        try:
+            while self._running:
+                ready, _, _ = select.select([conn], [], [], 0.1)
+                # Send status every 1 second
+                now = time.monotonic()
+                if now - last_status >= 1.0:
+                    line = _format_server_status(self._radio) + "\n"
+                    try:
+                        conn.sendall(line.encode())
+                    except OSError:
+                        break
+                    last_status = now
+                # Read incoming commands
+                if ready:
+                    try:
+                        data = conn.recv(1024)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        raw, buf = buf.split(b"\n", 1)
+                        self._dispatch(raw.strip())
+        finally:
+            conn.close()
+            print(f"Control client disconnected: {addr[0]}:{addr[1]}")
+
+    def _dispatch(self, raw):
+        try:
+            msg = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return
+        cmd = msg.get("cmd")
+        if cmd == "tune":
+            if msg.get("dir") == "up":
+                self._radio.tune_up()
+            elif msg.get("dir") == "down":
+                self._radio.tune_down()
+        elif cmd == "volume":
+            if msg.get("dir") == "up":
+                self._radio.volume_up()
+            elif msg.get("dir") == "down":
+                self._radio.volume_down()
 
 
 class FMRadio:
@@ -3421,17 +3514,22 @@ def _format_server_status(radio):
     return "  |  ".join(parts)
 
 
-def run_server(radio, port=14550):
+def run_server(radio, port=14550, control_port=None):
     """Run radio in headless server mode, streaming audio over UDP."""
+    if control_port is None:
+        control_port = port + 1
     sender = UDPAudioSender(port=port)
+    control = TCPControlServer(radio, port=control_port)
     radio.udp_sender = sender
 
     try:
         sender.start()
+        control.start()
         radio.start()
     except Exception as e:
         print(f"Error starting radio: {e}")
         sender.stop()
+        control.stop()
         return
 
     print(f"Server running on {radio.frequency_mhz:.1f} MHz — Ctrl-C to stop.")
@@ -3465,6 +3563,7 @@ def run_server(radio, port=14550):
     finally:
         radio.stop()
         sender.stop()
+        control.stop()
 
 
 def run_headless(radio, duration_s=90):
@@ -3751,6 +3850,10 @@ def main():
         metavar="PORT",
         help="UDP port for server mode (default: 14550)"
     )
+    parser.add_argument(
+        "--control-port", type=int, default=None, metavar="PORT",
+        help="TCP port for control/status channel (default: server-port + 1)"
+    )
     parser.set_defaults(rds=True)
 
     args = parser.parse_args()
@@ -3862,7 +3965,8 @@ def main():
     # Check for server mode
     if args.server:
         try:
-            run_server(radio, port=args.server_port)
+            ctrl_port = args.control_port if args.control_port else args.server_port + 1
+            run_server(radio, port=args.server_port, control_port=ctrl_port)
         except KeyboardInterrupt:
             pass
         except Exception as e:
