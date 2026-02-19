@@ -261,9 +261,11 @@ class UDPAudioClient:
             return
 
         # Interactive raw-terminal mode
-        old_settings = termios.tcgetattr(sys.stdin)
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
         try:
-            tty.setcbreak(sys.stdin.fileno())
+            tty.setcbreak(fd)
+            input_buf = ''
             last_display = 0.0
             while True:
                 now = time.monotonic()
@@ -272,41 +274,51 @@ class UDPAudioClient:
                     buf_ms = self._buf.level_ms if self._buf else 0
                     status = control.status_line or "Connecting to control port…"
                     line = f"\r{status}  [buf {buf_ms:.0f}ms]"
-                    # Pad to clear previous longer lines
-                    line = f"{line:<120}"
-                    sys.stdout.write(line)
+                    sys.stdout.write(f"{line:<120}")
                     sys.stdout.flush()
                     last_display = now
 
-                # Poll stdin for keypresses (0.1 s timeout)
+                # Non-blocking drain of all available stdin bytes into input_buf
                 ready, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if not ready:
-                    continue
+                if ready:
+                    try:
+                        chunk = os.read(fd, 32)
+                        if chunk:
+                            input_buf += chunk.decode('utf-8', errors='ignore')
+                    except (BlockingIOError, IOError):
+                        pass
 
-                ch = sys.stdin.read(1)
-                if ch in ('q', 'Q', '\x03'):   # q or Ctrl-C
-                    break
-                if ch == '\x1b':
-                    # Escape sequence — read up to 2 more bytes non-blocking
-                    seq = ch
-                    for _ in range(2):
-                        r, _, _ = select.select([sys.stdin], [], [], 0.05)
-                        if r:
-                            seq += sys.stdin.read(1)
-                        else:
-                            break
-                    if seq in ('\x1b[C', '\x1bOC'):
+                # Process accumulated input
+                while input_buf:
+                    if input_buf[0] in ('q', 'Q', '\x03'):
+                        input_buf = ''
+                        raise KeyboardInterrupt
+                    elif input_buf.startswith('\x1b[C') or input_buf.startswith('\x1bOC'):
                         control.send_command({"cmd": "tune", "dir": "up"})
-                    elif seq in ('\x1b[D', '\x1bOD'):
+                        input_buf = input_buf[3:]
+                    elif input_buf.startswith('\x1b[D') or input_buf.startswith('\x1bOD'):
                         control.send_command({"cmd": "tune", "dir": "down"})
-                    elif seq in ('\x1b[A', '\x1bOA'):
+                        input_buf = input_buf[3:]
+                    elif input_buf.startswith('\x1b[A') or input_buf.startswith('\x1bOA'):
                         control.send_command({"cmd": "volume", "dir": "up"})
-                    elif seq in ('\x1b[B', '\x1bOB'):
+                        input_buf = input_buf[3:]
+                    elif input_buf.startswith('\x1b[B') or input_buf.startswith('\x1bOB'):
                         control.send_command({"cmd": "volume", "dir": "down"})
+                        input_buf = input_buf[3:]
+                    elif input_buf.startswith('\x1b[') or input_buf.startswith('\x1bO'):
+                        if len(input_buf) < 3:
+                            break   # wait for rest of sequence
+                        input_buf = input_buf[3:]   # skip unknown sequence
+                    elif input_buf[0] == '\x1b':
+                        if len(input_buf) == 1:
+                            break   # might be start of sequence
+                        input_buf = input_buf[1:]
+                    else:
+                        input_buf = input_buf[1:]
         except KeyboardInterrupt:
             pass
         finally:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             sys.stdout.write("\n")
             sys.stdout.flush()
             self.stop()
