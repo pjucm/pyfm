@@ -449,23 +449,6 @@ def _build_client_display(control, audio, server_addr, buffer_s,
 
     table.add_row("", "")
 
-    # ── Spectrum analyzer ──────────────────────────────────────
-    if spectrum_enabled and _rich_available:
-        spec_rows = audio.spectrum_analyzer.render(height=6)
-        spec_table = Table(show_header=False, box=None, padding=0, expand=False)
-        spec_table.add_column("Spectrum")
-        for r in spec_rows:
-            spec_table.add_row(r)
-        spec_panel = Panel(
-            spec_table,
-            subtitle="[dim]AF Spectrum[/]",
-            box=rich_box.ROUNDED,
-            border_style="dim",
-            padding=(0, 1),
-        )
-        table.add_row("", Align.center(spec_panel))
-        table.add_row("", "")
-
     # ── Goto prompt (active while user is typing a frequency) ──
     if freq_input is not None:
         prompt = Text()
@@ -479,7 +462,31 @@ def _build_client_display(control, audio, server_addr, buffer_s,
         table.add_row("Goto:", prompt)
         table.add_row("", "")
 
-    # ── Key hints ──────────────────────────────────────────────
+    # ── Outer content table — single centered column ───────────
+    # The status table above is label-offset; spectrum + hints go
+    # into this outer table so they are centred in the full frame.
+    content = Table(show_header=False, box=None, padding=0, expand=True)
+    content.add_column("Content", justify="center")
+    content.add_row(Align.center(table))
+
+    # Spectrum analyzer
+    if spectrum_enabled and _rich_available:
+        spec_rows = audio.spectrum_analyzer.render(height=6)
+        spec_table = Table(show_header=False, box=None, padding=0, expand=False)
+        spec_table.add_column("Spectrum")
+        for r in spec_rows:
+            spec_table.add_row(r)
+        spec_panel = Panel(
+            spec_table,
+            subtitle="[dim]AF Spectrum[/]",
+            box=rich_box.ROUNDED,
+            border_style="dim",
+            padding=(0, 1),
+        )
+        content.add_row(Align.center(spec_panel))
+        content.add_row(Text(""))
+
+    # Key hints
     hints = Text()
     hints.append("← →", style="yellow")
     hints.append(" Tune  ", style="dim")
@@ -493,10 +500,10 @@ def _build_client_display(control, audio, server_addr, buffer_s,
     hints.append(" Spectrum  ", style="dim")
     hints.append("q", style="yellow")
     hints.append(" Quit", style="dim")
-    table.add_row("", Align.center(hints))
+    content.add_row(Align.center(hints))
 
     return Panel(
-        Align.center(table),
+        content,
         title="[bold cyan]📻 pjfm client[/]",
         border_style="cyan",
         box=rich_box.ROUNDED,
@@ -596,7 +603,7 @@ class UDPAudioClient:
             with Live(
                 _build_client_display(control, self, self.server_addr, self.buffer_s),
                 console=console,
-                refresh_per_second=5,
+                refresh_per_second=20,
                 screen=True,
             ) as live:
                 while True:
@@ -607,7 +614,7 @@ class UDPAudioClient:
                     )
 
                     # Non-blocking drain of all available stdin bytes
-                    ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.05)
                     if ready:
                         try:
                             chunk = os.read(fd, 32)
