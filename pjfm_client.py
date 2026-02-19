@@ -33,8 +33,10 @@ _VERSION = 1
 _HEADER_FMT = '>2sBBIII'   # magic(2) ver(1) ch(1) seq(4) rate(4) frames(4)
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 
-# How often the client sends heartbeat packets (seconds)
+# How often the client sends keepalive/reconnect packets (seconds)
 _HEARTBEAT_INTERVAL_S = 3.0
+# How long without a packet before we reset playback state and wait for refill
+_RECONNECT_TIMEOUT_S = 5.0
 
 
 class _RingBuffer:
@@ -117,9 +119,11 @@ class UDPAudioClient:
         self._last_seq = None
         self._received = 0
         self._dropped = 0
+        self._last_packet_time = 0.0
 
     def start(self):
         self._running = True
+        self._last_packet_time = time.monotonic()
         self._sock.sendto(b'CONNECT', self.server_addr)
         print(f"Connecting to {self.server_addr[0]}:{self.server_addr[1]} …")
 
@@ -168,9 +172,25 @@ class UDPAudioClient:
     def _heartbeat_loop(self):
         while self._running:
             try:
-                self._sock.sendto(b'HEARTBEAT', self.server_addr)
+                # Always send CONNECT (not HEARTBEAT) so we auto-register
+                # with a restarted server without any manual intervention.
+                self._sock.sendto(b'CONNECT', self.server_addr)
             except OSError:
                 pass
+
+            # Watchdog: if the server has gone silent, reset playback so
+            # we wait for the buffer to refill before resuming audio.
+            if (self._buf is not None and
+                    time.monotonic() - self._last_packet_time > _RECONNECT_TIMEOUT_S):
+                if self._playing:
+                    print("\nServer silent — waiting for reconnect …")
+                    self._playing = False
+                # Clear buffer so we get a clean refill on reconnect
+                self._buf = _RingBuffer(
+                    self._buf.sample_rate, self._buf.channels,
+                    capacity_s=self.buffer_s * 2.5)
+                self._last_seq = None
+
             time.sleep(_HEARTBEAT_INTERVAL_S)
 
     def _receive_loop(self):
@@ -205,6 +225,8 @@ class UDPAudioClient:
             self._start_stream(sample_rate, channels)
             print(f"Stream: {sample_rate} Hz, {channels}ch  "
                   f"(buffer target {self.buffer_s:.1f} s)")
+
+        self._last_packet_time = time.monotonic()
 
         # Sequence-number gap detection
         if self._last_seq is not None:
