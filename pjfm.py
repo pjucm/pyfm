@@ -914,6 +914,8 @@ class TCPControlServer:
                 self._radio.tune_to(freq_mhz * 1e6)
             except (TypeError, ValueError):
                 pass
+        elif cmd == "hd_cycle":
+            self._radio.cycle_hd_radio_program()
 
 
 class FMRadio:

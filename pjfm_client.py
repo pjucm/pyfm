@@ -361,6 +361,8 @@ def _build_client_display(control, audio, server_addr, buffer_s, freq_input=None
     hints.append(" Volume  ", style="dim")
     hints.append("g", style="yellow")
     hints.append(" Goto  ", style="dim")
+    hints.append("h", style="yellow")
+    hints.append(" HD  ", style="dim")
     hints.append("q", style="yellow")
     hints.append(" Quit", style="dim")
     table.add_row("", Align.center(hints))
@@ -525,6 +527,10 @@ class UDPAudioClient:
                             raise KeyboardInterrupt
                         elif ch == 'g':
                             freq_input = ''
+                            input_buf = input_buf[1:]
+                        elif ch == 'h':
+                            if control:
+                                control.send_command({"cmd": "hd_cycle"})
                             input_buf = input_buf[1:]
                         elif input_buf.startswith('\x1b[C') or input_buf.startswith('\x1bOC'):
                             if control:
