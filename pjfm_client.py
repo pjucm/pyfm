@@ -810,8 +810,6 @@ class UDPAudioClient:
         audio = np.frombuffer(payload[:expected_bytes],
                               dtype=np.float32).reshape(num_frames, channels)
         self._buf.write(audio)
-        if self.spectrum_enabled:
-            self.spectrum_analyzer.update(audio)
 
         # Start playback once the buffer has reached its target level
         if not self._playing and self._buf.level_s >= self.buffer_s:
@@ -824,6 +822,8 @@ class UDPAudioClient:
                 outdata[:] = self._buf.read(frames)
             else:
                 outdata[:] = 0
+            if self.spectrum_enabled:
+                self.spectrum_analyzer.update(outdata)
 
         self._stream = sd.OutputStream(
             samplerate=sample_rate,
