@@ -563,12 +563,16 @@ class UDPAudioClient:
 
         self._last_packet_time = time.monotonic()
 
-        # Sequence-number gap detection
+        # Sequence-number gap detection.
+        # A gap >= 0x80000000 means the sender reset its counter (e.g. FM→HD
+        # transition); treat it as a re-sync rather than billions of drops.
         if self._last_seq is not None:
             expected_seq = (self._last_seq + 1) & 0xFFFFFFFF
             if seq != expected_seq:
                 gap = (seq - expected_seq) & 0xFFFFFFFF
-                self._dropped += gap
+                if gap < 0x80000000:
+                    self._dropped += gap
+                # else: sequence reset — re-sync silently
         self._last_seq = seq
         self._received += 1
 
