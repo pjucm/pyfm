@@ -212,7 +212,7 @@ def _signal_bar(dbm, width=24):
     return t
 
 
-def _build_client_display(control, audio, server_addr, buffer_s):
+def _build_client_display(control, audio, server_addr, buffer_s, freq_input=None):
     """Build the Rich Panel shown in the client interactive UI."""
     s = control.status if control else {}
 
@@ -340,12 +340,27 @@ def _build_client_display(control, audio, server_addr, buffer_s):
 
     table.add_row("", "")
 
+    # ── Goto prompt (active while user is typing a frequency) ──
+    if freq_input is not None:
+        prompt = Text()
+        prompt.append(freq_input or "", style="green bold")
+        prompt.append("_", style="green bold")   # cursor
+        prompt.append("  MHz  ", style="dim")
+        prompt.append("Enter", style="yellow")
+        prompt.append(" to tune  ", style="dim")
+        prompt.append("Esc", style="yellow")
+        prompt.append(" to cancel", style="dim")
+        table.add_row("Goto:", prompt)
+        table.add_row("", "")
+
     # ── Key hints ──────────────────────────────────────────────
     hints = Text()
     hints.append("← →", style="yellow")
     hints.append(" Tune  ", style="dim")
     hints.append("↑ ↓", style="yellow")
     hints.append(" Volume  ", style="dim")
+    hints.append("g", style="yellow")
+    hints.append(" Goto  ", style="dim")
     hints.append("q", style="yellow")
     hints.append(" Quit", style="dim")
     table.add_row("", Align.center(hints))
@@ -444,6 +459,7 @@ class UDPAudioClient:
         try:
             tty.setcbreak(fd)
             input_buf = ''
+            freq_input = None   # None = normal mode; str = collecting frequency
             with Live(
                 _build_client_display(control, self, self.server_addr, self.buffer_s),
                 console=console,
@@ -452,7 +468,8 @@ class UDPAudioClient:
             ) as live:
                 while True:
                     live.update(
-                        _build_client_display(control, self, self.server_addr, self.buffer_s)
+                        _build_client_display(control, self, self.server_addr,
+                                              self.buffer_s, freq_input=freq_input)
                     )
 
                     # Non-blocking drain of all available stdin bytes
@@ -467,9 +484,48 @@ class UDPAudioClient:
 
                     # Process accumulated input
                     while input_buf:
-                        if input_buf[0] in ('q', 'Q', '\x03'):
+                        ch = input_buf[0]
+
+                        # ── Frequency-input mode ───────────────────────
+                        if freq_input is not None:
+                            if ch in ('\r', '\n'):
+                                # Commit: parse and send
+                                try:
+                                    freq_mhz = float(freq_input)
+                                    if control:
+                                        control.send_command(
+                                            {"cmd": "tune_to", "freq_mhz": freq_mhz}
+                                        )
+                                except ValueError:
+                                    pass
+                                freq_input = None
+                                input_buf = input_buf[1:]
+                            elif ch in ('\x1b',):
+                                # Escape — check for multi-byte sequence
+                                if input_buf.startswith('\x1b[') or input_buf.startswith('\x1bO'):
+                                    if len(input_buf) < 3:
+                                        break
+                                    input_buf = input_buf[3:]  # discard arrow etc.
+                                else:
+                                    freq_input = None          # lone Esc = cancel
+                                    input_buf = input_buf[1:]
+                            elif ch in ('\x08', '\x7f'):
+                                freq_input = freq_input[:-1]
+                                input_buf = input_buf[1:]
+                            elif ch.isdigit() or (ch == '.' and '.' not in freq_input):
+                                freq_input += ch
+                                input_buf = input_buf[1:]
+                            else:
+                                input_buf = input_buf[1:]   # ignore other chars
+                            continue
+
+                        # ── Normal mode ────────────────────────────────
+                        if ch in ('q', 'Q', '\x03'):
                             input_buf = ''
                             raise KeyboardInterrupt
+                        elif ch == 'g':
+                            freq_input = ''
+                            input_buf = input_buf[1:]
                         elif input_buf.startswith('\x1b[C') or input_buf.startswith('\x1bOC'):
                             if control:
                                 control.send_command({"cmd": "tune", "dir": "up"})
@@ -490,7 +546,7 @@ class UDPAudioClient:
                             if len(input_buf) < 3:
                                 break   # wait for rest of sequence
                             input_buf = input_buf[3:]
-                        elif input_buf[0] == '\x1b':
+                        elif ch == '\x1b':
                             if len(input_buf) == 1:
                                 break
                             input_buf = input_buf[1:]

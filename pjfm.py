@@ -908,6 +908,12 @@ class TCPControlServer:
                 self._radio.volume_up()
             elif msg.get("dir") == "down":
                 self._radio.volume_down()
+        elif cmd == "tune_to":
+            try:
+                freq_mhz = float(msg.get("freq_mhz", 0))
+                self._radio.tune_to(freq_mhz * 1e6)
+            except (TypeError, ValueError):
+                pass
 
 
 class FMRadio:
