@@ -42,6 +42,8 @@ import configparser
 import html
 import os
 import re
+import socket
+import struct
 import numpy as np
 import time
 from collections import deque
@@ -675,6 +677,146 @@ class AudioPlayer:
         self.volume = max(0.0, min(1.0, volume))
 
 
+class NullAudioPlayer:
+    """Stub audio player for server mode — no local audio output."""
+
+    def __init__(self, sample_rate=48000, channels=2):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.volume = 1.0
+        self.overflow_samples = 0
+        self._target_level_ms = 100.0
+        self._prefill_level_ms = 0.0
+
+    def start(self): pass
+    def stop(self): pass
+    def reset(self): pass
+    def set_volume(self, volume): self.volume = max(0.0, min(1.0, volume))
+    def queue_audio(self, audio_data): pass
+
+    @property
+    def buffer_level_ms(self):
+        # Report always-at-target so the PI controller outputs rate_adj ≈ 1.0
+        return self._target_level_ms
+
+    @property
+    def buffer_capacity_ms(self):
+        return 2000.0
+
+
+_UDP_MAGIC = b'PJ'
+_UDP_VERSION = 1
+# Header: magic(2B) + version(1B) + channels(1B) + seq(4B) + sample_rate(4B) + num_frames(4B) = 16B
+_UDP_HEADER_FMT = '>2sBBIII'
+_UDP_HEADER_SIZE = struct.calcsize(_UDP_HEADER_FMT)
+
+
+class UDPAudioSender:
+    """
+    Streams demodulated audio to UDP clients.
+
+    Protocol:
+      Client → Server  "CONNECT"    register for audio stream
+      Client → Server  "HEARTBEAT"  keep-alive (send every ~3 s)
+      Client → Server  "DISCONNECT" unregister
+      Server → Client  binary audio packets (header + float32 PCM)
+    """
+
+    HEARTBEAT_TIMEOUT_S = 10.0
+
+    def __init__(self, port=14550):
+        self.port = port
+        self._clients = {}       # addr -> last_seen (monotonic)
+        self._clients_lock = threading.Lock()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(('', port))
+        self._sock.settimeout(1.0)
+        self._seq = 0
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._listener_loop, daemon=True)
+        self._thread.start()
+        print(f"UDP audio server listening on port {self.port}")
+
+    def stop(self):
+        self._running = False
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    @property
+    def client_count(self):
+        with self._clients_lock:
+            return len(self._clients)
+
+    def send(self, audio_data, sample_rate=48000):
+        """Send one audio block to all registered clients."""
+        with self._clients_lock:
+            clients = list(self._clients.keys())
+        if not clients:
+            return
+
+        if audio_data.ndim == 1:
+            audio_data = np.column_stack((audio_data, audio_data))
+        audio_data = np.ascontiguousarray(audio_data, dtype=np.float32)
+
+        num_frames = len(audio_data)
+        channels = audio_data.shape[1]
+
+        header = struct.pack(_UDP_HEADER_FMT,
+                             _UDP_MAGIC, _UDP_VERSION, channels,
+                             self._seq, sample_rate, num_frames)
+        self._seq = (self._seq + 1) & 0xFFFFFFFF
+        packet = header + audio_data.tobytes()
+
+        for addr in clients:
+            try:
+                self._sock.sendto(packet, addr)
+            except OSError:
+                pass
+
+    def _listener_loop(self):
+        while self._running:
+            try:
+                data, addr = self._sock.recvfrom(256)
+            except socket.timeout:
+                self._cleanup_stale_clients()
+                continue
+            except OSError:
+                break
+
+            msg = data.strip()
+            now = time.monotonic()
+            with self._clients_lock:
+                if msg == b'CONNECT':
+                    if addr not in self._clients:
+                        print(f"UDP client connected: {addr[0]}:{addr[1]}")
+                    self._clients[addr] = now
+                elif msg == b'HEARTBEAT':
+                    if addr in self._clients:
+                        self._clients[addr] = now
+                elif msg == b'DISCONNECT':
+                    if addr in self._clients:
+                        del self._clients[addr]
+                        print(f"UDP client disconnected: {addr[0]}:{addr[1]}")
+
+    def _cleanup_stale_clients(self):
+        now = time.monotonic()
+        with self._clients_lock:
+            stale = [addr for addr, last in self._clients.items()
+                     if now - last > self.HEARTBEAT_TIMEOUT_S]
+            for addr in stale:
+                print(f"UDP client timed out: {addr[0]}:{addr[1]}")
+                del self._clients[addr]
+
+
 class FMRadio:
     """
     FM Radio application controller.
@@ -729,7 +871,8 @@ class FMRadio:
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pjfm.cfg')
 
     def __init__(self, initial_freq=89.9e6, use_icom=False, use_24bit=False,
-                 rds_enabled=True, realtime=True, iq_sample_rate=None):
+                 rds_enabled=True, realtime=True, iq_sample_rate=None,
+                 server_mode=False):
         """
         Initialize FM Radio.
 
@@ -740,10 +883,13 @@ class FMRadio:
             realtime: If True, real-time scheduling was requested (for config save)
             use_24bit: If True, use 24-bit I/Q samples (IC-R8600 only)
             iq_sample_rate: Requested IQ sample rate in Hz (optional)
+            server_mode: If True, disable local audio output (stream over UDP instead)
         """
         self.use_icom = use_icom
         self.use_24bit = use_24bit
         self.use_realtime = realtime  # For config save
+        self.server_mode = server_mode
+        self.udp_sender = None  # Set by run_server()
 
         if use_icom:
             if IcomR8600 is None:
@@ -757,12 +903,18 @@ class FMRadio:
         self.device.frequency = initial_freq
         self.iq_sample_rate = int(iq_sample_rate) if iq_sample_rate else self.IQ_SAMPLE_RATE
 
-        # Audio player at 48 kHz with stereo support
-        self.audio_player = AudioPlayer(
-            sample_rate=self.AUDIO_SAMPLE_RATE,
-            channels=2,
-            latency=0.05  # 50ms driver latency; rate control handles drift
-        )
+        # Audio player at 48 kHz with stereo support (NullAudioPlayer in server mode)
+        if server_mode:
+            self.audio_player = NullAudioPlayer(
+                sample_rate=self.AUDIO_SAMPLE_RATE,
+                channels=2,
+            )
+        else:
+            self.audio_player = AudioPlayer(
+                sample_rate=self.AUDIO_SAMPLE_RATE,
+                channels=2,
+                latency=0.05  # 50ms driver latency; rate control handles drift
+            )
         self.recorder = OpusRecorder(
             sample_rate=self.AUDIO_SAMPLE_RATE,
             channels=2,
@@ -1645,8 +1797,10 @@ class FMRadio:
                     else:
                         self.spectrum_analyzer.update(audio)
 
-                # Queue audio for playback
+                # Queue audio for local playback and/or UDP streaming
                 self.audio_player.queue_audio(audio)
+                if self.udp_sender is not None:
+                    self.udp_sender.send(audio, self.AUDIO_SAMPLE_RATE)
                 self._log_startup_prefill(applied_rate_adj=applied_rate_adj, loss_now=loss_now)
 
                 # Detect runaway buffer overflow and recover by resetting audio state.
@@ -3185,6 +3339,128 @@ def build_display(radio, width=80):
     return panel
 
 
+def _format_server_status(radio):
+    """Build a compact one-line status string for server mode."""
+    parts = [f"{radio.frequency_mhz:.1f} MHz"]
+
+    # Signal strength
+    dbm = radio.get_signal_strength()
+    parts.append(f"{dbm:.1f} dBm")
+
+    # Decode mode
+    if radio.weather_mode:
+        parts.append("NBFM")
+    elif radio.hd_analog_bypass_active:
+        parts.append(radio.hd_program_label or "HD")
+    elif radio.pilot_detected:
+        blend = radio.stereo_blend_factor
+        parts.append(f"Stereo {blend * 100:.0f}%")
+    else:
+        parts.append("Mono")
+
+    # HD decoder pipeline state (when armed but not yet bypassing analog)
+    if (not radio.weather_mode and not radio.hd_analog_bypass_active and
+            (radio.hd_auto_enabled or radio.hd_enabled) and radio.hd_decoder):
+        hd = radio.hd_decoder
+        if hd.poll():
+            stats = hd.stats_snapshot or {}
+            synced = bool(stats.get("sync", False))
+            ber = stats.get("ber_cber")
+            if synced:
+                ber_str = f" BER={ber:.1e}" if ber is not None else ""
+                parts.append(f"HD synced{ber_str}")
+            else:
+                iq_mb = hd.iq_bytes_in_total / 1e6
+                parts.append(f"HD seeking ({iq_mb:.1f} MB fed)")
+        elif hd.last_error:
+            parts.append(f"HD error: {hd.last_error[:50]}")
+        else:
+            parts.append("HD stopped")
+    elif not radio.weather_mode and not radio.hd_auto_enabled and not radio.hd_enabled:
+        if radio.hd_decoder and not radio.hd_decoder.available:
+            parts.append("HD unavail")
+
+    # Client count
+    if radio.udp_sender:
+        n = radio.udp_sender.client_count
+        parts.append(f"{n} client{'s' if n != 1 else ''}")
+
+    # Metadata: prefer HD when active, fall back to RDS
+    if not radio.weather_mode and (radio.hd_enabled or radio.hd_analog_bypass_active):
+        station = radio.hd_station_summary
+        now_playing = radio.hd_now_playing_summary
+        if station:
+            parts.append(station)
+        if now_playing:
+            parts.append(now_playing)
+    elif not radio.weather_mode and radio.rds_enabled and radio.rds_data:
+        rds = radio.rds_data
+        pi_hex = rds.get('pi_hex')
+        callsign = pi_to_callsign(pi_hex) if pi_hex else None
+        ps = radio._normalize_broadcast_text(rds.get('station_name', ''))
+        station_id = callsign or ps
+        rtplus_title = radio._normalize_broadcast_text(rds.get('rtplus_title') or '')
+        rtplus_artist = radio._normalize_broadcast_text(rds.get('rtplus_artist') or '')
+        radio_text = radio._normalize_broadcast_text(rds.get('radio_text', ''))
+
+        if station_id:
+            parts.append(station_id)
+        if rtplus_title and rtplus_artist:
+            parts.append(f"{rtplus_artist} - {rtplus_title}")
+        elif rtplus_title:
+            parts.append(rtplus_title)
+        elif radio_text:
+            parts.append(radio_text.strip())
+
+    return "  |  ".join(parts)
+
+
+def run_server(radio, port=14550):
+    """Run radio in headless server mode, streaming audio over UDP."""
+    sender = UDPAudioSender(port=port)
+    radio.udp_sender = sender
+
+    try:
+        sender.start()
+        radio.start()
+    except Exception as e:
+        print(f"Error starting radio: {e}")
+        sender.stop()
+        return
+
+    print(f"Server running on {radio.frequency_mhz:.1f} MHz — Ctrl-C to stop.")
+
+    # HD diagnostic
+    hd = radio.hd_decoder
+    if hd is None:
+        print("HD Radio: no decoder (nrsc5 module not loaded)")
+    elif not hd.available:
+        print(f"HD Radio: unavailable — {hd.unavailable_reason}")
+    elif not radio.hd_auto_enabled and not radio.hd_enabled:
+        print(f"HD Radio: decoder present but auto-arm disabled (hd_auto_arm=false in config) — error: {hd.last_error or 'none'}")
+    elif hd.poll():
+        print(f"HD Radio: decoder running (auto-arm, waiting for sync)")
+    else:
+        print(f"HD Radio: decoder not running — {hd.last_error or 'unknown reason'}")
+
+    use_cr = sys.stdout.isatty()
+    try:
+        while True:
+            time.sleep(1.0)
+            line = _format_server_status(radio)
+            if use_cr:
+                print(f"\r{line:<120}", end='', flush=True)
+            else:
+                print(line, flush=True)
+    except KeyboardInterrupt:
+        if use_cr:
+            print()  # move off the status line
+        print("Interrupted")
+    finally:
+        radio.stop()
+        sender.stop()
+
+
 def run_headless(radio, duration_s=90):
     """Run radio in headless mode for automated testing."""
     kp = os.environ.get('PYFM_PI_KP', '0.000015')
@@ -3457,6 +3733,18 @@ def main():
         dest="rds",
         help="Disable RDS decoding (auto-enables when pilot tone detected)"
     )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Run in headless server mode, streaming audio over UDP"
+    )
+    parser.add_argument(
+        "--server-port",
+        type=int,
+        default=14550,
+        metavar="PORT",
+        help="UDP port for server mode (default: 14550)"
+    )
     parser.set_defaults(rds=True)
 
     args = parser.parse_args()
@@ -3561,11 +3849,21 @@ def main():
     # Create radio instance
     radio = FMRadio(initial_freq=initial_freq, use_icom=use_icom, use_24bit=use_24bit,
                     rds_enabled=args.rds, realtime=use_realtime,
-                    iq_sample_rate=iq_sample_rate)
+                    iq_sample_rate=iq_sample_rate,
+                    server_mode=args.server)
     radio.rt_enabled = rt_enabled
 
+    # Check for server mode
+    if args.server:
+        try:
+            run_server(radio, port=args.server_port)
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
     # Check for headless mode (for automated PI loop tuning)
-    if os.environ.get('PYFM_HEADLESS'):
+    elif os.environ.get('PYFM_HEADLESS'):
         duration = int(os.environ.get('PYFM_DURATION', '90'))
         try:
             run_headless(radio, duration_s=duration)

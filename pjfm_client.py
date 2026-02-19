@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+pjfm_client - UDP audio client for pjfm server
+
+Receives audio streamed by pjfm --server and plays it locally.
+Maintains a configurable jitter buffer (default 1 second).
+
+Usage:
+    ./pjfm_client.py <server-host> [--port PORT] [--buffer SECONDS]
+
+Controls:
+    Ctrl-C  Quit
+"""
+
+import argparse
+import socket
+import struct
+import sys
+import threading
+import time
+
+import numpy as np
+
+try:
+    import sounddevice as sd
+except ImportError:
+    print("Error: sounddevice not installed. Run: pip install sounddevice")
+    sys.exit(1)
+
+# Must match pjfm.py
+_MAGIC = b'PJ'
+_VERSION = 1
+_HEADER_FMT = '>2sBBIII'   # magic(2) ver(1) ch(1) seq(4) rate(4) frames(4)
+_HEADER_SIZE = struct.calcsize(_HEADER_FMT)
+
+# How often the client sends heartbeat packets (seconds)
+_HEARTBEAT_INTERVAL_S = 3.0
+
+
+class _RingBuffer:
+    """Thread-safe stereo float32 ring buffer."""
+
+    def __init__(self, sample_rate, channels, capacity_s):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.capacity = int(sample_rate * capacity_s)
+        self._buf = np.zeros((self.capacity, channels), dtype=np.float32)
+        self._wp = 0
+        self._rp = 0
+        self._lock = threading.Lock()
+
+    def write(self, frames):
+        """Append frames (shape N×channels).  Drops oldest on overflow."""
+        with self._lock:
+            n = len(frames)
+            if n > self.capacity:
+                frames = frames[-self.capacity:]
+                n = self.capacity
+
+            used = (self._wp - self._rp) % self.capacity
+            space = self.capacity - used - 1
+            if n > space:
+                # Advance read pointer to make room (drops oldest audio)
+                self._rp = (self._rp + (n - space)) % self.capacity
+
+            end = self._wp + n
+            if end <= self.capacity:
+                self._buf[self._wp:end] = frames
+            else:
+                first = self.capacity - self._wp
+                self._buf[self._wp:] = frames[:first]
+                self._buf[:n - first] = frames[first:]
+            self._wp = end % self.capacity
+
+    def read(self, n):
+        """Read n frames. Returns silence for any underrun portion."""
+        with self._lock:
+            available = (self._wp - self._rp) % self.capacity
+            actual = min(n, available)
+            out = np.zeros((n, self.channels), dtype=np.float32)
+            if actual > 0:
+                end = self._rp + actual
+                if end <= self.capacity:
+                    out[:actual] = self._buf[self._rp:end]
+                else:
+                    first = self.capacity - self._rp
+                    out[:first] = self._buf[self._rp:]
+                    out[first:actual] = self._buf[:actual - first]
+                self._rp = end % self.capacity
+            return out
+
+    @property
+    def level_s(self):
+        with self._lock:
+            return ((self._wp - self._rp) % self.capacity) / self.sample_rate
+
+    @property
+    def level_ms(self):
+        return self.level_s * 1000.0
+
+
+class UDPAudioClient:
+    """Receives pjfm UDP audio stream and plays it via sounddevice."""
+
+    def __init__(self, server_host, server_port=14550, buffer_s=1.0):
+        self.server_addr = (server_host, server_port)
+        self.buffer_s = buffer_s
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.settimeout(1.0)
+
+        self._buf = None          # created on first packet
+        self._stream = None
+        self._playing = False
+        self._running = False
+
+        self._last_seq = None
+        self._received = 0
+        self._dropped = 0
+
+    def start(self):
+        self._running = True
+        self._sock.sendto(b'CONNECT', self.server_addr)
+        print(f"Connecting to {self.server_addr[0]}:{self.server_addr[1]} …")
+
+        self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._hb_thread.start()
+
+        self._rx_thread = threading.Thread(target=self._receive_loop, daemon=True)
+        self._rx_thread.start()
+
+    def stop(self):
+        self._running = False
+        try:
+            self._sock.sendto(b'DISCONNECT', self.server_addr)
+        except OSError:
+            pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+
+    def run(self):
+        """Block until Ctrl-C, printing periodic status."""
+        self.start()
+        try:
+            while True:
+                time.sleep(5.0)
+                if self._buf:
+                    state = "playing" if self._playing else "buffering"
+                    print(f"[{state}]  buffer {self._buf.level_ms:.0f} ms  "
+                          f"rx {self._received}  dropped {self._dropped}")
+                else:
+                    print("Waiting for server …")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop()
+
+    # ------------------------------------------------------------------ #
+
+    def _heartbeat_loop(self):
+        while self._running:
+            try:
+                self._sock.sendto(b'HEARTBEAT', self.server_addr)
+            except OSError:
+                pass
+            time.sleep(_HEARTBEAT_INTERVAL_S)
+
+    def _receive_loop(self):
+        while self._running:
+            try:
+                data, _ = self._sock.recvfrom(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            self._handle_packet(data)
+
+    def _handle_packet(self, data):
+        if len(data) < _HEADER_SIZE:
+            return
+
+        magic, version, channels, seq, sample_rate, num_frames = \
+            struct.unpack_from(_HEADER_FMT, data)
+
+        if magic != _MAGIC or version != _VERSION:
+            return
+
+        expected_bytes = num_frames * channels * 4
+        payload = data[_HEADER_SIZE:]
+        if len(payload) < expected_bytes:
+            return
+
+        # Initialise buffer and sounddevice stream on first packet
+        if self._buf is None:
+            self._buf = _RingBuffer(sample_rate, channels,
+                                    capacity_s=self.buffer_s * 2.5)
+            self._start_stream(sample_rate, channels)
+            print(f"Stream: {sample_rate} Hz, {channels}ch  "
+                  f"(buffer target {self.buffer_s:.1f} s)")
+
+        # Sequence-number gap detection
+        if self._last_seq is not None:
+            expected_seq = (self._last_seq + 1) & 0xFFFFFFFF
+            if seq != expected_seq:
+                gap = (seq - expected_seq) & 0xFFFFFFFF
+                self._dropped += gap
+        self._last_seq = seq
+        self._received += 1
+
+        audio = np.frombuffer(payload[:expected_bytes],
+                              dtype=np.float32).reshape(num_frames, channels)
+        self._buf.write(audio)
+
+        # Start playback once the buffer has reached its target level
+        if not self._playing and self._buf.level_s >= self.buffer_s:
+            self._playing = True
+            print(f"Buffer ready ({self._buf.level_ms:.0f} ms) — starting playback")
+
+    def _start_stream(self, sample_rate, channels):
+        def callback(outdata, frames, time_info, status):
+            if self._playing:
+                outdata[:] = self._buf.read(frames)
+            else:
+                outdata[:] = 0
+
+        self._stream = sd.OutputStream(
+            samplerate=sample_rate,
+            channels=channels,
+            dtype='float32',
+            blocksize=1024,
+            callback=callback,
+            latency='low',
+        )
+        self._stream.start()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="pjfm_client — UDP audio client for pjfm --server"
+    )
+    parser.add_argument("server", help="Server hostname or IP address")
+    parser.add_argument(
+        "--port", type=int, default=14550,
+        help="UDP port (default: 14550)"
+    )
+    parser.add_argument(
+        "--buffer", type=float, default=1.0, metavar="SECONDS",
+        help="Jitter buffer size in seconds (default: 1.0)"
+    )
+    args = parser.parse_args()
+
+    client = UDPAudioClient(args.server, server_port=args.port, buffer_s=args.buffer)
+    client.run()
+    print("Goodbye.")
+
+
+if __name__ == "__main__":
+    main()
