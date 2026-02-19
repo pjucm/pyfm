@@ -2009,7 +2009,7 @@ class FMRadio:
     def _normalize_broadcast_text(value):
         """Decode HTML entities from metadata text and normalize whitespace."""
         text = str(value or "").strip()
-        if not text:
+        if not text or text == "None":
             return ""
         return html.unescape(text)
 
@@ -3585,14 +3585,14 @@ def _build_status_dict(radio):
             title = radio._normalize_broadcast_text(rds.get('rtplus_title') or '') or None
 
     return {
-        "freq_mhz": round(radio.frequency_mhz, 3),
-        "signal_dbm": round(dbm, 1),
+        "freq_mhz": round(float(radio.frequency_mhz), 3),
+        "signal_dbm": round(float(dbm), 1),
         "mode": mode,
-        "stereo_blend_pct": stereo_blend_pct,
+        "stereo_blend_pct": int(stereo_blend_pct) if stereo_blend_pct is not None else None,
         "hd_status": hd_status,
         "hd_label": hd_label,
-        "hd_ber_pct": hd_ber_pct,
-        "client_count": client_count,
+        "hd_ber_pct": float(hd_ber_pct) if hd_ber_pct is not None else None,
+        "client_count": int(client_count),
         "station": station,
         "ps_name": ps_name,
         "radio_text": radio_text,
