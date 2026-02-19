@@ -200,6 +200,114 @@ class TCPControlClient:
                         pass
 
 
+class SpectrumAnalyzer:
+    """
+    Audio spectrum analyzer with ModPlug-style bar rendering.
+    Computes FFT on audio samples and displays 16 frequency bands
+    as vertical bars with peak hold.  Ported from pjfm.py.
+    """
+
+    NUM_BANDS = 16
+    BLOCKS = ' ▁▂▃▄▅▆▇█'
+
+    def __init__(self, sample_rate=48000, fft_size=2048):
+        self.sample_rate = sample_rate
+        self.fft_size = fft_size
+
+        min_freq, max_freq = 60, 16000
+        self.band_edges = np.logspace(
+            np.log10(min_freq), np.log10(max_freq), self.NUM_BANDS + 1
+        )
+        freq_per_bin = sample_rate / fft_size
+        self.band_bins = np.clip(
+            (self.band_edges / freq_per_bin).astype(int), 0, fft_size // 2
+        )
+
+        self.levels = np.zeros(self.NUM_BANDS)
+        self.peaks  = np.zeros(self.NUM_BANDS)
+
+        self.attack     = 0.7
+        self.decay      = 0.15
+        self.peak_decay = 0.02
+
+        self.audio_buffer = np.zeros(fft_size)
+        self.buffer_pos   = 0
+        self.window       = np.hanning(fft_size)
+
+    def update(self, audio_samples):
+        if audio_samples.ndim == 2:
+            audio_samples = audio_samples.mean(axis=1)
+        n = len(audio_samples)
+        if n == 0:
+            return
+        if self.buffer_pos + n <= self.fft_size:
+            self.audio_buffer[self.buffer_pos:self.buffer_pos + n] = audio_samples
+            self.buffer_pos += n
+        else:
+            if n >= self.fft_size:
+                self.audio_buffer[:] = audio_samples[-self.fft_size:]
+                self.buffer_pos = self.fft_size
+            else:
+                self.audio_buffer[:-n] = self.audio_buffer[n:]
+                self.audio_buffer[-n:] = audio_samples
+                self.buffer_pos = self.fft_size
+        if self.buffer_pos >= self.fft_size:
+            self._compute_spectrum()
+            self.buffer_pos = self.fft_size // 2
+
+    def _compute_spectrum(self):
+        windowed  = self.audio_buffer * self.window
+        magnitude = np.abs(np.fft.rfft(windowed)) / self.fft_size
+        new_levels = np.zeros(self.NUM_BANDS)
+        for i in range(self.NUM_BANDS):
+            s, e = self.band_bins[i], self.band_bins[i + 1]
+            if e > s:
+                power = np.mean(magnitude[s:e] ** 2)
+                if power > 1e-12:
+                    db = 10 * np.log10(power)
+                    new_levels[i] = np.clip((db + 70) / 60, 0, 1)
+        for i in range(self.NUM_BANDS):
+            alpha = self.attack if new_levels[i] > self.levels[i] else self.decay
+            self.levels[i] += (new_levels[i] - self.levels[i]) * alpha
+            if self.levels[i] > self.peaks[i]:
+                self.peaks[i] = self.levels[i]
+            else:
+                self.peaks[i] = max(0, self.peaks[i] - self.peak_decay)
+
+    def render(self, height=6):
+        total_steps = height * 8
+        rows = []
+        for row in range(height):
+            row_text = Text()
+            rfb = height - 1 - row      # row_from_bottom
+            row_min = rfb * 8
+            row_max = row_min + 8
+            pos = rfb / height
+            color = "green" if pos < 0.33 else ("yellow" if pos < 0.66 else "red")
+            for band in range(self.NUM_BANDS):
+                lvl   = int(self.levels[band] * total_steps)
+                peak  = int(self.peaks[band]  * total_steps)
+                if lvl >= row_max:
+                    char, style = self.BLOCKS[8], color
+                elif lvl > row_min:
+                    char, style = self.BLOCKS[lvl - row_min], color
+                elif row_min <= peak < row_max:
+                    char, style = '▔', "bright_white"
+                else:
+                    char, style = ' ', "default"
+                row_text.append(char * 2, style=style)
+                if band < self.NUM_BANDS - 1:
+                    row_text.append(' ')
+            rows.append(row_text)
+        return rows
+
+    def reset(self):
+        self.levels[:] = 0
+        self.peaks[:]  = 0
+        self.audio_buffer[:] = 0
+        self.buffer_pos = 0
+
+
 def _signal_bar(dbm, width=24):
     """Colored signal strength bar mapped to [-100, -20] dBm."""
     normalized = (dbm - (-100.0)) / 80.0
@@ -212,7 +320,8 @@ def _signal_bar(dbm, width=24):
     return t
 
 
-def _build_client_display(control, audio, server_addr, buffer_s, freq_input=None):
+def _build_client_display(control, audio, server_addr, buffer_s,
+                          freq_input=None, spectrum_enabled=False):
     """Build the Rich Panel shown in the client interactive UI."""
     s = control.status if control else {}
 
@@ -340,6 +449,23 @@ def _build_client_display(control, audio, server_addr, buffer_s, freq_input=None
 
     table.add_row("", "")
 
+    # ── Spectrum analyzer ──────────────────────────────────────
+    if spectrum_enabled and _rich_available:
+        spec_rows = audio.spectrum_analyzer.render(height=6)
+        spec_table = Table(show_header=False, box=None, padding=0, expand=False)
+        spec_table.add_column("Spectrum")
+        for r in spec_rows:
+            spec_table.add_row(r)
+        spec_panel = Panel(
+            spec_table,
+            subtitle="[dim]AF Spectrum[/]",
+            box=rich_box.ROUNDED,
+            border_style="dim",
+            padding=(0, 1),
+        )
+        table.add_row("", Align.center(spec_panel))
+        table.add_row("", "")
+
     # ── Goto prompt (active while user is typing a frequency) ──
     if freq_input is not None:
         prompt = Text()
@@ -363,6 +489,8 @@ def _build_client_display(control, audio, server_addr, buffer_s, freq_input=None
     hints.append(" Goto  ", style="dim")
     hints.append("h", style="yellow")
     hints.append(" HD  ", style="dim")
+    hints.append("a", style="yellow")
+    hints.append(" Spectrum  ", style="dim")
     hints.append("q", style="yellow")
     hints.append(" Quit", style="dim")
     table.add_row("", Align.center(hints))
@@ -395,6 +523,9 @@ class UDPAudioClient:
         self._received = 0
         self._dropped = 0
         self._last_packet_time = 0.0
+
+        self.spectrum_analyzer = SpectrumAnalyzer()
+        self.spectrum_enabled  = False
 
     def start(self):
         self._running = True
@@ -471,7 +602,8 @@ class UDPAudioClient:
                 while True:
                     live.update(
                         _build_client_display(control, self, self.server_addr,
-                                              self.buffer_s, freq_input=freq_input)
+                                              self.buffer_s, freq_input=freq_input,
+                                              spectrum_enabled=self.spectrum_enabled)
                     )
 
                     # Non-blocking drain of all available stdin bytes
@@ -531,6 +663,11 @@ class UDPAudioClient:
                         elif ch == 'h':
                             if control:
                                 control.send_command({"cmd": "hd_cycle"})
+                            input_buf = input_buf[1:]
+                        elif ch == 'a':
+                            self.spectrum_enabled = not self.spectrum_enabled
+                            if not self.spectrum_enabled:
+                                self.spectrum_analyzer.reset()
                             input_buf = input_buf[1:]
                         elif input_buf.startswith('\x1b[C') or input_buf.startswith('\x1bOC'):
                             if control:
@@ -620,6 +757,7 @@ class UDPAudioClient:
             self._buf = _RingBuffer(sample_rate, channels,
                                     capacity_s=self.buffer_s * 2.5)
             self._start_stream(sample_rate, channels)
+            self.spectrum_analyzer = SpectrumAnalyzer(sample_rate=sample_rate)
             print(f"Stream: {sample_rate} Hz, {channels}ch  "
                   f"(buffer target {self.buffer_s:.1f} s)")
 
@@ -641,6 +779,8 @@ class UDPAudioClient:
         audio = np.frombuffer(payload[:expected_bytes],
                               dtype=np.float32).reshape(num_frames, channels)
         self._buf.write(audio)
+        if self.spectrum_enabled:
+            self.spectrum_analyzer.update(audio)
 
         # Start playback once the buffer has reached its target level
         if not self._playing and self._buf.level_s >= self.buffer_s:
