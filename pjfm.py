@@ -3351,7 +3351,13 @@ def _format_server_status(radio):
     if radio.weather_mode:
         parts.append("NBFM")
     elif radio.hd_analog_bypass_active:
-        parts.append(radio.hd_program_label or "HD")
+        label = radio.hd_program_label or "HD"
+        if radio.hd_decoder:
+            stats = radio.hd_decoder.stats_snapshot or {}
+            ber = stats.get("ber_cber")
+            if ber is not None:
+                label += f" BER {ber * 100:.2f}%"
+        parts.append(label)
     elif radio.pilot_detected:
         blend = radio.stereo_blend_factor
         parts.append(f"Stereo {blend * 100:.0f}%")
