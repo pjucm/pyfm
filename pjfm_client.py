@@ -46,7 +46,7 @@ except ImportError:
 
 # Must match pjfm.py
 _MAGIC = b'PJ'
-_VERSION = 1
+_VERSION = 2
 _HEADER_FMT = '>2sBBIII'   # magic(2) ver(1) ch(1) seq(4) rate(4) frames(4)
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 
@@ -778,7 +778,7 @@ class UDPAudioClient:
         if magic != _MAGIC or version != _VERSION:
             return
 
-        expected_bytes = num_frames * channels * 4
+        expected_bytes = num_frames * channels * 2  # int16 = 2 bytes
         payload = data[_HEADER_SIZE:]
         if len(payload) < expected_bytes:
             return
@@ -807,8 +807,8 @@ class UDPAudioClient:
         self._last_seq = seq
         self._received += 1
 
-        audio = np.frombuffer(payload[:expected_bytes],
-                              dtype=np.float32).reshape(num_frames, channels)
+        audio = (np.frombuffer(payload[:expected_bytes], dtype=np.int16)
+                   .astype(np.float32) / 32767.0).reshape(num_frames, channels)
         self._buf.write(audio)
 
         # Start playback once the buffer has reached its target level
