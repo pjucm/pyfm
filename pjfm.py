@@ -707,7 +707,7 @@ class NullAudioPlayer:
 
 
 _UDP_MAGIC = b'PJ'
-_UDP_VERSION = 1
+_UDP_VERSION = 2
 # Header: magic(2B) + version(1B) + channels(1B) + seq(4B) + sample_rate(4B) + num_frames(4B) = 16B
 _UDP_HEADER_FMT = '>2sBBIII'
 _UDP_HEADER_SIZE = struct.calcsize(_UDP_HEADER_FMT)
@@ -772,11 +772,14 @@ class UDPAudioSender:
         num_frames = len(audio_data)
         channels = audio_data.shape[1]
 
+        # Encode as 16-bit signed integers
+        audio_int16 = (np.clip(audio_data, -1.0, 1.0) * 32767.0).astype(np.int16)
+
         header = struct.pack(_UDP_HEADER_FMT,
                              _UDP_MAGIC, _UDP_VERSION, channels,
                              self._seq, sample_rate, num_frames)
         self._seq = (self._seq + 1) & 0xFFFFFFFF
-        packet = header + audio_data.tobytes()
+        packet = header + audio_int16.tobytes()
 
         for addr in clients:
             try:
